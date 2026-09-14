@@ -1,5 +1,12 @@
 import type { Locator, Page } from "patchright";
-import { humanDrag, sleep } from "./human-behavior.ts";
+import {
+  CaptchaCdpTimeoutError,
+  humanDrag,
+  sleep,
+  withCdpDeadline,
+} from "./human-behavior.ts";
+
+export { CaptchaCdpTimeoutError };
 
 
 export const BAXIA_DIALOG_SELECTOR = ".baxia-dialog";
@@ -153,17 +160,27 @@ const DEFAULT_RETRY_DELAY_MS = 1_000;
 const DEFAULT_SETTLE_MS = 2_000;
 const DEFAULT_SLIDER_TIMEOUT_MS = 8_000;
 
-async function isVisible(locator: Locator): Promise<boolean> {
-  return locator.isVisible().catch(() => false);
+async function isVisible(
+  locator: Locator,
+  timeoutMs?: number,
+): Promise<boolean> {
+  const probe = locator.isVisible().catch(() => false);
+  // Detection polling treats a hung probe as "not visible yet" and keeps
+  // polling until the overall wait budget expires; interaction steps below
+  // propagate the typed timeout instead (a mid-solve transport death must
+  // reset the account, not silently retry on a dead page).
+  if (timeoutMs === undefined) return probe;
+  return withCdpDeadline(probe, timeoutMs, "visible").catch(() => false);
 }
 
 async function findVisibleLocator(
   page: Page,
   selectors: readonly string[],
+  timeoutMs?: number,
 ): Promise<{ selector: string; locator: Locator } | null> {
   for (const selector of selectors) {
     const candidate = page.locator(selector).first();
-    if (await isVisible(candidate)) {
+    if (await isVisible(candidate, timeoutMs)) {
       return { selector, locator: candidate };
     }
   }
@@ -172,8 +189,13 @@ async function findVisibleLocator(
 
 async function findVisibleIframe(
   page: Page,
+  timeoutMs?: number,
 ): Promise<BaxiaChallengeTarget | null> {
-  const iframe = await findVisibleLocator(page, BAXIA_IFRAME_SELECTORS);
+  const iframe = await findVisibleLocator(
+    page,
+    BAXIA_IFRAME_SELECTORS,
+    timeoutMs,
+  );
   return iframe
     ? { iframeSelector: iframe.selector, locator: iframe.locator }
     : null;
@@ -181,10 +203,12 @@ async function findVisibleIframe(
 
 async function findVisibleDocument(
   page: Page,
+  timeoutMs?: number,
 ): Promise<BaxiaChallengeTarget | null> {
   const documentTarget = await findVisibleLocator(
     page,
     BAXIA_DOCUMENT_SELECTORS,
+    timeoutMs,
   );
   return documentTarget
     ? { iframeSelector: null, locator: documentTarget.locator }
@@ -194,6 +218,7 @@ async function findVisibleDocument(
 async function detectBaxiaChallenge(
   page: Page,
   timeoutMs: number,
+  perActionMs?: number,
 ): Promise<{
   dialogLocator: Locator;
   contentLocator: Locator;
@@ -206,26 +231,26 @@ async function detectBaxiaChallenge(
   let dialogReported = false;
 
   while (true) {
-    const dialogVisible = await isVisible(dialogLocator);
-    const contentVisible = await isVisible(contentLocator);
+    const dialogVisible = await isVisible(dialogLocator, perActionMs);
+    const contentVisible = await isVisible(contentLocator, perActionMs);
     if ((dialogVisible || contentVisible) && !dialogReported) {
       logBaxiaCaptcha("dialog_detected");
       dialogReported = true;
     }
 
-    const iframe = await findVisibleIframe(page);
+    const iframe = await findVisibleIframe(page, perActionMs);
     if (iframe) {
       logBaxiaCaptcha("iframe_found");
       return { dialogLocator, contentLocator, target: iframe };
     }
 
-    const documentTarget = await findVisibleDocument(page);
+    const documentTarget = await findVisibleDocument(page, perActionMs);
     if (documentTarget) {
       logBaxiaCaptcha("challenge_detected", { scope: "top_level" });
       return {
         dialogLocator,
         // In this mode #baxia-punish/#nocaptcha is the challenge surface.
-        contentLocator: (await isVisible(topLevelRootLocator))
+        contentLocator: (await isVisible(topLevelRootLocator, perActionMs))
           ? topLevelRootLocator
           : documentTarget.locator,
         target: documentTarget,
@@ -247,11 +272,12 @@ async function hasSolvedState(
   dialogLocator: Locator,
   contentLocator: Locator,
   frame: BaxiaLocatorContext,
+  perActionMs?: number,
 ): Promise<boolean> {
   const [challengeVisible, dialogVisible, contentVisible] = await Promise.all([
-    isVisible(challengeLocator),
-    isVisible(dialogLocator),
-    isVisible(contentLocator),
+    isVisible(challengeLocator, perActionMs),
+    isVisible(dialogLocator, perActionMs),
+    isVisible(contentLocator, perActionMs),
   ]);
 
   // Baxia calls hide(true) on the outer dialog after it receives the success
@@ -260,7 +286,8 @@ async function hasSolvedState(
   if (!challengeVisible && !dialogVisible && !contentVisible) return true;
 
   for (const selector of BAXIA_SUCCESS_SELECTOR.split(", ")) {
-    if (await isVisible(frame.locator(selector.trim()))) return true;
+    if (await isVisible(frame.locator(selector.trim()), perActionMs))
+      return true;
   }
   return false;
 }
@@ -271,8 +298,17 @@ async function waitForSolvedState(
   contentLocator: Locator,
   frame: BaxiaLocatorContext,
   timeoutMs: number,
+  perActionMs?: number,
 ): Promise<boolean> {
-  if (await hasSolvedState(challengeLocator, dialogLocator, contentLocator, frame)) {
+  if (
+    await hasSolvedState(
+      challengeLocator,
+      dialogLocator,
+      contentLocator,
+      frame,
+      perActionMs,
+    )
+  ) {
     return true;
   }
   if (timeoutMs <= 0) return false;
@@ -286,6 +322,7 @@ async function waitForSolvedState(
         dialogLocator,
         contentLocator,
         frame,
+        perActionMs,
       )
     ) {
       return true;
@@ -311,13 +348,22 @@ export function sanitizeCaptchaErrorDetail(error: unknown): string {
 // two concurrent solvers on the same browser would interleave mouse events.
 let captchaMouseLock: Promise<void> = Promise.resolve();
 
-async function withCaptchaMouseLock<T>(fn: () => Promise<T>): Promise<T> {
+async function withCaptchaMouseLock<T>(
+  fn: () => Promise<T>,
+  runTimeoutMs: number,
+): Promise<T> {
   const previous = captchaMouseLock;
   const { promise: gate, resolve } = Promise.withResolvers<void>();
   captchaMouseLock = gate;
   await previous;
   try {
-    return await fn();
+    // The run is raced against an explicit deadline INSIDE the try/finally,
+    // so the gate is released even when the inner CDP work never settles
+    // (dead renderer): the orphaned promise is marked handled and dropped,
+    // and the next solver proceeds instead of queueing forever.
+    const inner = fn();
+    void inner.then(undefined, () => {});
+    return await withCdpDeadline(inner, runTimeoutMs, "mouse_lock");
   } finally {
     resolve();
   }
@@ -338,7 +384,36 @@ export async function solveBaxiaCaptcha(
   // One physical mouse per browser: with concurrent relay streams on one page
   // two watchers could interleave drag events and break each other's slider.
   // Serialize the whole solve (upstream captcha-solver uses the same lock).
-  return await withCaptchaMouseLock(() => solveBaxiaCaptchaUnlocked(page, options));
+  //
+  // Every budget below reuses the existing solver knobs (no new defaults):
+  // per-CDP-action deadline = sliderTimeoutMs, and the lock run budget covers
+  // detection + one attempt's slider waits/backoffs + leaf actions + margin.
+  // The attempt loop aborts on the first transport timeout (a CDP deadline
+  // means the renderer is dead; retrying on the same page is futile), so the
+  // run budget never needs to cover all attempts hanging.
+  const waitForMs = Math.max(0, options.waitForMs ?? 0);
+  const maxAttempts = Math.max(
+    1,
+    Math.min(5, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS),
+  );
+  const retryDelayMs = Math.max(
+    0,
+    options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
+  );
+  const settleMs = Math.max(0, options.settleMs ?? DEFAULT_SETTLE_MS);
+  const sliderTimeoutMs = Math.max(
+    500,
+    options.sliderTimeoutMs ?? DEFAULT_SLIDER_TIMEOUT_MS,
+  );
+  const runTimeoutMs =
+    waitForMs +
+    maxAttempts * (sliderTimeoutMs + settleMs + retryDelayMs) +
+    2 * sliderTimeoutMs +
+    5_000;
+  return await withCaptchaMouseLock(
+    () => solveBaxiaCaptchaUnlocked(page, options),
+    runTimeoutMs,
+  );
 }
 
 async function solveBaxiaCaptchaUnlocked(
@@ -360,7 +435,12 @@ async function solveBaxiaCaptchaUnlocked(
     options.sliderTimeoutMs ?? DEFAULT_SLIDER_TIMEOUT_MS,
   );
 
-  const detected = await detectBaxiaChallenge(page, waitForMs);
+  // Per-CDP-action deadline for every protocol round-trip below. On a
+  // healthy renderer these settle in milliseconds, so racing them changes
+  // nothing; after a renderer crash they would hang forever.
+  const perActionMs = sliderTimeoutMs;
+
+  const detected = await detectBaxiaChallenge(page, waitForMs, perActionMs);
   if (!detected) return false;
 
   const scope = detected.target.iframeSelector ? "iframe" : "top_level";
@@ -392,9 +472,13 @@ async function solveBaxiaCaptchaUnlocked(
       // (e.g. from an earlier rejected drag, network hiccup, or expired token).
       // If the reload link is visible, click it to trigger native noCaptcha.reset().
       const reloadLink = frame.locator(BAXIA_RELOAD_SELECTOR).first();
-      if (await isVisible(reloadLink)) {
+      if (await isVisible(reloadLink, perActionMs)) {
         logBaxiaCaptcha("challenge_reload", { attempt });
-        await reloadLink.click({ force: true }).catch(() => {});
+        await withCdpDeadline(
+          reloadLink.click({ force: true }),
+          perActionMs,
+          "reload_click",
+        ).catch(() => {});
         await sleep(500);
       }
 
@@ -405,13 +489,21 @@ async function solveBaxiaCaptchaUnlocked(
       }
 
       stage = "geometry";
-      const sliderBox = await slider.boundingBox();
+      const sliderBox = await withCdpDeadline(
+        slider.boundingBox(),
+        perActionMs,
+        "slider_bounds",
+      );
       if (!sliderBox) {
         lastReason = "bounds_unavailable";
         logBaxiaCaptcha("attempt_bounds_unavailable", { attempt });
       } else {
         const track = frame.locator(BAXIA_TRACK_SELECTOR);
-        const trackBox = await track.boundingBox();
+        const trackBox = await withCdpDeadline(
+          track.boundingBox(),
+          perActionMs,
+          "track_bounds",
+        );
         const trackWidth = trackBox?.width ?? 300;
         const dragDistance = Math.max(0, trackWidth - sliderBox.width);
         lastGeometry = {
@@ -432,6 +524,7 @@ async function solveBaxiaCaptchaUnlocked(
             sliderBox.y + sliderBox.height / 2,
             sliderBox.x + sliderBox.width / 2 + dragDistance,
             sliderBox.y + sliderBox.height / 2,
+            perActionMs,
           );
         }
       }
@@ -444,6 +537,7 @@ async function solveBaxiaCaptchaUnlocked(
           detected.contentLocator,
           frame,
           settleMs,
+          perActionMs,
         )
       ) {
         logBaxiaCaptcha(
@@ -461,6 +555,11 @@ async function solveBaxiaCaptchaUnlocked(
       lastReason = "not_solved";
       logBaxiaCaptcha("attempt_not_solved", { attempt });
     } catch (error) {
+      // A CDP deadline means the transport is dead (healthy renderers answer
+      // in milliseconds), so retrying further attempts on the same page is
+      // futile: abort the solve with the typed error so the caller resets
+      // the account and wakes parked streams instead of returning "unsolved".
+      if (error instanceof CaptchaCdpTimeoutError) throw error;
       const errorKind = error instanceof Error ? error.name : "UnknownError";
       const detail = sanitizeCaptchaErrorDetail(error);
       if (!sliderFoundReported && !sliderMissingReported) {

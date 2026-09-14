@@ -3,6 +3,56 @@ import type { Page } from "patchright";
 export const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Typed timeout for a CDP/Playwright interaction that never settles.
+ *
+ * A dead renderer (Chromium crash) can leave a protocol promise pending
+ * forever: it neither resolves nor rejects, so no `catch` and no crash event
+ * ever runs. Every potentially-unsettlable CDP await in the captcha path is
+ * raced against this deadline so the failure becomes an identifiable error
+ * instead of an indefinite hang. Identifiable via `instanceof`, `name` and
+ * `code` (callers without the class import can duck-type on `code`).
+ */
+export class CaptchaCdpTimeoutError extends Error {
+  readonly code = "CAPTCHA_CDP_TIMEOUT";
+  readonly stage: string;
+  readonly timeoutMs: number;
+
+  constructor(stage: string, timeoutMs: number) {
+    super(`Captcha CDP operation timed out: ${stage} after ${timeoutMs}ms`);
+    this.name = "CaptchaCdpTimeoutError";
+    this.stage = stage;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Race a CDP-backed promise against an explicit deadline.
+ *
+ * The loser's late settlement is marked handled so a promise that settles
+ * after the race does not surface as an unhandled rejection. The timer is
+ * intentionally ref'd: the deadline must fire even when nothing else keeps
+ * the loop alive in the test harness.
+ */
+export function withCdpDeadline<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  stage: string,
+): Promise<T> {
+  const ms = Math.max(1, Math.floor(timeoutMs));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      timer = undefined;
+      reject(new CaptchaCdpTimeoutError(stage, ms));
+    }, ms);
+  });
+  void promise.then(undefined, () => {});
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 export function humanDelay(
   minMs: number,
   maxMs: number,
@@ -120,24 +170,39 @@ export async function humanDrag(
   startY: number,
   endX: number,
   endY: number,
+  /**
+   * Per mouse-operation deadline. Playwright mouse calls are raw CDP
+   * (Input.dispatchMouseEvent) with no timeout option: after a renderer
+   * crash the promise can stay pending forever and wedge the global captcha
+   * lock. The sleeps between samples are local timers and stay outside the
+   * deadline; only the protocol round-trips are raced.
+   */
+  timeoutMs?: number,
 ): Promise<void> {
+  const mouse = (operation: Promise<void>, stage: string): Promise<void> =>
+    timeoutMs === undefined
+      ? operation
+      : withCdpDeadline(operation, timeoutMs, stage);
   // Approach with its own path, then dwell before pressing: a pointer that
   // teleports onto the handle and clicks instantly is the classic automation
   // signature.
-  await page.mouse.move(startX, startY, { steps: 8 });
+  await mouse(page.mouse.move(startX, startY, { steps: 8 }), "drag_approach");
   await sleep(logNormalDelay(160, 0.5));
-  await page.mouse.down();
+  await mouse(page.mouse.down(), "drag_press");
   await sleep(logNormalDelay(120, 0.5));
 
   try {
     for (const sample of buildDragTrajectory(startX, startY, endX, endY)) {
       await sleep(sample.delayMs);
-      await page.mouse.move(sample.x, sample.y, { steps: 1 });
+      await mouse(
+        page.mouse.move(sample.x, sample.y, { steps: 1 }),
+        "drag_move",
+      );
     }
     // Dwell before release — humans verify the handle is in place.
     await sleep(logNormalDelay(220, 0.5));
   } finally {
-    await page.mouse.up();
+    await mouse(page.mouse.up(), "drag_release");
   }
 }
 

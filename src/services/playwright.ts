@@ -75,7 +75,10 @@ import {
   updateChromeMajor,
   type FingerprintProfile,
 } from "./fingerprint.ts";
-import { subtlePageActivity } from "./human-behavior.ts";
+import {
+  CaptchaCdpTimeoutError,
+  subtlePageActivity,
+} from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
@@ -87,6 +90,30 @@ const contextInitHooks: ContextInitHook[] = [];
 
 export function onBrowserContextCreated(hook: ContextInitHook): void {
   contextInitHooks.push(hook);
+}
+
+/**
+ * Account-death hooks: fired synchronously from cleanupPlaywrightAccountState,
+ * the single funnel for every context/page death path (page crash, context
+ * close, shared-browser disconnect, stuck-mutex recovery, page-op reset,
+ * explicit close). Lets the browser-stream layer fail its parked
+ * browserStreamStates for the dead account so ReadableStream pull /
+ * waitForBrowserStreamMetadata wake instead of hanging forever.
+ * Fire-and-forget: a throwing hook must not break map cleanup.
+ */
+type AccountDeathHook = (accountId: string) => void;
+const accountDeathHooks: AccountDeathHook[] = [];
+
+export function onPlaywrightAccountDeath(hook: AccountDeathHook): void {
+  accountDeathHooks.push(hook);
+}
+
+function notifyPlaywrightAccountDeath(accountId: string): void {
+  for (const hook of accountDeathHooks) {
+    try {
+      hook(accountId);
+    } catch {}
+  }
 }
 export type BrowserType = "chromium" | "chrome" | "edge";
 
@@ -2676,7 +2703,23 @@ export async function withAccountPage<T>(
       return result;
     } catch (error) {
       const message = getErrorMessage(error);
-      if (message.includes("Playwright page operation timed out")) {
+      // A renderer crash ("Target crashed"/"Page crashed"/"Protocol error"/
+      // "Connection closed", see isPlaywrightAlreadyClosedError) leaves the
+      // same zombie as a stuck op: maps still reference a dead page while the
+      // solver/stream waits on it. Reset synchronously here instead of
+      // relying on the async page-crash event, which races retries on a stale
+      // page object.
+      //
+      // A CaptchaCdpTimeoutError means a CDP round-trip never settled (dead
+      // renderer whose transport never rejected): without this branch neither
+      // the message match above nor any crash event would fire, and the
+      // cleanup below — which notifies account death and wakes parked
+      // browser streams — would never run.
+      if (
+        message.includes("Playwright page operation timed out") ||
+        error instanceof CaptchaCdpTimeoutError ||
+        (recoverOnTimeout && isPlaywrightAlreadyClosedError(error))
+      ) {
         console.warn(
           `⏱️  [Playwright] Resetting account context after a stuck page operation: ${accountId}`,
         );
@@ -3188,6 +3231,9 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   // page is gone, so it must not be selected by the rotation gate until a
   // fresh capture succeeds again.
   unmarkAccountHeadersReady(accountId);
+  // Wake parked browser streams for this account (see onPlaywrightAccountDeath).
+  // No-op when the account holds no live requestId.
+  notifyPlaywrightAccountDeath(accountId);
 }
 
 async function closePlaywrightContextBestEffort(
