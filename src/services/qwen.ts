@@ -27,7 +27,7 @@ import {
   syncModelMetadata,
 } from "../core/model-registry.ts";
 import { type Page, type BrowserContext } from "patchright";
-import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated } from "./playwright.ts";
+import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, onPlaywrightAccountDeath } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
@@ -117,6 +117,8 @@ interface BrowserStreamState {
   error: Error | null;
   metadata: BrowserStreamMetadata | null;
   waiters: Set<() => void>;
+  /** Owning account: lets a renderer/context death fail only its own streams. */
+  accountId?: string;
 }
 
 const browserStreamStates = new Map<string, BrowserStreamState>();
@@ -145,6 +147,68 @@ export async function registerBrowserContextStreamBinding(
 onBrowserContextCreated((context) => {
   void registerBrowserContextStreamBinding(context);
 });
+
+/**
+ * Fail every parked browser stream owned by a dead account (renderer crash,
+ * context close, shared-browser disconnect). Marks error+done and wakes
+ * waiters so waitForBrowserStreamMetadata / ReadableStream pull reject
+ * promptly; pull/cancel cleanup then releases the stream slot, lease and
+ * registry entry. Scoped by accountId: other accounts' streams are untouched.
+ * Exported for tests.
+ */
+export function failBrowserStreamsForAccount(
+  accountId: string,
+  message = "Browser context closed during stream",
+): void {
+  for (const state of browserStreamStates.values()) {
+    if (state.accountId !== accountId || state.done) continue;
+    state.error =
+      state.error ?? new QwenNetworkError(`${message} (account=${accountId})`);
+    state.done = true;
+    wakeBrowserStreamState(state);
+  }
+}
+
+onPlaywrightAccountDeath((accountId) => {
+  failBrowserStreamsForAccount(accountId);
+});
+
+/**
+ * Test-only: register a parked browser stream state without a live browser,
+ * so the renderer-crash wake path can be exercised deterministically.
+ * Returns a promise that resolves when the state is woken (same mechanism
+ * ReadableStream pull / waitForBrowserStreamMetadata park on).
+ */
+export function __registerBrowserStreamStateForTests(
+  requestId: string,
+  accountId: string,
+): { waitForWake: Promise<void> } {
+  const state: BrowserStreamState = {
+    chunks: [],
+    done: false,
+    error: null,
+    metadata: null,
+    waiters: new Set(),
+    accountId,
+  };
+  browserStreamStates.set(requestId, state);
+  const waitForWake = new Promise<void>((resolve) => {
+    state.waiters.add(resolve);
+  });
+  return { waitForWake };
+}
+
+/** Test-only: inspect a registered browser stream state. */
+export function __getBrowserStreamStateForTests(
+  requestId: string,
+): BrowserStreamState | undefined {
+  return browserStreamStates.get(requestId);
+}
+
+/** Test-only: drop all registered browser stream states. */
+export function __resetBrowserStreamStatesForTests(): void {
+  browserStreamStates.clear();
+}
 
 function wakeBrowserStreamState(state: BrowserStreamState): void {
   const waiters = Array.from(state.waiters);
@@ -1104,6 +1168,7 @@ async function createQwenBrowserResponse(
     error: null,
     metadata: null,
     waiters: new Set(),
+    accountId,
   };
   browserStreamStates.set(requestId, state);
 
