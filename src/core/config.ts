@@ -1,3 +1,4 @@
+import "./runtime-compat.ts";
 import { z } from "zod";
 
 const envSchema = z

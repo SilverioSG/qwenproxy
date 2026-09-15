@@ -1,7 +1,13 @@
+import { asyncStackGuardEnabled } from './core/runtime-compat.ts'
+
 process.env.DOTENV_CONFIG_QUIET = 'true'
 import dotenv from 'dotenv'
 import fs from 'node:fs'
 import { getEnvFilePath, ensureDataDirs } from './core/paths.ts'
+
+if (asyncStackGuardEnabled) {
+  console.warn('[Runtime] V8 async stack guard active; synchronous error stacks retained.')
+}
 
 // Ensure persistent user data directory exists
 ensureDataDirs()
