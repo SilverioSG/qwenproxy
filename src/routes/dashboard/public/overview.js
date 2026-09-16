@@ -17,38 +17,50 @@ function updateUptime() {
   setText('kpiUptimeSub', '');
   setText('headerUptime', str);
 }
-/* ── KPI + Health ── */
+/* ── KPI + Health ──
+ * TOTAL ACCOUNTS comes from /accounts (configured accounts) — never from
+ * /health, whose QwenProxy shape carries no `accounts` object (that gap
+ * zeroed the KPI). READY (headers-ready, warmed) and AVAILABLE (usable by
+ * the pool, including standby) stay separate counters from separate fields.
+ */
 async function refreshHealth() {
   var data = await apiFetch('/health');
-  if (!data) return;
-  var accts = data.accounts || {};
-  var total = accts.total != null ? accts.total : 0;
-  var avail = accts.available != null ? accts.available : 0;
-  setText('kpiTotalAccounts', total);
-  setText('kpiTotalAccountsSub', avail + ' available');
-  var pct = total > 0 ? Math.round((avail / total) * 100) : 0;
-  setText('kpiAuthenticatedSub', pct + '% available');
-  if (data.uptime != null) {
+  if (data && data.uptime != null) {
     uptimeSeconds = data.uptime;
     uptimeBase = Date.now();
     updateUptime();
   }
   var acctData = await apiFetch('/accounts');
+  var total = 0;
+  var avail = 0;
+  var ready = 0;
   if (Array.isArray(acctData)) {
-    var ready = 0;
-    var totalReqs = 0;
-    var haveReqs = false;
+    total = acctData.length;
     for (var i = 0; i < acctData.length; i++) {
       var a = acctData[i];
+      if (a.available) avail++;
       if (a.ready || a.authenticated) ready++;
-      if (typeof a.totalRequests === 'number') {
-        totalReqs += a.totalRequests;
+    }
+  }
+  // QwenGate-shaped /health fallback (only when /accounts is unreachable).
+  if (total === 0 && data && data.accounts) {
+    if (data.accounts.total != null) total = data.accounts.total;
+    if (data.accounts.available != null) avail = data.accounts.available;
+  }
+  setText('kpiTotalAccounts', total);
+  setText('kpiTotalAccountsSub', avail + ' available');
+  setText('kpiAuthenticated', ready);
+  var readyPct = total > 0 ? Math.round((ready / total) * 100) : 0;
+  setText('kpiAuthenticatedSub', readyPct + '% of ' + total);
+  if (Array.isArray(acctData)) {
+    var totalReqs = 0;
+    var haveReqs = false;
+    for (var j = 0; j < acctData.length; j++) {
+      if (typeof acctData[j].totalRequests === 'number') {
+        totalReqs += acctData[j].totalRequests;
         haveReqs = true;
       }
     }
-    setText('kpiAuthenticated', ready);
-    var readyPct = total > 0 ? Math.round((ready / total) * 100) : 0;
-    setText('kpiAuthenticatedSub', readyPct + '% of ' + total);
     if (haveReqs) setText('kpiTotalRequests', totalReqs);
   }
   var mon = await apiFetch('/metrics/monitor');
