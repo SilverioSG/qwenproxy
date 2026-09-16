@@ -68,10 +68,65 @@ function redactLogValue(value: unknown): unknown {
   return value;
 }
 
-function redactLogMessage(message: string): string {
+export function redactLogMessage(message: string): string {
   return message
     .replace(LOOSE_SECRET_PATTERN, "[REDACTED]")
     .replace(EMBEDDED_SECRET_PATTERN, "[REDACTED]");
+}
+
+// ─── Dashboard system-log ring (V2) ──────────────────────────────────────────
+// Passive, bounded, in-memory capture of Logger calls for GET /system/logs.
+// Recording happens BEFORE the console level filter so the dashboard can
+// show info/debug lines even when the terminal only prints warnings/errors.
+// Console behavior is unchanged; entries are redacted with the same rules.
+export interface DashboardLogEntry {
+  id: string;
+  timestamp: number;
+  level: LogLevel;
+  category: string;
+  message: string;
+}
+
+export const DASHBOARD_LOG_RING_SIZE = 200;
+
+const dashboardLogRing: DashboardLogEntry[] = [];
+let dashboardLogSeq = 0;
+
+function recordDashboardLog(
+  level: LogLevel,
+  context: string | undefined,
+  message: string,
+): void {
+  try {
+    dashboardLogSeq += 1;
+    dashboardLogRing.push({
+      id: `log-${dashboardLogSeq}`,
+      timestamp: Date.now(),
+      level,
+      category: context ?? "general",
+      message: redactLogMessage(String(message)).substring(0, 500),
+    });
+    if (dashboardLogRing.length > DASHBOARD_LOG_RING_SIZE) {
+      dashboardLogRing.splice(
+        0,
+        dashboardLogRing.length - DASHBOARD_LOG_RING_SIZE,
+      );
+    }
+  } catch {
+    // Logging must never break the request path.
+  }
+}
+
+export function getRecentDashboardLogs(
+  limit = 100,
+  minLevel: LogLevel = "debug",
+): DashboardLogEntry[] {
+  const n = Math.max(1, Math.min(limit, DASHBOARD_LOG_RING_SIZE));
+  const floor = LEVEL_RANK[minLevel] ?? 0;
+  return dashboardLogRing
+    .filter((e) => (LEVEL_RANK[e.level] ?? 0) >= floor)
+    .slice(-n)
+    .reverse();
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -159,6 +214,7 @@ export class Logger {
   }
 
   debug(message: string, data?: Record<string, unknown>): void {
+    recordDashboardLog("debug", this.context, message);
     if (this.shouldLog("debug")) {
       console.log(
         this.formatEntry({
@@ -172,6 +228,7 @@ export class Logger {
   }
 
   info(message: string, data?: Record<string, unknown>): void {
+    recordDashboardLog("info", this.context, message);
     if (this.shouldLog("info")) {
       console.log(
         this.formatEntry({
@@ -185,6 +242,7 @@ export class Logger {
   }
 
   warn(message: string, data?: Record<string, unknown>): void {
+    recordDashboardLog("warn", this.context, message);
     if (this.shouldLog("warn")) {
       console.warn(
         this.formatEntry({
@@ -198,6 +256,7 @@ export class Logger {
   }
 
   error(message: string, data?: Record<string, unknown>): void {
+    recordDashboardLog("error", this.context, message);
     if (this.shouldLog("error")) {
       console.error(
         this.formatEntry({

@@ -34,6 +34,20 @@ import {
 } from "./retry-policy.ts";
 import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
+import { recordAIRequest } from "../../core/dashboard-stats.ts";
+
+/** Passive dashboard trace: counters only, never influences decisions. */
+interface DashboardTrace {
+  requestId: string;
+  httpRequestId: string | null;
+  startMs: number;
+  model: string;
+  stream: boolean;
+  route: string;
+  accountIds: Set<string>;
+  lastAccountId: string | null;
+  retries: number;
+}
 
 
 
@@ -62,6 +76,8 @@ export async function chatCompletions(c: Context) {
   let releaseChatLock: (() => void) | null = null;
   const startedAt = Date.now();
   const timings: Record<string, number> = {};
+  // Dashboard V2 passive trace (initialized once the request is parsed).
+  let dashTrace: DashboardTrace | null = null;
   const mark = (name: string, since: number) => {
     timings[name] = Date.now() - since;
   };
@@ -99,19 +115,58 @@ export async function chatCompletions(c: Context) {
     console.log(
       `📥 [${routeLabel}] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
     );
+    // Passive dashboard trace start (no effect on routing/retry).
+    dashTrace = {
+      requestId: reqId,
+      httpRequestId: c.req.header("X-Request-Id") ?? null,
+      startMs: reqStartedAt,
+      model: typeof body.model === "string" ? body.model : "unknown",
+      stream: isStream,
+      route: routeLabel,
+      accountIds: new Set<string>(),
+      lastAccountId: null,
+      retries: 0,
+    };
 
     // Intercept image/video generation models: they bypass the text chat flow
     // and are handled by the native media pipeline (qwen-image-*, wan2.*).
     const rawModel = typeof body.model === "string" ? body.model.trim() : "";
     const mediaKind = rawModel ? classifyMediaModel(rawModel) : null;
     if (mediaKind) {
-      return handleMediaChatCompletion({
+      const mediaResponse = await handleMediaChatCompletion({
         c,
         body,
         model: rawModel,
         kind: mediaKind,
         isStream,
       });
+      // Passive outcome record for the dashboard ring.
+      try {
+        const trace = dashTrace;
+        if (trace) {
+          recordAIRequest({
+            requestId: reqId,
+            httpRequestId: trace.httpRequestId,
+            route: trace.route,
+            model: rawModel,
+            stream: isStream,
+            accountId: null,
+            latencyMs: Date.now() - trace.startMs,
+            success:
+              mediaResponse.status >= 200 && mediaResponse.status < 300,
+            error:
+              mediaResponse.status >= 200 && mediaResponse.status < 300
+                ? null
+                : `media HTTP ${mediaResponse.status}`,
+            errorReason: "media",
+            retryCount: 0,
+            attemptedAccounts: 0,
+          });
+        }
+      } catch {
+        // Recording must never break the request path.
+      }
+      return mediaResponse;
     }
 
     stepStartedAt = Date.now();
@@ -263,6 +318,11 @@ export async function chatCompletions(c: Context) {
       }
       throw streamResult.error || new Error("All accounts failed");
     }
+    // Passive dashboard trace: first upstream account for this request.
+    if (dashTrace) {
+      dashTrace.accountIds.add(streamResult.activeAccountId);
+      dashTrace.lastAccountId = streamResult.activeAccountId;
+    }
 
     for (const [name, value] of Object.entries(
       getContextMeterHeaders(streamResult.tokenEstimationContext.contextMeter),
@@ -340,9 +400,30 @@ export async function chatCompletions(c: Context) {
 
         while (true) {
           try {
-            return isStream
+            const chatResponse = isStream
               ? await processStreamingResponse(currentParams)
               : await processNonStreamingResponse(currentParams);
+            // Passive dashboard trace: terminal success for this request.
+            try {
+              const trace = dashTrace;
+              if (trace) {
+                recordAIRequest({
+                  requestId: reqId,
+                  httpRequestId: trace.httpRequestId,
+                  route: trace.route,
+                  model: trace.model,
+                  stream: trace.stream,
+                  accountId: currentStreamResult.activeAccountId,
+                  latencyMs: Date.now() - trace.startMs,
+                  success: true,
+                  retryCount: trace.retries,
+                  attemptedAccounts: trace.accountIds.size,
+                });
+              }
+            } catch {
+              // Recording must never break the request path.
+            }
+            return chatResponse;
           } catch (streamErr: any) {
             const policy = classifyRetryAction(streamErr, {
               requestAborted: c.req.raw.signal.aborted,
@@ -392,6 +473,10 @@ export async function chatCompletions(c: Context) {
             }
 
             streamProcessingRetries--;
+            // Passive dashboard trace: a stream-level retry happened.
+            if (dashTrace) {
+              dashTrace.retries += 1;
+            }
             console.warn(
               `[Chat] Stream processing error, retrying with new stream | reason=${policy.reason} | ${streamErr.message?.substring(0, 150)} | retries left: ${streamProcessingRetries}`,
             );
@@ -529,6 +614,11 @@ export async function chatCompletions(c: Context) {
               // triggered the replay (for example, an oversized full context).
               throw newStreamResult.error ?? streamErr;
             }
+            // Passive dashboard trace: re-acquired (possibly switched) account.
+            if (dashTrace) {
+              dashTrace.accountIds.add(newStreamResult.activeAccountId);
+              dashTrace.lastAccountId = newStreamResult.activeAccountId;
+            }
 
             for (const [name, value] of Object.entries(
               getContextMeterHeaders(
@@ -611,9 +701,62 @@ export async function chatCompletions(c: Context) {
       logger.debug("[chat] request aborted before response", {
         error: err instanceof Error ? err.message : String(err),
       });
+      // Passive dashboard trace: terminal client-abort outcome.
+      try {
+        const trace = dashTrace;
+        if (trace) {
+          recordAIRequest({
+            requestId: trace.requestId,
+            httpRequestId: trace.httpRequestId,
+            route: trace.route,
+            model: trace.model,
+            stream: trace.stream,
+            accountId: trace.lastAccountId,
+            latencyMs: Date.now() - trace.startMs,
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+            errorReason: "client_abort",
+            retryCount: trace.retries,
+            attemptedAccounts: trace.accountIds.size,
+          });
+        }
+      } catch {
+        // Recording must never break the request path.
+      }
       return new Response(null, { status: 499 });
     }
 
+    // Passive dashboard trace: terminal failure outcome.
+    try {
+      const trace = dashTrace;
+      if (trace) {
+        let reason: string | null = null;
+        try {
+          reason =
+            classifyRetryAction(err, {
+              requestAborted: c.req.raw.signal.aborted,
+            })?.reason ?? null;
+        } catch {
+          reason = null;
+        }
+        recordAIRequest({
+          requestId: trace.requestId,
+          httpRequestId: trace.httpRequestId,
+          route: trace.route,
+          model: trace.model,
+          stream: trace.stream,
+          accountId: trace.lastAccountId,
+          latencyMs: Date.now() - trace.startMs,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          errorReason: reason,
+          retryCount: trace.retries,
+          attemptedAccounts: trace.accountIds.size,
+        });
+      }
+    } catch {
+      // Recording must never break the request path.
+    }
     return handleChatCompletionsError(c, err);
   } finally {
     // Lock released via onStreamComplete when stream finishes

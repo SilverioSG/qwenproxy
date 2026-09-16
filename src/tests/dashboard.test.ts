@@ -26,6 +26,8 @@ test("dashboard pages serve 200 HTML", async () => {
   for (const path of [
     "/dashboard",
     "/dashboard/accounts",
+    "/dashboard/usage",
+    "/dashboard/network",
     "/dashboard/monitor",
     "/dashboard/settings",
   ]) {
@@ -174,11 +176,18 @@ test("/metrics/uptime shape", async () => {
   assert.equal(typeof body.version, "string");
 });
 
-test("/system/logs is explicitly unsupported (no fake structure)", async () => {
+test("/system/logs returns redacted ring entries", async () => {
   const res = await get("/system/logs");
-  assert.equal(res.status, 501);
-  const body = (await res.json()) as Record<string, unknown>;
-  assert.equal(body.code, "UNSUPPORTED");
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as Array<Record<string, unknown>>;
+  assert.ok(Array.isArray(body));
+  for (const e of body) {
+    for (const key of ["id", "timestamp", "level", "category", "message"]) {
+      assert.ok(key in e, `missing ${key}`);
+    }
+  }
+  const serialized = JSON.stringify(body).toLowerCase();
+  assert.doesNotMatch(serialized, /password/);
 });
 
 test("/api/config exposes safe subset only; PUT is read-only", async () => {

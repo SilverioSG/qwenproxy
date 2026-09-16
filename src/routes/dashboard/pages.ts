@@ -32,6 +32,18 @@ const NAV_ITEMS: NavItem[] = [
     svg: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`,
   },
   {
+    id: "usage",
+    label: "Usage",
+    href: "/dashboard/usage",
+    svg: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>`,
+  },
+  {
+    id: "network",
+    label: "Network",
+    href: "/dashboard/network",
+    svg: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>`,
+  },
+  {
     id: "monitor",
     label: "Monitor",
     href: "/dashboard/monitor",
@@ -403,5 +415,158 @@ export const settingsHtml = `<!DOCTYPE html>
 
   <script src="/dashboard/static/shared.js"></script>
   <script src="/dashboard/static/settings.js"></script>
+</body>
+</html>`;
+
+export const usageHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QwenProxy — Usage</title>
+<link rel="stylesheet" href="/dashboard/static/shared.css">
+<link rel="stylesheet" href="/dashboard/static/overview.css">
+<link rel="stylesheet" href="/dashboard/static/usage.css">
+</head>
+<body>
+<div class="dashboard-layout">
+${sidebarHtml("usage")}
+  <main class="main-content">
+    <div class="page-header">
+      <h1>Usage</h1>
+      <div class="page-header-right">
+        <span class="uptime-text" id="dataWindow">Requests per account × model, since process start</span>
+      </div>
+    </div>
+
+    <!-- Summary Cards -->
+    <div class="kpi-grid" id="kpiGrid">
+      <div class="kpi-card"><span class="kpi-label">Requests</span><span class="kpi-value" id="kpiToday">—</span><span class="kpi-sub" id="kpiTodaySub"></span></div>
+      <div class="kpi-card"><span class="kpi-label">Success</span><span class="kpi-value" id="kpiWeek">—</span><span class="kpi-sub" id="kpiWeekSub"></span></div>
+      <div class="kpi-card"><span class="kpi-label">Active Accounts</span><span class="kpi-value" id="kpiAccounts">—</span><span class="kpi-sub" id="kpiAccountsSub"></span></div>
+      <div class="kpi-card"><span class="kpi-label">Errors</span><span class="kpi-value" id="kpiWalls">—</span><span class="kpi-sub" id="kpiWallsSub"></span></div>
+    </div>
+
+    <!-- Per-account table -->
+    <div class="panel">
+      <div class="panel-header open" onclick="togglePanel(this)"><span class="panel-title">Per-Account Breakdown</span><span class="panel-chevron">▼</span></div>
+      <div class="panel-body open">
+        <div class="panel-content">
+          <div class="tbl-wrap">
+            <table id="usageTable">
+              <thead>
+                <tr>
+                  <th>Account</th>
+                  <th class="num">Requests</th>
+                  <th class="num">Success</th>
+                  <th class="num">Errors</th>
+                  <th>Per-Model</th>
+                </tr>
+              </thead>
+              <tbody id="usageBody"></tbody>
+            </table>
+          </div>
+          <div class="empty-state" id="emptyState" style="display:none">No usage recorded yet — send a few requests and this fills up.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-model totals -->
+    <div class="panel">
+      <div class="panel-header open" onclick="togglePanel(this)"><span class="panel-title">Model Totals</span><span class="panel-chevron">▼</span></div>
+      <div class="panel-body open">
+        <div class="panel-content">
+          <div class="tbl-wrap">
+            <table id="modelTable">
+              <thead>
+                <tr>
+                  <th>Model</th>
+                  <th class="num">Requests</th>
+                  <th class="num">Success</th>
+                  <th class="num">Errors</th>
+                  <th>Last Activity</th>
+                </tr>
+              </thead>
+              <tbody id="modelBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/dashboard/static/shared.js"></script>
+<script src="/dashboard/static/usage.js"></script>
+</body>
+</html>`;
+
+export const networkHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QwenProxy — Network</title>
+  <link rel="stylesheet" href="/dashboard/static/shared.css">
+  <link rel="stylesheet" href="/dashboard/static/network.css">
+</head>
+<body>
+
+<div class="dashboard-layout">
+  ${sidebarHtml("network")}
+  <main class="main-content">
+
+<div class="page-header">
+  <h1>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+    Network
+    <span class="count-badge" id="entryCount">0</span>
+  </h1>
+  <div class="page-header-right">
+    <span class="uptime-text">Last 200 HTTP requests (in-memory)</span>
+  </div>
+</div>
+
+<div class="controls">
+  <label style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-secondary);font-weight:500">Filter</label>
+  <select class="filter-select" id="methodFilter" onchange="onFilterChange()">
+    <option value="">All Methods</option>
+    <option value="GET">GET</option>
+    <option value="POST">POST</option>
+    <option value="PUT">PUT</option>
+    <option value="PATCH">PATCH</option>
+    <option value="DELETE">DELETE</option>
+  </select>
+  <select class="filter-select" id="statusFilter" onchange="onFilterChange()">
+    <option value="">All Status</option>
+    <option value="2xx">2xx Success</option>
+    <option value="4xx">4xx Client Error</option>
+    <option value="5xx">5xx Server Error</option>
+  </select>
+  <select class="filter-select" id="categoryFilter" onchange="onFilterChange()">
+    <option value="">All Routes</option>
+    <option value="Chat">Chat</option>
+    <option value="Responses">Responses</option>
+    <option value="Anthropic">Anthropic</option>
+    <option value="completions">Completions</option>
+    <option value="media">Media</option>
+    <option value="models">Models</option>
+    <option value="dashboard">Dashboard</option>
+    <option value="system">System</option>
+    <option value="other">Other</option>
+  </select>
+  <span class="entry-count" id="filteredCount"></span>
+</div>
+
+<div class="net-container" id="netContainer">
+  <div class="empty-state" id="netEmpty" style="display:none">No network entries recorded yet</div>
+  <div class="error-state" id="netError" style="display:none"></div>
+</div>
+
+  </main>
+</div>
+
+  <script src="/dashboard/static/shared.js"></script>
+  <script src="/dashboard/static/network.js"></script>
 </body>
 </html>`;

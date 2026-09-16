@@ -19,6 +19,7 @@ import { completionsLegacy } from "../routes/completions.js";
 import { anthropicApp } from "../routes/anthropic/index.ts";
 import { sendOpenAIError } from "./error-helpers.js";
 import { dashboardApp } from "./dashboard.js";
+import { recordNetworkEvent } from "../core/dashboard-stats.ts";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
@@ -36,6 +37,58 @@ const app = new Hono();
 function formatAccountId(accountId: string): string {
   const normalized = accountId.trim();
   return normalized.length > 12 ? `${normalized.slice(0, 12)}…` : normalized;
+}
+
+/**
+ * Logical route label for the dashboard network ring. Internal loopbacks
+ * (Responses/Anthropic via /v1/chat/completions) self-identify with the
+ * x-qwenproxy-route header; everything else derives from the path.
+ * Pure mapping — no request behavior depends on it.
+ */
+function deriveDashboardRoute(c: Context): string {
+  const loopback = c.req.header("x-qwenproxy-route");
+  if (loopback === "Responses" || loopback === "Anthropic") return loopback;
+  let path = "/";
+  try {
+    path = new URL(c.req.url).pathname;
+  } catch {
+    path = "/";
+  }
+  if (path === "/v1/chat/completions") return "Chat";
+  if (path === "/v1/completions") return "completions";
+  if (path === "/v1/messages" || path === "/v1/messages/count_tokens")
+    return "Anthropic";
+  if (path === "/v1/responses" || path.startsWith("/v1/responses/"))
+    return "Responses";
+  if (
+    path === "/v1/upload" ||
+    path === "/v1/images/generations" ||
+    path === "/v1/videos/generations" ||
+    path.startsWith("/v1/tasks/")
+  )
+    return "media";
+  if (path === "/v1/models" || path.startsWith("/v1/models/")) return "models";
+  if (
+    path === "/health" ||
+    path === "/metrics" ||
+    path.startsWith("/diagnostics/")
+  )
+    return "system";
+  if (
+    path === "/dashboard" ||
+    path.startsWith("/dashboard/") ||
+    path === "/accounts" ||
+    path === "/pool/stats" ||
+    path === "/system/logs" ||
+    path.startsWith("/metrics/") ||
+    path === "/api/config" ||
+    path === "/api/usage" ||
+    path === "/api/usage/raw" ||
+    path === "/v1/accounts" ||
+    path.startsWith("/v1/accounts/")
+  )
+    return "dashboard";
+  return "other";
 }
 
 function buildPortInUseMessage(port: number, host: string): string {
@@ -140,6 +193,21 @@ app.use("*", async (c, next) => {
   metrics.histogram("latency.request", duration);
   c.header("X-Response-Time", `${duration}ms`);
   c.header("openai-processing-ms", String(duration));
+  // Dashboard V2 passive hook: record every HTTP request in the bounded
+  // in-memory network ring. No behavior change (best-effort, never throws).
+  // Reuses the requestId generated above (client-supplied or uuid).
+  try {
+    recordNetworkEvent({
+      requestId,
+      route: deriveDashboardRoute(c),
+      method: c.req.method,
+      path: new URL(c.req.url).pathname,
+      status: c.res.status,
+      latencyMs: duration,
+    });
+  } catch {
+    // Recording must never break the request path.
+  }
 });
 
 function constantTimeStringEqual(provided: string, expected: string): boolean {
@@ -264,6 +332,9 @@ app.get("/health", async (c) => {
     status: status?.overall || "unknown",
     ram: status?.ram || "unknown",
     streams: status?.streams || "unknown",
+    // Additive for dashboard V2 (QwenGate health also carried uptime).
+    // Existing consumers ignore unknown fields; contract otherwise unchanged.
+    uptime: Math.floor(process.uptime()),
     heap: status?.heap
       ? {
           used: status.heap.heapUsed,

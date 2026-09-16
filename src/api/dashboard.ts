@@ -40,12 +40,22 @@ import { getAccountsByPriority } from "../core/account-priority.js";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.js";
 import { config } from "../core/config.js";
 import { metrics } from "../core/metrics.js";
+import { getRecentDashboardLogs } from "../core/logger.js";
+import {
+  getModelHealth,
+  getMonitorSummary,
+  getRecentAIRequests,
+  getRecentNetworkEvents,
+  getUsageSummary,
+} from "../core/dashboard-stats.js";
 import { verifyApiKey } from "./server.js";
 import {
   accountsHtml,
   monitorHtml,
+  networkHtml,
   overviewHtml,
   settingsHtml,
+  usageHtml,
 } from "../routes/dashboard/pages.js";
 
 export const dashboardApp = new Hono();
@@ -120,6 +130,8 @@ function serveHtml(html: string) {
 
 dashboardApp.get("/dashboard", serveHtml(overviewHtml));
 dashboardApp.get("/dashboard/accounts", serveHtml(accountsHtml));
+dashboardApp.get("/dashboard/usage", serveHtml(usageHtml));
+dashboardApp.get("/dashboard/network", serveHtml(networkHtml));
 dashboardApp.get("/dashboard/monitor", serveHtml(monitorHtml));
 dashboardApp.get("/dashboard/settings", serveHtml(settingsHtml));
 dashboardApp.get("/", (c) => c.redirect("/dashboard", 302));
@@ -293,15 +305,59 @@ dashboardApp.get("/pool/stats", (c) => {
 dashboardApp.get("/metrics/monitor", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
-  return c.json(buildMonitorSummary());
+  // V2: real in-memory AI-request ring (since process start). When no AI
+  // request has completed yet, fall back to the global HTTP counters so the
+  // page is still useful on a fresh boot.
+  const summary = getMonitorSummary();
+  if (summary.totalEntries === 0) {
+    return c.json(buildMonitorSummary());
+  }
+  const emailById = new Map(
+    loadAccounts().map((a) => [a.id, a.email] as [string, string]),
+  );
+  return c.json({
+    totals: summary.totals,
+    modeComparison: {
+      streaming: summary.modeComparison.streaming,
+      nonStreaming: summary.modeComparison.nonStreaming,
+    },
+    accounts: summary.accounts.map((a) => ({
+      email: emailById.get(a.accountId) ?? a.accountId,
+      accountId: a.accountId,
+      totalRequests: a.totalRequests,
+      successCount: a.successCount,
+      errorCount: a.errorCount,
+      errorRate: a.errorRate,
+      avgLatencyMs: a.avgLatencyMs,
+      medianLatencyMs: a.medianLatencyMs,
+      p95LatencyMs: a.p95LatencyMs,
+      byMode: {
+        streaming: a.byMode.streaming,
+        nonStreaming: a.byMode.nonStreaming,
+      },
+      recentErrors: a.recentErrors,
+      lastActivity: a.lastActivity,
+    })),
+    topErrors: summary.topErrors,
+    timeRange: summary.timeRange,
+    totalEntries: summary.totalEntries,
+    capabilities: {
+      perAccount: true,
+      percentiles: true,
+      modes: true,
+      topErrors: true,
+      window: "since process start (in-memory)",
+    },
+  });
 });
 
 dashboardApp.get("/metrics/model-health", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
-  // No per-model success/error counters exist in V1; return the honest
-  // empty shape the frontend already renders as "No model activity".
-  return c.json({});
+  // V2: real per-model counters from the AI-request ring, in the exact
+  // QwenGate shape the overview table already renders. Empty = no model
+  // activity yet (the UI shows its empty state).
+  return c.json(getModelHealth());
 });
 
 dashboardApp.get("/metrics/uptime", (c) => {
@@ -313,18 +369,110 @@ dashboardApp.get("/metrics/uptime", (c) => {
   });
 });
 
+const VALID_LOG_LEVELS = new Set(["debug", "info", "warn", "error"]);
+
 dashboardApp.get("/system/logs", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
-  // No structured, redacted log store exists in V1 — refuse instead of
-  // parsing free-form console output into fake structure.
-  return c.json(
-    {
-      error: "System logs are not available in dashboard V1",
-      code: "UNSUPPORTED",
-    },
-    501,
+  // V2: bounded in-memory Logger ring (redacted on ingest). Query params
+  // mirror QwenGate: ?limit=&level= (min level).
+  const limit = Math.max(
+    1,
+    Math.min(
+      200,
+      Number.parseInt(c.req.query("limit") ?? "100", 10) || 100,
+    ),
   );
+  const levelParam = (c.req.query("level") ?? "debug").toLowerCase();
+  const minLevel = (
+    VALID_LOG_LEVELS.has(levelParam) ? levelParam : "debug"
+  ) as "debug" | "info" | "warn" | "error";
+  return c.json(getRecentDashboardLogs(limit, minLevel));
+});
+
+// ─── Usage (V2: real runtime window, never faked history) ────────────────────
+
+dashboardApp.get("/api/usage", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const usage = getUsageSummary();
+  const emailById = new Map(
+    loadAccounts().map((a) => [a.id, a.email] as [string, string]),
+  );
+  // Per-account × model breakdown derived from the retained AI-request
+  // window (top 5 models each). Real counts only — no daily buckets exist.
+  const modelsByAccount = new Map<string, Map<string, number>>();
+  for (const r of getRecentAIRequests(1000)) {
+    if (!r.accountId) continue;
+    let m = modelsByAccount.get(r.accountId);
+    if (!m) {
+      m = new Map<string, number>();
+      modelsByAccount.set(r.accountId, m);
+    }
+    m.set(r.model, (m.get(r.model) ?? 0) + 1);
+  }
+  return c.json({
+    window: usage.window,
+    totals: usage.totals,
+    accounts: usage.accounts.map((a) => ({
+      ...a,
+      email: emailById.get(a.accountId) ?? a.accountId,
+      perModel: [...(modelsByAccount.get(a.accountId) ?? new Map()).entries()]
+        .map(([model, requests]) => ({ model, requests }))
+        .sort((x, y) => y.requests - x.requests)
+        .slice(0, 5),
+    })),
+    models: usage.models,
+    routes: usage.routes,
+  });
+});
+
+dashboardApp.get("/api/usage/raw", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const limit = Math.max(
+    1,
+    Math.min(200, Number.parseInt(c.req.query("limit") ?? "100", 10) || 100),
+  );
+  return c.json(getRecentAIRequests(limit));
+});
+
+// ─── Network (V2: passive HTTP ring, auth-protected) ─────────────────────────
+// NOTE: the HTML page lives at GET /dashboard/network (registered above);
+// this JSON feed uses /dashboard/network/events to avoid a route clash.
+dashboardApp.get("/dashboard/network/events", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const limit = Math.max(
+    1,
+    Math.min(200, Number.parseInt(c.req.query("limit") ?? "50", 10) || 50),
+  );
+  const emailById = new Map(
+    loadAccounts().map((a) => [a.id, a.email] as [string, string]),
+  );
+  const aiByHttpId = new Map(
+    getRecentAIRequests(1000)
+      .filter((r) => r.httpRequestId)
+      .map((r) => [r.httpRequestId as string, r] as const),
+  );
+  return c.json({
+    entries: getRecentNetworkEvents(limit).map((e) => {
+      const detail = aiByHttpId.get(e.requestId);
+      return {
+        ...e,
+        model: detail?.model ?? null,
+        stream: detail?.stream ?? null,
+        accountEmail: detail?.accountId
+          ? (emailById.get(detail.accountId) ?? detail.accountId)
+          : null,
+        ok: detail ? detail.success : e.status >= 200 && e.status < 300,
+        error: detail?.error ?? null,
+        errorReason: detail?.errorReason ?? null,
+        retryCount: detail?.retryCount ?? 0,
+        attemptedAccounts: detail?.attemptedAccounts ?? 1,
+      };
+    }),
+  });
 });
 
 // ─── Config (safe read-only subset; PUT disabled in V1) ──────────────────────

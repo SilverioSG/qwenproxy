@@ -62,6 +62,16 @@ async function refreshMonitor() {
     entryBadge.className = 'badge ' + (t.totalErrors > 0 ? 'badge-warning' : 'badge-accent');
   }
 
+  // ── Data window label (honest scope) ──
+  var timeEl = document.getElementById('timeRange');
+  if (timeEl) {
+    if (data.timeRange && data.timeRange.from && data.timeRange.to) {
+      timeEl.textContent = 'AI requests from ' + fmtTime(data.timeRange.from) + ' to ' + fmtTime(data.timeRange.to);
+    } else if (data.capabilities && data.capabilities.window) {
+      timeEl.textContent = data.capabilities.window;
+    }
+  }
+
   // ── Mode Comparison (only if the adapter provides it) ──
   var mc = data.modeComparison || {};
   if (mc.streaming || mc.nonStreaming) {
