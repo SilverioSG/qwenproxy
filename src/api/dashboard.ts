@@ -1,0 +1,429 @@
+/**
+ * QwenProxy dashboard adapter (V1).
+ *
+ * QwenGate is the functional/visual source of truth; DeepSeek-Gate was used
+ * only as the decoupling reference (id-keyed handlers, sessionStorage auth,
+ * presentation-only resolvers, strict static whitelist).
+ *
+ * This module rebuilds the dashboard contract consumed by the QwenGate-style
+ * frontend in `src/routes/dashboard/public/` using ONLY real QwenProxy data:
+ *
+ * - GET /accounts            from loadAccounts + cooldowns + headersReady + leases
+ * - GET /pool/stats           from getAccountConcurrencySnapshot + cooldowns
+ * - GET /metrics/monitor      from requests.total/errors + latency histogram (global only)
+ * - GET /metrics/model-health empty (no per-model counters exist; UI shows empty state)
+ * - GET /metrics/uptime       from process.uptime + package.json version
+ * - GET /system/logs          UNSUPPORTED in V1 (no structured log store)
+ * - GET /api/config           safe read-only subset (never secrets)
+ * - POST /v1/accounts, DELETE /v1/accounts/:id,
+ *   POST /v1/accounts/:id/reset-cooldown  (native business logic only)
+ *
+ * V1 rules enforced here: no synthetic metrics, no invented per-account
+ * history, no `disabled` semantics, no passwords/cookies/tokens exposed,
+ * no historical persistence, no new business semantics.
+ */
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Hono, type Context } from "hono";
+import {
+  clearAccountCooldown,
+  getAccountCooldownInfo,
+  isAccountHeadersReady,
+} from "../core/account-manager.js";
+import {
+  addAccount as createAccount,
+  loadAccounts,
+  removeAccount,
+} from "../core/accounts.js";
+import { getAccountsByPriority } from "../core/account-priority.js";
+import { getAccountConcurrencySnapshot } from "../core/account-concurrency.js";
+import { config } from "../core/config.js";
+import { metrics } from "../core/metrics.js";
+import { verifyApiKey } from "./server.js";
+import {
+  accountsHtml,
+  monitorHtml,
+  overviewHtml,
+  settingsHtml,
+} from "../routes/dashboard/pages.js";
+
+export const dashboardApp = new Hono();
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = resolve(HERE, "..", "routes", "dashboard", "public");
+
+let packageVersion = "unknown";
+try {
+  const pkgRaw = readFileSync(
+    resolve(HERE, "..", "..", "package.json"),
+    "utf-8",
+  );
+  const parsed: unknown = JSON.parse(pkgRaw);
+  if (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    "version" in parsed &&
+    typeof (parsed as { version: unknown }).version === "string"
+  ) {
+    packageVersion = (parsed as { version: string }).version;
+  }
+} catch {
+  packageVersion = "unknown";
+}
+
+// ─── Static hosting (strict whitelist, no traversal) ─────────────────────────
+
+const STATIC_MIME: Record<string, string> = {
+  css: "text/css; charset=utf-8",
+  js: "application/javascript; charset=utf-8",
+  svg: "image/svg+xml",
+};
+
+// ─── Static files are served by the whitelisted handler below ───
+
+dashboardApp.get("/dashboard/static/:file", (c) => {
+  const file = c.req.param("file");
+  if (!/^[a-z0-9_-]+\.(css|js|svg)$/i.test(file)) {
+    return c.json({ error: "Invalid file" }, 400);
+  }
+  const filePath = resolve(PUBLIC_DIR, file);
+  if (!filePath.startsWith(PUBLIC_DIR + "/") && filePath !== PUBLIC_DIR) {
+    return c.json({ error: "Not found" }, 404);
+  }
+  if (!existsSync(filePath)) {
+    return c.json({ error: "Not found" }, 404);
+  }
+  const ext = file.split(".").pop()?.toLowerCase() ?? "";
+  const contentType = STATIC_MIME[ext] ?? "application/octet-stream";
+  return c.text(readFileSync(filePath, "utf-8"), 200, {
+    "Content-Type": contentType,
+    "Cache-Control": "public, max-age=300",
+  });
+});
+
+// ─── Pages (public static admin UI; data endpoints below require API key) ────
+
+function serveHtml(html: string) {
+  return (c: Context) => {
+    const scriptInjection =
+      `<script>\nwindow.APP_VERSION = ${JSON.stringify(packageVersion)};\n</script>\n` +
+      `<link rel="icon" type="image/svg+xml" href="/dashboard/static/logo.svg">\n`;
+    const output = html.replace(/(<script\b)/, `${scriptInjection}$1`);
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';",
+    );
+    return c.html(output);
+  };
+}
+
+dashboardApp.get("/dashboard", serveHtml(overviewHtml));
+dashboardApp.get("/dashboard/accounts", serveHtml(accountsHtml));
+dashboardApp.get("/dashboard/monitor", serveHtml(monitorHtml));
+dashboardApp.get("/dashboard/settings", serveHtml(settingsHtml));
+dashboardApp.get("/", (c) => c.redirect("/dashboard", 302));
+
+// ─── Read adapters (real data only) ──────────────────────────────────────────
+
+export interface DashboardAccount {
+  id: string;
+  email: string;
+  ready: boolean;
+  available: boolean;
+  headersReady: boolean;
+  cooldown: boolean;
+  cooldown_remaining_ms: number | null;
+  cooldown_reason: string | null;
+  inFlight: number;
+  waiting: number;
+  priority: number | null;
+}
+
+export function buildAccountsList(): DashboardAccount[] {
+  const accounts = loadAccounts();
+  const snapshotById = new Map(
+    getAccountConcurrencySnapshot().map((s) => [s.accountId, s]),
+  );
+  const priorityOrder = getAccountsByPriority(accounts);
+  const priorityIndex = new Map(
+    priorityOrder.map((a, i) => [a.id, i] as [string, number]),
+  );
+  // Memory cooldown map may be empty for entries restored only in the DB
+  // (e.g. after restart before first rotation); fall back to the persisted
+  // cooldown_until so the dashboard never reports a cooling account as ready.
+  const persistedById = new Map(
+    accounts.map((a) => [a.id, a] as const),
+  );
+
+  return accounts.map((a) => {
+    const mem = getAccountCooldownInfo(a.id);
+    let onCooldown = mem !== null;
+    let remainingMs: number | null = mem?.remainingMs ?? null;
+    let reason: string | null = mem?.reason ?? null;
+    if (!onCooldown) {
+      const persisted = persistedById.get(a.id);
+      const until = persisted?.cooldown_until ?? 0;
+      if (until > Date.now()) {
+        onCooldown = true;
+        remainingMs = until - Date.now();
+        reason = persisted?.cooldown_reason ?? "RateLimited";
+      }
+    }
+    const snap = snapshotById.get(a.id);
+    const headersReady = isAccountHeadersReady(a.id);
+    return {
+      id: a.id,
+      email: a.email,
+      ready: headersReady && !onCooldown,
+      available: !onCooldown,
+      headersReady,
+      cooldown: onCooldown,
+      cooldown_remaining_ms: remainingMs,
+      cooldown_reason: reason,
+      inFlight: snap?.active ?? 0,
+      waiting: snap?.waiting ?? 0,
+      priority: priorityIndex.get(a.id) ?? null,
+    };
+  });
+}
+
+export function buildPoolStats(): {
+  total: number;
+  available: number;
+  inUse: number;
+  waiting: number;
+} {
+  const list = buildAccountsList();
+  return {
+    total: list.length,
+    available: list.filter((a) => a.available).length,
+    inUse: list.reduce((sum, a) => sum + a.inFlight, 0),
+    waiting: list.reduce((sum, a) => sum + a.waiting, 0),
+  };
+}
+
+interface HistogramAggregate {
+  count: number;
+  sum: number;
+}
+
+export function buildMonitorSummary(): {
+  totals: {
+    totalRequests: number;
+    totalSuccess: number;
+    totalErrors: number;
+    overallErrorRate: number;
+    overallAvgLatencyMs: number | null;
+    p95LatencyMs: null;
+    medianLatencyMs: null;
+  };
+  modeComparison: { streaming: null; nonStreaming: null };
+  accounts: never[];
+  topErrors: never[];
+  timeRange: null;
+  totalEntries: number;
+  capabilities: {
+    perAccount: false;
+    percentiles: false;
+    modes: false;
+    topErrors: false;
+  };
+} {
+  const total = metrics.get("requests.total")?.value ?? 0;
+  const errors = metrics.get("requests.errors")?.value ?? 0;
+  const totalRequests = typeof total === "number" ? total : 0;
+  const totalErrors = typeof errors === "number" ? errors : 0;
+  const totalSuccess = Math.max(0, totalRequests - totalErrors);
+
+  let avg: number | null = null;
+  const latencyPoint = metrics.get("latency.request");
+  const raw = latencyPoint?.value as unknown;
+  if (typeof raw === "object" && raw !== null) {
+    const agg = raw as Partial<HistogramAggregate>;
+    if (
+      typeof agg.count === "number" &&
+      typeof agg.sum === "number" &&
+      agg.count > 0
+    ) {
+      avg = Math.round(agg.sum / agg.count);
+    }
+  }
+
+  return {
+    totals: {
+      totalRequests,
+      totalSuccess,
+      totalErrors,
+      overallErrorRate:
+        totalRequests > 0
+          ? Math.round((totalErrors / totalRequests) * 10000) / 100
+          : 0,
+      overallAvgLatencyMs: avg,
+      // V1 collects no percentile data: explicit nulls, never fabricated.
+      p95LatencyMs: null,
+      medianLatencyMs: null,
+    },
+    modeComparison: { streaming: null, nonStreaming: null },
+    accounts: [],
+    topErrors: [],
+    timeRange: null,
+    totalEntries: totalRequests,
+    capabilities: {
+      perAccount: false,
+      percentiles: false,
+      modes: false,
+      topErrors: false,
+    },
+  };
+}
+
+dashboardApp.get("/accounts", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json(buildAccountsList());
+});
+
+dashboardApp.get("/pool/stats", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json(buildPoolStats());
+});
+
+dashboardApp.get("/metrics/monitor", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json(buildMonitorSummary());
+});
+
+dashboardApp.get("/metrics/model-health", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  // No per-model success/error counters exist in V1; return the honest
+  // empty shape the frontend already renders as "No model activity".
+  return c.json({});
+});
+
+dashboardApp.get("/metrics/uptime", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json({
+    uptimeSeconds: Math.floor(process.uptime()),
+    version: packageVersion,
+  });
+});
+
+dashboardApp.get("/system/logs", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  // No structured, redacted log store exists in V1 — refuse instead of
+  // parsing free-form console output into fake structure.
+  return c.json(
+    {
+      error: "System logs are not available in dashboard V1",
+      code: "UNSUPPORTED",
+    },
+    501,
+  );
+});
+
+// ─── Config (safe read-only subset; PUT disabled in V1) ──────────────────────
+
+dashboardApp.get("/api/config", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const apiKey = process.env.API_KEY || config.apiKey;
+  return c.json({
+    PORT: String(config.server.port),
+    HOST: config.server.host,
+    QWEN_BASE_URL: config.qwen.baseUrl,
+    QWEN_CHAT_MODE: config.qwen.chatMode,
+    QWEN_CHAT_POOL_SIZE: String(config.qwen.chatPoolSize),
+    ACCOUNT_MAX_CONCURRENT_STREAMS: String(
+      config.concurrency.maxStreamsPerAccount,
+    ),
+    apiKeyConfigured: Boolean(apiKey),
+    readonly: true,
+    source: ".env (restart required)",
+  });
+});
+
+dashboardApp.put("/api/config", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json(
+    {
+      error: "Dashboard configuration is read-only in V1 (managed via .env)",
+      code: "READ_ONLY",
+    },
+    405,
+  );
+});
+
+// ─── Account management (native business logic only) ─────────────────────────
+
+dashboardApp.get("/v1/accounts", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json(buildAccountsList());
+});
+
+dashboardApp.post("/v1/accounts", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  const email =
+    typeof body === "object" && body !== null
+      ? String((body as { email?: unknown }).email ?? "").trim()
+      : "";
+  const password =
+    typeof body === "object" && body !== null
+      ? String((body as { password?: unknown }).password ?? "")
+      : "";
+  if (!email || !password) {
+    return c.json({ error: "email and password are required" }, 400);
+  }
+  try {
+    const created = createAccount(email, password);
+    return c.json({ ok: true, id: created.id, email: created.email }, 201);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = message.includes("already exists") ? 409 : 400;
+    return c.json({ error: message }, status);
+  }
+});
+
+dashboardApp.delete("/v1/accounts/:id", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const exists = loadAccounts().some((a) => a.id === id);
+  if (!exists) {
+    return c.json({ error: "Account not found" }, 404);
+  }
+  removeAccount(id);
+  // Drop any in-memory cooldown entry so a removed id never leaks state.
+  try {
+    clearAccountCooldown(id);
+  } catch {
+    // Best effort; removal already succeeded.
+  }
+  return c.json({ ok: true, id });
+});
+
+dashboardApp.post("/v1/accounts/:id/reset-cooldown", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const exists = loadAccounts().some((a) => a.id === id);
+  if (!exists) {
+    return c.json({ error: "Account not found" }, 404);
+  }
+  clearAccountCooldown(id);
+  return c.json({ ok: true, id, onCooldown: false });
+});

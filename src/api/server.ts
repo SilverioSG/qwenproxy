@@ -18,6 +18,7 @@ import { responsesApp } from "../routes/responses/index.js";
 import { completionsLegacy } from "../routes/completions.js";
 import { anthropicApp } from "../routes/anthropic/index.ts";
 import { sendOpenAIError } from "./error-helpers.js";
+import { dashboardApp } from "./dashboard.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
@@ -169,7 +170,7 @@ function extractProvidedApiKeys(c: Context): string[] {
   return keys;
 }
 
-function verifyApiKey(c: Context): Response | null {
+export function verifyApiKey(c: Context): Response | null {
   const apiKey = process.env.API_KEY || config.apiKey;
   if (!apiKey) return null;
 
@@ -236,6 +237,11 @@ app.get("/v1/tasks/status/:taskId", videoTaskStatus);
 // OpenAI Responses API compatible routes
 app.route("", responsesApp);
 app.route("", anthropicApp);
+
+// QwenGate-style dashboard (V1: static pages + read-only adapters).
+// Mounted after the API routes; registers no conflicting paths and does
+// not alter the existing /health contract.
+app.route("", dashboardApp);
 
 // Accept paths without the /v1 prefix via a 308 redirect (method + body are
 // preserved on redirect). Most clients append /v1 themselves; the redirect
