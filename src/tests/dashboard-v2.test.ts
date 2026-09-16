@@ -356,3 +356,93 @@ test("http hook logs AI routes and errors, skips self-poll noise", async () => {
     .filter((e) => e.category === "http").length;
   assert.equal(afterLogs, beforeLogs, "no http entry for /system/logs 200");
 });
+
+test("syslog dedupe renders log-9/log-10/log-11 exactly once (no string-max freeze)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { resolve, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const vm = await import("node:vm");
+
+  const served = await (
+    await app.request("/dashboard/static/overview.js")
+  ).text();
+  assert.ok(
+    !served.includes("_lastSysLogId"),
+    "string-max dedupe pattern is gone from served file",
+  );
+  assert.ok(
+    served.includes("_seenSysLogIds"),
+    "seen-ids dedupe present in served file",
+  );
+
+  const here = dirname(fileURLToPath(import.meta.url));
+  const pub = resolve(here, "..", "routes", "dashboard", "public");
+  const sharedJs = readFileSync(resolve(pub, "shared.js"), "utf-8");
+  const overviewJs = readFileSync(resolve(pub, "overview.js"), "utf-8");
+
+  // Two consecutive polls, newest-first, crossing the 9 -> 10 boundary.
+  const polls = [
+    [
+      { id: "log-9", timestamp: 3, level: "info", category: "server", message: "event log-9" },
+      { id: "log-8", timestamp: 2, level: "info", category: "server", message: "event log-8" },
+    ],
+    [
+      { id: "log-11", timestamp: 5, level: "info", category: "server", message: "event log-11" },
+      { id: "log-10", timestamp: 4, level: "info", category: "server", message: "event log-10" },
+      { id: "log-9", timestamp: 3, level: "info", category: "server", message: "event log-9" },
+      { id: "log-8", timestamp: 2, level: "info", category: "server", message: "event log-8" },
+    ],
+  ];
+  let pollIdx = 0;
+
+  const makeEl = () => ({
+    innerHTML: "",
+    textContent: "",
+    style: {},
+    insertAdjacentHTML(_pos: string, html: string) {
+      (this as { innerHTML: string }).innerHTML = html + (this as { innerHTML: string }).innerHTML;
+    },
+    querySelectorAll: () => [],
+    appendChild: () => {},
+  });
+  const elements = new Map<string, ReturnType<typeof makeEl>>();
+  const sandbox: Record<string, unknown> = {
+    console,
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    fetch: async (url: string) => ({
+      status: 200,
+      ok: true,
+      json: async () =>
+        String(url).includes("/system/logs")
+          ? polls[Math.min(pollIdx++, polls.length - 1)]
+          : null,
+    }),
+    prompt: () => null,
+    document: {
+      readyState: "loading",
+      addEventListener: () => {},
+      getElementById: (id: string) => {
+        if (!elements.has(id)) elements.set(id, makeEl());
+        return elements.get(id);
+      },
+      createElement: () => makeEl(),
+      hidden: false,
+    },
+  };
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(sharedJs, sandbox);
+  vm.runInContext(overviewJs, sandbox);
+  await (sandbox.refreshSysLogs as () => Promise<void>)();
+  await (sandbox.refreshSysLogs as () => Promise<void>)();
+
+  const html = String(
+    (elements.get("sysLogsContainer") as { innerHTML: string }).innerHTML,
+  );
+  for (const id of ["log-8", "log-9", "log-10", "log-11"]) {
+    const count = html.split(`event ${id}`).length - 1;
+    assert.equal(count, 1, `${id} rendered exactly once (got ${count})`);
+  }
+});

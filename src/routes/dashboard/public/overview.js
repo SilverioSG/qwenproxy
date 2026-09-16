@@ -132,8 +132,24 @@ async function refreshModelHealth() {
   }
   tbody.innerHTML = rows;
 }
-/* ── System Logs (unsupported in V1: endpoint answers 501) ── */
-var _lastSysLogId = '';
+/* ── System Logs ──
+ * Dedupe by seen-ids dictionary (not string max-comparison): backend ids
+ * are sequential `log-N`, where "log-10" <= "log-9" lexicographically and a
+ * max-id filter would freeze the panel past 9 entries. The backend ring is
+ * capped at 200, so the dict stays bounded by pruning to recent keys.
+ */
+var _seenSysLogIds = {};
+var _seenSysLogOrder = [];
+var _seenSysLogCap = 500;
+function _markSysLogSeen(id) {
+  if (_seenSysLogIds[id]) return;
+  _seenSysLogIds[id] = true;
+  _seenSysLogOrder.push(id);
+  if (_seenSysLogOrder.length > _seenSysLogCap) {
+    var drop = _seenSysLogOrder.splice(0, _seenSysLogOrder.length - _seenSysLogCap);
+    for (var d = 0; d < drop.length; d++) delete _seenSysLogIds[drop[d]];
+  }
+}
 async function refreshSysLogs() {
   var data = await apiFetch('/system/logs');
   var container = document.getElementById('sysLogsContainer');
@@ -141,10 +157,10 @@ async function refreshSysLogs() {
   if (!data || !Array.isArray(data) || data.length === 0) return;
   empty.style.display = 'none';
   var html = '';
-  var maxId = _lastSysLogId;
   for (var i = 0; i < data.length; i++) {
     var l = data[i];
-    if (!l.id || l.id <= _lastSysLogId) continue;
+    if (!l.id || _seenSysLogIds[l.id]) continue;
+    _markSysLogSeen(l.id);
     var lvl = (l.level || 'info').toLowerCase();
     var cls = lvl === 'debug' ? 'log-debug' : lvl === 'warn' || lvl === 'warning' ? 'log-warn' : lvl === 'error' ? 'log-error' : 'log-info';
     html +=
@@ -167,11 +183,9 @@ async function refreshSysLogs() {
     if (lvl === 'error' || lvl === 'warn') {
       showNotif(lvl, l.category || '', l.message || '');
     }
-    if (l.id > maxId) maxId = l.id;
   }
   if (!html) return;
   container.insertAdjacentHTML('afterbegin', html);
-  _lastSysLogId = maxId;
 }
 function showNotif(level, category, message) {
   var container = document.getElementById('notifContainer') || document.body;
