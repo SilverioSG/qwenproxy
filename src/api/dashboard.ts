@@ -38,6 +38,7 @@ import {
 } from "../core/accounts.js";
 import { getAccountsByPriority } from "../core/account-priority.js";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.js";
+import { getActivePlaywrightAccountIds } from "../services/playwright.ts";
 import { config } from "../core/config.js";
 import { metrics } from "../core/metrics.js";
 import { getRecentDashboardLogs } from "../core/logger.js";
@@ -144,6 +145,7 @@ export interface DashboardAccount {
   ready: boolean;
   available: boolean;
   headersReady: boolean;
+  hasActiveContext: boolean;
   cooldown: boolean;
   cooldown_remaining_ms: number | null;
   cooldown_reason: string | null;
@@ -168,6 +170,8 @@ export function buildAccountsList(): DashboardAccount[] {
     accounts.map((a) => [a.id, a] as const),
   );
 
+  const activeContextIds = new Set(getActivePlaywrightAccountIds());
+
   return accounts.map((a) => {
     const mem = getAccountCooldownInfo(a.id);
     let onCooldown = mem !== null;
@@ -190,6 +194,7 @@ export function buildAccountsList(): DashboardAccount[] {
       ready: headersReady && !onCooldown,
       available: !onCooldown,
       headersReady,
+      hasActiveContext: activeContextIds.has(a.id),
       cooldown: onCooldown,
       cooldown_remaining_ms: remainingMs,
       cooldown_reason: reason,

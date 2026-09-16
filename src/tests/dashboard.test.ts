@@ -109,6 +109,7 @@ test("/accounts returns real-shape list without secrets", async () => {
       "ready",
       "available",
       "headersReady",
+      "hasActiveContext",
       "cooldown",
       "cooldown_remaining_ms",
       "cooldown_reason",
@@ -285,5 +286,107 @@ test("existing /health contract is unchanged", async () => {
   const body = (await res.json()) as Record<string, unknown>;
   for (const key of ["status", "timestamp", "metrics"]) {
     assert.ok(key in body, `missing ${key}`);
+  }
+});
+
+test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveContext", async () => {
+  const { buildAccountsList } = await import("../api/dashboard.ts");
+  const {
+    markAccountHeadersReady,
+    unmarkAccountHeadersReady,
+    markAccountRateLimited,
+    clearAccountCooldown,
+  } = await import("../core/account-manager.ts");
+  const {
+    registerPlaywrightAccountForTests,
+    unregisterPlaywrightAccountForTests,
+  } = await import("../services/playwright.ts");
+  const { getDatabase } = await import("../core/database.ts");
+  const { invalidateAccountsCache } = await import("../core/accounts.ts");
+
+  const db = getDatabase();
+  const ids = {
+    readyCtx: "semantic-ready-ctx",
+    warmingCtx: "semantic-warming-ctx",
+    standby: "semantic-standby",
+    cooldown: "semantic-cooldown",
+  };
+  const insert = db.prepare(
+    "INSERT OR REPLACE INTO accounts (id, email, password) VALUES (?, ?, ?)",
+  );
+  insert.run(ids.readyCtx, "ready-ctx@example.com", "x");
+  insert.run(ids.warmingCtx, "warming-ctx@example.com", "x");
+  insert.run(ids.standby, "standby@example.com", "x");
+  insert.run(ids.cooldown, "cooldown@example.com", "x");
+  invalidateAccountsCache();
+
+  const stubPage = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+  } as any;
+
+  try {
+    markAccountHeadersReady(ids.readyCtx);
+    registerPlaywrightAccountForTests(ids.readyCtx, stubPage, Date.now());
+
+    registerPlaywrightAccountForTests(ids.warmingCtx, stubPage, Date.now());
+
+    markAccountRateLimited(ids.cooldown, 600_000, "SemanticTest");
+
+    const list = buildAccountsList();
+    const byId = new Map(list.map((a) => [a.id, a]));
+
+    const readyAcc = byId.get(ids.readyCtx)!;
+    assert.equal(readyAcc.ready, true, "ready + ctx -> ready");
+    assert.equal(readyAcc.headersReady, true);
+    assert.equal(readyAcc.hasActiveContext, true, "ready: hasActiveContext");
+    assert.equal(readyAcc.cooldown, false);
+    assert.equal(readyAcc.available, true, "ready: available = !cooldown");
+
+    const warmingAcc = byId.get(ids.warmingCtx)!;
+    assert.equal(warmingAcc.headersReady, false, "warming: no headers yet");
+    assert.equal(warmingAcc.hasActiveContext, true, "warming: has context");
+    assert.equal(warmingAcc.ready, false, "warming: not ready");
+    assert.equal(warmingAcc.cooldown, false);
+    assert.equal(warmingAcc.available, true, "warming: available = !cooldown");
+
+    const standbyAcc = byId.get(ids.standby)!;
+    assert.equal(standbyAcc.headersReady, false, "standby: no headers");
+    assert.equal(standbyAcc.hasActiveContext, false, "standby: no context");
+    assert.equal(standbyAcc.ready, false, "standby: not ready");
+    assert.equal(standbyAcc.cooldown, false);
+    assert.equal(standbyAcc.available, true, "standby: available = !cooldown");
+
+    const cooldownAcc = byId.get(ids.cooldown)!;
+    assert.equal(cooldownAcc.cooldown, true, "cooldown: on cooldown");
+    assert.equal(cooldownAcc.available, false, "cooldown: available = false");
+    assert.equal(cooldownAcc.ready, false, "cooldown: not ready");
+
+    for (const a of [readyAcc, warmingAcc, standbyAcc, cooldownAcc]) {
+      for (const key of [
+        "id",
+        "email",
+        "ready",
+        "available",
+        "headersReady",
+        "hasActiveContext",
+        "cooldown",
+        "cooldown_remaining_ms",
+        "cooldown_reason",
+        "inFlight",
+        "waiting",
+        "priority",
+      ]) {
+        assert.ok(key in a, `field ${key} present on ${a.id}`);
+      }
+    }
+  } finally {
+    unmarkAccountHeadersReady(ids.readyCtx);
+    unregisterPlaywrightAccountForTests(ids.readyCtx);
+    unregisterPlaywrightAccountForTests(ids.warmingCtx);
+    clearAccountCooldown(ids.cooldown);
+    const del = db.prepare("DELETE FROM accounts WHERE id = ?");
+    for (const id of Object.values(ids)) del.run(id);
+    invalidateAccountsCache();
   }
 });

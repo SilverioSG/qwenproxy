@@ -51,13 +51,15 @@ function setError(msg) {
 function getStatus(acct) {
   if (acct.cooldown) return 'cooldown';
   if (acct.ready) return 'live';
-  return 'pending';
+  if (acct.hasActiveContext && !acct.headersReady) return 'warming';
+  return 'standby';
 }
 
 function getStatusLabel(status) {
   if (status === 'live') return 'Ready';
   if (status === 'cooldown') return 'Cooldown';
-  return 'Not ready';
+  if (status === 'warming') return 'Warming';
+  return 'Standby';
 }
 
 function makeCooldownBadge(acct) {
@@ -86,7 +88,9 @@ function renderAccountsTable(accts) {
     var label = getStatusLabel(status);
     var headers = a.headersReady
       ? '<span class="badge badge-success">ready</span>'
-      : '<span class="badge badge-neutral">warming</span>';
+      : a.hasActiveContext
+        ? '<span class="badge badge-neutral">warming</span>'
+        : '<span class="badge badge-neutral">standby</span>';
     rows +=
       '<tr>' +
       '<td>' +
