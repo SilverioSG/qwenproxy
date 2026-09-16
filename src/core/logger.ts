@@ -129,6 +129,21 @@ export function getRecentDashboardLogs(
     .reverse();
 }
 
+/**
+ * Public producer for the dashboard system-log ring, for call sites that
+ * emit via console.* instead of Logger (e.g. server startup/runtime lines
+ * in api/server.ts). Reuses exactly the internal ring logic: same
+ * redaction, same 200-entry bound, never throws. Console output of the
+ * caller is untouched — this only mirrors the message into the ring.
+ */
+export function recordDashboardSystemLog(
+  level: LogLevel,
+  category: string,
+  message: string,
+): void {
+  recordDashboardLog(level, category || undefined, message);
+}
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_RANK: Record<LogLevel, number> = {

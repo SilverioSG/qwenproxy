@@ -294,3 +294,65 @@ test("error text is truncated and redacted on ingest", async () => {
   assert.ok(!rec.error?.includes("A".repeat(50)), "secret stripped");
   stats.resetDashboardStatsForTesting();
 });
+
+test("public ring producer feeds /system/logs with redaction", async () => {
+  const { recordDashboardSystemLog } = await import("../core/logger.ts");
+  recordDashboardSystemLog("info", "server", "probe server boot line");
+  const res = await get("/system/logs?limit=200&level=debug");
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as Array<Record<string, unknown>>;
+  const probe = body.find((e) => e.message === "probe server boot line");
+  assert.ok(probe, "public producer entry present");
+  assert.equal(probe.category, "server");
+  assert.equal(probe.level, "info");
+
+  const secret = "sk-abcdefghij1234567890ABCD";
+  recordDashboardSystemLog("error", "server", `probe leak ${secret} end`);
+  const res2 = await get("/system/logs?limit=200&level=debug");
+  const body2 = (await res2.json()) as Array<Record<string, unknown>>;
+  const leaked = body2.find((e) =>
+    String(e.message ?? "").includes("probe leak"),
+  );
+  assert.ok(leaked, "secret probe present");
+  assert.ok(!String(leaked.message).includes(secret), "secret redacted");
+  assert.ok(
+    String(leaked.message).includes("[REDACTED]"),
+    "redaction marker present",
+  );
+});
+
+test("http hook logs AI routes and errors, skips self-poll noise", async () => {
+  const loggerMod = await import("../core/logger.ts");
+
+  // Dashboard self-poll success: /health 200 must not add http noise.
+  const beforeHealth = loggerMod
+    .getRecentDashboardLogs(200, "debug")
+    .filter((e) => e.category === "http").length;
+  await app.request("/health");
+  const afterHealth = loggerMod
+    .getRecentDashboardLogs(200, "debug")
+    .filter((e) => e.category === "http").length;
+  assert.equal(afterHealth, beforeHealth, "no http entry for /health 200");
+
+  // Errors anywhere are genuine signal: unknown route 404 is recorded.
+  await app.request("/definitely-not-a-route-xyz");
+  const entries = loggerMod.getRecentDashboardLogs(200, "debug");
+  const notFound = entries.find(
+    (e) =>
+      e.category === "http" &&
+      String(e.message).includes("/definitely-not-a-route-xyz") &&
+      String(e.message).includes("404"),
+  );
+  assert.ok(notFound, "http DEBUG entry for 404");
+  assert.match(String(notFound.message), /^GET \/definitely-not-a-route-xyz 404 \d+ms$/);
+
+  // /system/logs success itself never self-logs (no polling feedback).
+  const beforeLogs = loggerMod
+    .getRecentDashboardLogs(200, "debug")
+    .filter((e) => e.category === "http").length;
+  await get("/system/logs?limit=5");
+  const afterLogs = loggerMod
+    .getRecentDashboardLogs(200, "debug")
+    .filter((e) => e.category === "http").length;
+  assert.equal(afterLogs, beforeLogs, "no http entry for /system/logs 200");
+});

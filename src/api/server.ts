@@ -5,7 +5,7 @@ import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
 import { config } from "../core/config.js";
 import { metrics } from "../core/metrics.js";
-import { logger, maskEmail } from "../core/logger.js";
+import { logger, maskEmail, recordDashboardSystemLog } from "../core/logger.js";
 import { MemoryCache } from "../cache/memory-cache.js";
 import { Watchdog } from "../core/watchdog.js";
 import { getAccountCooldownInfo } from "../core/account-manager.js";
@@ -37,6 +37,22 @@ const app = new Hono();
 function formatAccountId(accountId: string): string {
   const normalized = accountId.trim();
   return normalized.length > 12 ? `${normalized.slice(0, 12)}…` : normalized;
+}
+
+/**
+ * Mirror a server console line into the dashboard system-log ring.
+ * Console/journal output is untouched; the ring keeps its redaction and
+ * 200-entry bound. Never throws; never affects gateway logic.
+ */
+function mirrorServerLog(
+  level: "info" | "warn" | "error",
+  message: string,
+): void {
+  try {
+    recordDashboardSystemLog(level, "server", message);
+  } catch {
+    // Logging must never break the request/startup path.
+  }
 }
 
 /**
@@ -197,14 +213,35 @@ app.use("*", async (c, next) => {
   // in-memory network ring. No behavior change (best-effort, never throws).
   // Reuses the requestId generated above (client-supplied or uuid).
   try {
+    const httpPath = new URL(c.req.url).pathname;
+    const httpRoute = deriveDashboardRoute(c);
     recordNetworkEvent({
       requestId,
-      route: deriveDashboardRoute(c),
+      route: httpRoute,
       method: c.req.method,
-      path: new URL(c.req.url).pathname,
+      path: httpPath,
       status: c.res.status,
       latencyMs: duration,
     });
+    // Optional HTTP live logs for System Logs (DeepSeek-style traffic view):
+    // DEBUG entries for AI-serving routes plus errors anywhere. Dashboard
+    // self-polling (/health, /accounts, /metrics/*, /system/logs, …) is
+    // deliberately excluded on success so the 200-entry ring is not flooded
+    // by its own refresh loop. No headers, body or query are stored.
+    const isAiRoute =
+      httpRoute === "Chat" ||
+      httpRoute === "Responses" ||
+      httpRoute === "Anthropic" ||
+      httpRoute === "completions" ||
+      httpRoute === "media" ||
+      httpRoute === "models";
+    if (isAiRoute || c.res.status >= 400) {
+      recordDashboardSystemLog(
+        "debug",
+        "http",
+        `${c.req.method} ${httpPath} ${c.res.status} ${Math.max(0, Math.round(duration))}ms`,
+      );
+    }
   } catch {
     // Recording must never break the request path.
   }
@@ -448,6 +485,10 @@ async function prepareQwenRuntime(params: {
       console.warn(
         `⚠️ [Server] Account not ready | account=${formatAccountId(params.accountId)} | cooldown=${Math.ceil(cooldownInfo.remainingMs / 1000)}s | reason=${cooldownInfo.reason}`,
       );
+      mirrorServerLog(
+        "warn",
+        `⚠️ [Server] Account not ready | account=${formatAccountId(params.accountId)} | cooldown=${Math.ceil(cooldownInfo.remainingMs / 1000)}s | reason=${cooldownInfo.reason}`,
+      );
       return false;
     }
   }
@@ -464,12 +505,20 @@ async function prepareQwenRuntime(params: {
         console.warn(
           `⚠️ [Server] Account not ready | account=${formatAccountId(params.accountId)} | cooldown=${Math.ceil(cooldownInfo.remainingMs / 1000)}s | reason=${cooldownInfo.reason}`,
         );
+        mirrorServerLog(
+          "warn",
+          `⚠️ [Server] Account not ready | account=${formatAccountId(params.accountId)} | cooldown=${Math.ceil(cooldownInfo.remainingMs / 1000)}s | reason=${cooldownInfo.reason}`,
+        );
         return false;
       }
     }
     return true;
   } catch (error) {
     console.warn(`❌ ${params.failureMessage}`, getErrorMessage(error));
+    mirrorServerLog(
+      "warn",
+      `❌ ${params.failureMessage} ${getErrorMessage(error)}`,
+    );
     if (params.accountId) {
       const { markAccountRateLimited } =
         await import("../core/account-manager.ts");
@@ -558,6 +607,10 @@ async function prepareRemainingAccountsInBackground(params: {
             console.log(
               `✅ [Server] Account ready (${displayIndex}/${params.totalAccounts}): ${maskEmail(account.email)}`,
             );
+            mirrorServerLog(
+              "info",
+              `✅ [Server] Account ready (${displayIndex}/${params.totalAccounts}): ${maskEmail(account.email)}`,
+            );
           }
           return ok;
         }),
@@ -592,10 +645,18 @@ async function cleanupServerResources(): Promise<void> {
       console.log(
         `🗑️  [Server] Deleted Qwen chats on shutdown: ${result.succeeded}/${result.attempted} scope(s)`,
       );
+      mirrorServerLog(
+        "info",
+        `🗑️  [Server] Deleted Qwen chats on shutdown: ${result.succeeded}/${result.attempted} scope(s)`,
+      );
     } catch (error) {
       console.error(
         `❌ [Server] Failed to delete Qwen chats on shutdown:`,
         error instanceof Error ? error.message : String(error),
+      );
+      mirrorServerLog(
+        "error",
+        `❌ [Server] Failed to delete Qwen chats on shutdown: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -639,6 +700,7 @@ async function handleSignal(signal: string): Promise<never> {
   console.log(
     `🛑 [Server] Shutdown | ${signal}`,
   );
+  mirrorServerLog("info", `🛑 [Server] Shutdown | ${signal}`);
   await stopServer();
   process.exit(0);
 }
@@ -698,6 +760,10 @@ export async function startServer(options?: {
     const accounts = loadAccounts();
 
     if (accounts.length === 0 && !isAuthMockEnabled()) {
+      mirrorServerLog(
+        "error",
+        "❌ [Server] No Qwen accounts configured. Configure an account with `npm run login`, the QWEN_ACCOUNTS environment variable, or the accounts database before starting the server.",
+      );
       throw new Error(
         "❌ [Server] No Qwen accounts configured. Configure an account with `npm run login`, the QWEN_ACCOUNTS environment variable, or the accounts database before starting the server.",
       );
@@ -751,6 +817,10 @@ export async function startServer(options?: {
           console.log(
             `✅ [Server] Account ready (1/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
           );
+          mirrorServerLog(
+            "info",
+            `✅ [Server] Account ready (1/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
+          );
           break;
         }
       }
@@ -762,11 +832,19 @@ export async function startServer(options?: {
         console.warn(
           `⚠️  [Server] No account ready during startup; continuing in background`,
         );
+        mirrorServerLog(
+          "warn",
+          `⚠️  [Server] No account ready during startup; continuing in background`,
+        );
       }
 
       if (config.playwright.prepareAllOnStartup || readyAccountIds.size === 0) {
         if (config.playwright.prepareAllOnStartup && remainingAccounts.length > 0) {
           console.log(
+            `🪶 [Server] Preparing ${remainingAccounts.length} standby account(s) in background`,
+          );
+          mirrorServerLog(
+            "info",
             `🪶 [Server] Preparing ${remainingAccounts.length} standby account(s) in background`,
           );
         }
@@ -782,9 +860,17 @@ export async function startServer(options?: {
           console.warn(
             `❌ [Server] Background account preparation failed: ${getErrorMessage(error)}`,
           );
+          mirrorServerLog(
+            "warn",
+            `❌ [Server] Background account preparation failed: ${getErrorMessage(error)}`,
+          );
         });
       } else if (remainingAccounts.length > 0) {
         console.log(
+          `🪶 [Server] ${remainingAccounts.length} standby account(s) will initialize on demand`,
+        );
+        mirrorServerLog(
+          "info",
           `🪶 [Server] ${remainingAccounts.length} standby account(s) will initialize on demand`,
         );
 
@@ -814,11 +900,19 @@ export async function startServer(options?: {
                   console.log(
                     `✅ [Server] Reserve account ready (2/${totalAccounts}): ${maskEmail(reserveAccount.email)}`,
                   );
+                  mirrorServerLog(
+                    "info",
+                    `✅ [Server] Reserve account ready (2/${totalAccounts}): ${maskEmail(reserveAccount.email)}`,
+                  );
                   reserveCandidateIdx++;
                   break;
                 }
               } catch (err) {
                 console.warn(
+                  `⚠️  [Server] Failed to warm reserve account ${maskEmail(reserveAccount.email)}: ${getErrorMessage(err)}`,
+                );
+                mirrorServerLog(
+                  "warn",
                   `⚠️  [Server] Failed to warm reserve account ${maskEmail(reserveAccount.email)}: ${getErrorMessage(err)}`,
                 );
               }
@@ -845,15 +939,27 @@ export async function startServer(options?: {
                 console.log(
                   `✅ [Server] Standby account validated: ${maskEmail(account.email)}`,
                 );
+                mirrorServerLog(
+                  "info",
+                  `✅ [Server] Standby account validated: ${maskEmail(account.email)}`,
+                );
               } else {
                 failed++;
                 console.warn(
+                  `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)} (quarantined)`,
+                );
+                mirrorServerLog(
+                  "warn",
                   `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)} (quarantined)`,
                 );
               }
             } catch (error) {
               failed++;
               console.warn(
+                `⚠️  [Server] Standby account validation error: ${maskEmail(account.email)}: ${getErrorMessage(error)} (quarantined)`,
+              );
+              mirrorServerLog(
+                "warn",
                 `⚠️  [Server] Standby account validation error: ${maskEmail(account.email)}: ${getErrorMessage(error)} (quarantined)`,
               );
               const { markAccountRateLimited } = await import("../core/account-manager.ts");
@@ -869,9 +975,17 @@ export async function startServer(options?: {
             console.log(
               `✅ [Server] Standby validation complete: ${validated} account(s) ready${failed > 0 ? `, ${failed} failed` : ""}`,
             );
+            mirrorServerLog(
+              "info",
+              `✅ [Server] Standby validation complete: ${validated} account(s) ready${failed > 0 ? `, ${failed} failed` : ""}`,
+            );
           }
         })().catch((error) => {
           console.warn(
+            `❌ [Server] Background standby validation failed: ${getErrorMessage(error)}`,
+          );
+          mirrorServerLog(
+            "warn",
             `❌ [Server] Background standby validation failed: ${getErrorMessage(error)}`,
           );
         });
@@ -907,8 +1021,13 @@ export async function startServer(options?: {
         console.error(
           buildPortInUseMessage(config.server.port, config.server.host),
         );
+        mirrorServerLog(
+          "error",
+          buildPortInUseMessage(config.server.port, config.server.host),
+        );
       } else {
         console.error(`❌ [Server] Listen failed: ${err.message}`);
+        mirrorServerLog("error", `❌ [Server] Listen failed: ${err.message}`);
       }
       process.exit(1);
     });
