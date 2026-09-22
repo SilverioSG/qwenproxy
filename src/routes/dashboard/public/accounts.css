@@ -19,7 +19,7 @@
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
+  overflow: visible;
   margin-bottom: 16px;
   max-height: 100vh;
   box-shadow: var(--clay-shadow), var(--clay-puff);
@@ -125,6 +125,7 @@
 }
 #acctTable {
   width: 100%;
+  min-width: 700px;
   border-collapse: collapse;
   font-size: 0.8125rem;
 }
