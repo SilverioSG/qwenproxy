@@ -373,7 +373,7 @@ export const monitorHtml = `<!DOCTYPE html>
     </div>
 
     <div class="page-header-right" style="margin-top:12px">
-      <span class="badge badge-neutral" id="timeRange">Live counters since boot (global only)</span>
+      <span class="badge badge-neutral" id="timeRange">Last 1000 logical AI requests</span>
     </div>
 
   </main>

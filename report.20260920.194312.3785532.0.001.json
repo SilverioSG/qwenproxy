@@ -1,0 +1,937 @@
+
+{
+  "header": {
+    "reportVersion": 5,
+    "event": "Allocation failed - JavaScript heap out of memory",
+    "trigger": "OOMError",
+    "filename": "report.20260920.194312.3785532.0.001.json",
+    "dumpEventTime": "2026-09-20T19:43:12Z",
+    "dumpEventTimeStamp": "1789926192083",
+    "processId": 3785532,
+    "threadId": 0,
+    "cwd": "/home/silver/Apps/qwenproxy",
+    "commandLine": [
+      "/usr/bin/node",
+      "--require",
+      "/home/silver/Apps/qwenproxy/node_modules/tsx/dist/preflight.cjs",
+      "--import",
+      "file:///home/silver/Apps/qwenproxy/node_modules/tsx/dist/loader.mjs",
+      "src/index.ts"
+    ],
+    "nodejsVersion": "v26.8.2",
+    "glibcVersionRuntime": "2.44",
+    "glibcVersionCompiler": "2.44",
+    "wordSize": 64,
+    "arch": "x64",
+    "platform": "linux",
+    "componentVersions": {
+      "acorn": "8.18.0",
+      "ada": "4.0.0",
+      "amaro": "1.1.11",
+      "ares": "1.34.8",
+      "brotli": "1.2.0",
+      "cldr": "48.0",
+      "icu": "78.3",
+      "libffi": "3.8.0",
+      "lief": "0.17.0",
+      "llhttp": "9.4.3",
+      "merve": "1.2.2",
+      "modules": "147",
+      "napi": "10",
+      "nbytes": "0.1.4",
+      "ncrypto": "0.0.1",
+      "nghttp2": "1.70.0",
+      "nghttp3": "",
+      "ngtcp2": "",
+      "node": "26.8.2",
+      "openssl": "3.6.4",
+      "simdjson": "4.6.9",
+      "simdutf": "7.7.0",
+      "sqlite": "3.53.4",
+      "tz": "2026a",
+      "undici": "8.10.2",
+      "unicode": "17.0",
+      "uv": "1.52.1",
+      "uvwasi": "0.0.23",
+      "v8": "14.6.202.34-node.28",
+      "zlib": "1.3.1.zlib-ng",
+      "zstd": "1.5.7"
+    },
+    "release": {
+      "name": "node",
+      "headersUrl": "https://nodejs.org/download/release/v26.8.2/node-v26.8.2-headers.tar.gz",
+      "sourceUrl": "https://nodejs.org/download/release/v26.8.2/node-v26.8.2.tar.gz"
+    },
+    "osName": "Linux",
+    "osRelease": "7.2.2-1-cachyos",
+    "osVersion": "#1 SMP PREEMPT_DYNAMIC Fri, 28 Aug 2026 11:45:06 +0000",
+    "osMachine": "x86_64",
+    "cpus": [
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 16192710,
+        "nice": 8591250,
+        "sys": 10686210,
+        "idle": 245968890,
+        "irq": 3539040
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 14004680,
+        "nice": 8031790,
+        "sys": 9442330,
+        "idle": 253558130,
+        "irq": 3138340
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 12903810,
+        "nice": 8304600,
+        "sys": 8274440,
+        "idle": 257710550,
+        "irq": 2434640
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 12012860,
+        "nice": 8186940,
+        "sys": 7672500,
+        "idle": 260359830,
+        "irq": 2172260
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 11342530,
+        "nice": 7902810,
+        "sys": 7234210,
+        "idle": 262356290,
+        "irq": 1913620
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 11277350,
+        "nice": 7918790,
+        "sys": 7005220,
+        "idle": 263222710,
+        "irq": 1825340
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 10955580,
+        "nice": 7738480,
+        "sys": 7091380,
+        "idle": 264112220,
+        "irq": 1763620
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 11007710,
+        "nice": 8141710,
+        "sys": 6899030,
+        "idle": 263930210,
+        "irq": 1727660
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 18205790,
+        "nice": 8313620,
+        "sys": 10852910,
+        "idle": 248117020,
+        "irq": 3417490
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 15836390,
+        "nice": 7855720,
+        "sys": 9414580,
+        "idle": 253888340,
+        "irq": 2846020
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 14347190,
+        "nice": 7537920,
+        "sys": 8357050,
+        "idle": 257981020,
+        "irq": 2389540
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 13092910,
+        "nice": 7111600,
+        "sys": 7650800,
+        "idle": 261090470,
+        "irq": 2076980
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 12312070,
+        "nice": 6854910,
+        "sys": 7236090,
+        "idle": 262880020,
+        "irq": 1894470
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 12075910,
+        "nice": 6749480,
+        "sys": 7103530,
+        "idle": 263815280,
+        "irq": 1761370
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 11891000,
+        "nice": 6646200,
+        "sys": 7052750,
+        "idle": 262950300,
+        "irq": 1770130
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 11690590,
+        "nice": 6792980,
+        "sys": 7046630,
+        "idle": 264157480,
+        "irq": 1680550
+      }
+    ],
+    "networkInterfaces": [
+      {
+        "name": "lo",
+        "internal": true,
+        "mac": "00:00:00:00:00:00",
+        "address": "127.0.0.1",
+        "netmask": "255.0.0.0",
+        "family": "IPv4"
+      },
+      {
+        "name": "eth0",
+        "internal": false,
+        "mac": "00:50:56:5d:54:02",
+        "address": "75.119.151.189",
+        "netmask": "255.255.224.0",
+        "family": "IPv4"
+      },
+      {
+        "name": "wg0",
+        "internal": false,
+        "mac": "00:00:00:00:00:00",
+        "address": "10.8.0.7",
+        "netmask": "255.255.255.255",
+        "family": "IPv4"
+      },
+      {
+        "name": "lo",
+        "internal": true,
+        "mac": "00:00:00:00:00:00",
+        "address": "::1",
+        "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "family": "IPv6",
+        "scopeid": 0
+      },
+      {
+        "name": "eth0",
+        "internal": false,
+        "mac": "00:50:56:5d:54:02",
+        "address": "2a02:c207:2283:4924::1",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 0
+      },
+      {
+        "name": "eth0",
+        "internal": false,
+        "mac": "00:50:56:5d:54:02",
+        "address": "fe80::250:56ff:fe5d:5402",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 2
+      }
+    ],
+    "host": "quant"
+  },
+  "javascriptStack": {
+    "message": "No stack.",
+    "stack": [
+      "Unavailable."
+    ],
+    "errorProperties": {
+    }
+  },
+  "javascriptHeap": {
+    "totalMemory": 8565030912,
+    "executableMemory": 5922816,
+    "totalCommittedMemory": 8560852992,
+    "availableMemory": 128254968,
+    "totalGlobalHandlesMemory": 49152,
+    "usedGlobalHandlesMemory": 27968,
+    "usedMemory": 8530422664,
+    "memoryLimit": 8690597888,
+    "mallocedMemory": 1065024,
+    "externalMemory": 85816046,
+    "peakMallocedMemory": 9931968,
+    "nativeContextCount": 1,
+    "detachedContextCount": 0,
+    "doesZapGarbage": 0,
+    "heapSpaces": {
+      "read_only_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "new_space": {
+        "memorySize": 1048576,
+        "committedMemory": 1048576,
+        "capacity": 1048512,
+        "used": 0,
+        "available": 1048512
+      },
+      "old_space": {
+        "memorySize": 8545632256,
+        "committedMemory": 8541556736,
+        "capacity": 8513459096,
+        "used": 8512868192,
+        "available": 590904
+      },
+      "code_space": {
+        "memorySize": 5767168,
+        "committedMemory": 5685248,
+        "capacity": 5278528,
+        "used": 5278528,
+        "available": 0
+      },
+      "shared_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "trusted_space": {
+        "memorySize": 4980736,
+        "committedMemory": 4960256,
+        "capacity": 4744544,
+        "used": 4744544,
+        "available": 0
+      },
+      "shared_trusted_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "new_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 1048576,
+        "used": 0,
+        "available": 1048576
+      },
+      "large_object_space": {
+        "memorySize": 7446528,
+        "committedMemory": 7446528,
+        "capacity": 7378760,
+        "used": 7378760,
+        "available": 0
+      },
+      "code_large_object_space": {
+        "memorySize": 155648,
+        "committedMemory": 155648,
+        "capacity": 152640,
+        "used": 152640,
+        "available": 0
+      },
+      "shared_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "shared_trusted_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "trusted_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      }
+    }
+  },
+  "nativeStack": [
+    {
+      "pc": "0x00005610a948e168",
+      "symbol": "node::TriggerNodeReport[abi:cxx11](v8::Isolate*, node::Environment*, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, v8::Local<v8::Value>) [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a956869a",
+      "symbol": "node::TriggerNodeReport[abi:cxx11](v8::Isolate*, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, v8::Local<v8::Value>) [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a9749f82",
+      "symbol": "node::OOMErrorHandler(char const*, v8::OOMDetails const&) [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a9bfe8b3",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a9bfea43",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a9d3490e",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a9d2e263",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aaa3cb24",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aaa376ab",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aaa3748d",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aa55fa42",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aa55996a",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aa56a4e8",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aa54763d",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610a9cc96c3",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aaa1a6c5",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aaa1a5f7",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005610aa9d6053",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00007fa26f63d7f6",
+      "symbol": ""
+    }
+  ],
+  "resourceUsage": {
+    "free_memory": 49639251968,
+    "total_memory": 67416576000,
+    "rss": 8858710016,
+    "constrained_memory": 18446744073709551615,
+    "available_memory": 49639251968,
+    "userCpuSeconds": 1589.61,
+    "kernelCpuSeconds": 72.3498,
+    "cpuConsumptionPercent": 19.8657,
+    "userCpuConsumptionPercent": 19.0009,
+    "kernelCpuConsumptionPercent": 0.864807,
+    "maxRss": 8901427200,
+    "pageFaults": {
+      "IORequired": 1192,
+      "IONotRequired": 3832473
+    },
+    "fsActivity": {
+      "reads": 77624,
+      "writes": 21568
+    }
+  },
+  "uvthreadResourceUsage": {
+    "userCpuSeconds": 1113,
+    "kernelCpuSeconds": 56.8991,
+    "cpuConsumptionPercent": 13.9839,
+    "userCpuConsumptionPercent": 13.3038,
+    "kernelCpuConsumptionPercent": 0.680123,
+    "fsActivity": {
+      "reads": 68128,
+      "writes": 13416
+    }
+  },
+  "libuv": [
+    {
+      "type": "async",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dad09240"
+    },
+    {
+      "type": "async",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610ac855d20"
+    },
+    {
+      "type": "timer",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610dad6e608",
+      "repeat": 0,
+      "firesInMsFromNow": 148,
+      "expired": false
+    },
+    {
+      "type": "check",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dad6e6a0"
+    },
+    {
+      "type": "idle",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610dad6e718"
+    },
+    {
+      "type": "prepare",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dad6e790"
+    },
+    {
+      "type": "check",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dad6e808"
+    },
+    {
+      "type": "async",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dad6e880"
+    },
+    {
+      "type": "pipe",
+      "is_active": false,
+      "is_referenced": true,
+      "address": "0x00005610dad84e00",
+      "localEndpoint": null,
+      "remoteEndpoint": "/run/systemd/journal/stdout",
+      "sendBufferSize": 8388608,
+      "recvBufferSize": 212992,
+      "fd": 1,
+      "stdio": "stdout",
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dad83200",
+      "localEndpoint": null,
+      "remoteEndpoint": "/tmp/tsx-1000/3785521.pipe",
+      "sendBufferSize": 212992,
+      "recvBufferSize": 212992,
+      "fd": 21,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": false,
+      "is_referenced": true,
+      "address": "0x00005610dad833c0",
+      "localEndpoint": null,
+      "remoteEndpoint": "/run/systemd/journal/stdout",
+      "sendBufferSize": 8388608,
+      "recvBufferSize": 212992,
+      "fd": 2,
+      "stdio": "stderr",
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610dadf4d10",
+      "localEndpoint": null,
+      "remoteEndpoint": "/tmp/tsx-1000/3785521.pipe",
+      "sendBufferSize": 212992,
+      "recvBufferSize": 212992,
+      "fd": 22,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "signal",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610db34f538",
+      "signum": 2,
+      "signal": "SIGINT"
+    },
+    {
+      "type": "signal",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610db34f428",
+      "signum": 15,
+      "signal": "SIGTERM"
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610daf39d30",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 26,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db33c620",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 28,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db33b100",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 30,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db33b2c0",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 32,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "process",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db08a3a8",
+      "pid": 3785595
+    },
+    {
+      "type": "signal",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610db30bbb8",
+      "signum": 1,
+      "signal": "SIGHUP"
+    },
+    {
+      "type": "tcp",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db347370",
+      "localEndpoint": {
+        "host": "0.0.0.0",
+        "ip4": "0.0.0.0",
+        "port": 7936
+      },
+      "remoteEndpoint": null,
+      "sendBufferSize": 16384,
+      "recvBufferSize": 131072,
+      "fd": 27,
+      "writeQueueSize": 0,
+      "readable": false,
+      "writable": false
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db1b0fd0",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 29,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610dafe15c0",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 33,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db3cf500",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 35,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "pipe",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db498490",
+      "localEndpoint": null,
+      "remoteEndpoint": null,
+      "sendBufferSize": 131072,
+      "recvBufferSize": 131072,
+      "fd": 37,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "process",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db49e3c8",
+      "pid": 3786207
+    },
+    {
+      "type": "tcp",
+      "is_active": true,
+      "is_referenced": true,
+      "address": "0x00005610db51ebd0",
+      "localEndpoint": {
+        "host": "localhost",
+        "ip4": "127.0.0.1",
+        "port": 7936
+      },
+      "remoteEndpoint": {
+        "host": "localhost",
+        "ip4": "127.0.0.1",
+        "port": 59622
+      },
+      "sendBufferSize": 2626560,
+      "recvBufferSize": 162990,
+      "fd": 31,
+      "writeQueueSize": 0,
+      "readable": true,
+      "writable": true
+    },
+    {
+      "type": "timer",
+      "is_active": true,
+      "is_referenced": false,
+      "address": "0x00005610ddfda730",
+      "repeat": 0,
+      "firesInMsFromNow": 260,
+      "expired": false
+    },
+    {
+      "type": "loop",
+      "is_active": true,
+      "address": "0x00007fa28205e200",
+      "loopIdleTimeSeconds": 7114.46
+    }
+  ],
+  "workers": [
+  ],
+  "environmentVariables": {
+    "SHELL": "/bin/bash",
+    "npm_command": "start",
+    "npm_config_userconfig": "/home/silver/.npmrc",
+    "npm_config_cache": "/home/silver/.npm",
+    "NODE": "/usr/bin/node",
+    "NODE_OPTIONS": "--max-old-space-size=8192 --require /tmp/mem-probe.cjs --report-on-fatalerror --diagnostic-dir=/home/silver/.local/state/qwenproxy/diagnostics",
+    "MEMORY_PRESSURE_WRITE": "c29tZSAyMDAwMDAgMjAwMDAwMAA=",
+    "COLOR": "0",
+    "npm_config_local_prefix": "/home/silver/Apps/qwenproxy",
+    "npm_config_globalconfig": "/etc/npmrc",
+    "EDITOR": "vi",
+    "PWD": "/home/silver/Apps/qwenproxy",
+    "LOGNAME": "silver",
+    "npm_config_init_module": "/home/silver/.npm-init.js",
+    "SYSTEMD_EXEC_PID": "3785501",
+    "XAUTHORITY": "/tmp/xauth_baiEkH",
+    "HOME": "/home/silver",
+    "LANG": "es_ES.UTF-8",
+    "npm_package_version": "1.0.23",
+    "MEMORY_PRESSURE_WATCH": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/qwenproxy.service/memory.pressure",
+    "INVOCATION_ID": "8cbe7440ec304e4d8686c446ad1661b6",
+    "MANAGERPID": "595",
+    "INIT_CWD": "/home/silver/Apps/qwenproxy",
+    "npm_lifecycle_script": "tsx src/index.ts",
+    "npm_config_npm_version": "12.0.2",
+    "npm_package_name": "qwenproxy-cli",
+    "npm_config_prefix": "/home/silver/.local/npm-global",
+    "USER": "silver",
+    "DISPLAY": ":0",
+    "npm_lifecycle_event": "start",
+    "SHLVL": "0",
+    "MANAGERPIDFDID": "49166",
+    "npm_config_user_agent": "npm/12.0.2 node/v26.8.2 linux x64 workspaces/false",
+    "npm_execpath": "/usr/lib/node_modules/npm/bin/npm-cli.js",
+    "XDG_RUNTIME_DIR": "/run/user/1000",
+    "npm_package_bin_qpx": "bin/qwenproxy.js",
+    "npm_package_json": "/home/silver/Apps/qwenproxy/package.json",
+    "JOURNAL_STREAM": "10:31696937",
+    "XDG_DATA_DIRS": "/home/silver/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/",
+    "npm_config_allow_scripts": "true",
+    "npm_config_noproxy": "",
+    "PATH": "/home/silver/Apps/qwenproxy/node_modules/.bin:/home/silver/Apps/node_modules/.bin:/home/silver/node_modules/.bin:/home/node_modules/.bin:/node_modules/.bin:/usr/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/usr/local/bin:/usr/bin",
+    "npm_config_node_gyp": "/usr/lib/node_modules/node-gyp/bin/node-gyp.js",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+    "npm_config_global_prefix": "/home/silver/.local/npm-global",
+    "npm_config_global_ignore_file": "/home/silver/.local/npm-global/etc/npmignore",
+    "npm_node_execpath": "/usr/bin/node",
+    "npm_package_engines_node": ">=22",
+    "_": "/home/silver/Apps/qwenproxy/node_modules/.bin/tsx",
+    "QWEN_ACCOUNTS": "1cuentatest1@gmail.com:Gmail_User1!;1cuentatest2@gmail.com:Gmail_User1!;macmamaman@proton.me:QwentUser1!;qwtestfdgdtmepfp@emalupe.com:QwenUser1!;jaymeeseparate@emalupe.com:QwenUser1!;qwenusuario1@emalupe.com:QwenUser1!;qwenusuario2@emalupe.com:QwenUser1!;tatianiagold@emalupe.com:QwenUser1!;rayna54@emalupe.com:QwenUser1!;67mead@emalupe.com:QwenUser1!;tatianadamaged@emalupe.com:QwenUser1!;othellaliterary@emalupe.com:QwenUser1!;6630silvia@emalupe.com:QwenUser1!;privatejaneta@emalupe.com:QwenUser1!;extended274@emalupe.com:QwenUser1!;vidaamber@emalupe.com:QwenUser1!;deenadriving@emalupe.com:QwenUser1!;stronglinell@emalupe.com:QwenUser1!;apricotexciting@emalupe.com:QwenUser1!;comprehensiveloraine@emalupe.com:QwenUser1!;modelocuantitativo+test1@gmail.com:QwenUser1!;modelocuantitativo+test2@gmail.com:Gmail_User1!",
+    "DOTENV_CONFIG_QUIET": "true"
+  },
+  "userLimits": {
+    "core_file_size_blocks": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "data_seg_size_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "file_size_blocks": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "max_locked_memory_bytes": {
+      "soft": 8388608,
+      "hard": 8388608
+    },
+    "max_memory_size_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "open_files": {
+      "soft": 1048576,
+      "hard": 1048576
+    },
+    "stack_size_bytes": {
+      "soft": 8388608,
+      "hard": "unlimited"
+    },
+    "cpu_time_seconds": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "max_user_processes": {
+      "soft": 257081,
+      "hard": 257081
+    },
+    "virtual_memory_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    }
+  },
+  "sharedObjects": [
+    "linux-vdso.so.1",
+    "/usr/lib/libz.so.1",
+    "/usr/lib/libuv.so.1",
+    "/usr/lib/libada.so.4",
+    "/usr/lib/libsimdjson.so.33",
+    "/usr/lib/libbrotlidec.so.1",
+    "/usr/lib/libbrotlienc.so.1",
+    "/usr/lib/libcares.so.2",
+    "/usr/lib/libnghttp2.so.14",
+    "/usr/lib/libffi.so.8",
+    "/usr/lib/libzstd.so.1",
+    "/usr/lib/libcrypto.so.3",
+    "/usr/lib/libssl.so.3",
+    "/usr/lib/libicui18n.so.78",
+    "/usr/lib/libicuuc.so.78",
+    "/usr/lib/libstdc++.so.6",
+    "/usr/lib/libm.so.6",
+    "/usr/lib/libgcc_s.so.1",
+    "/usr/lib/libc.so.6",
+    "/lib64/ld-linux-x86-64.so.2",
+    "/usr/lib/libbrotlicommon.so.1",
+    "/usr/lib/libicudata.so.78",
+    "/home/silver/Apps/qwenproxy/node_modules/better-sqlite3/prebuilds/linux-x64.node",
+    "/usr/lib/libnss_mymachines.so.2",
+    "/usr/lib/libnss_resolve.so.2"
+  ]
+}

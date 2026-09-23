@@ -10,8 +10,8 @@
  *
  * - GET /accounts            from loadAccounts + cooldowns + headersReady + leases
  * - GET /pool/stats           from getAccountConcurrencySnapshot + cooldowns
- * - GET /metrics/monitor      from requests.total/errors + latency histogram (global only)
- * - GET /metrics/model-health empty (no per-model counters exist; UI shows empty state)
+ * - GET /metrics/monitor      last 1000 logical AI requests (aiRing only)
+ * - GET /metrics/model-health lifetime per-model counters since process start (not the ring)
  * - GET /metrics/uptime       from process.uptime + package.json version
  * - GET /system/logs          UNSUPPORTED in V1 (no structured log store)
  * - GET /api/config           safe read-only subset (never secrets)
@@ -40,7 +40,6 @@ import { getAccountsByPriority } from "../core/account-priority.js";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.js";
 import { getActivePlaywrightAccountIds } from "../services/playwright.ts";
 import { config } from "../core/config.js";
-import { metrics } from "../core/metrics.js";
 import { getRecentDashboardLogs } from "../core/logger.js";
 import {
   getModelHealth,
@@ -220,81 +219,6 @@ export function buildPoolStats(): {
   };
 }
 
-interface HistogramAggregate {
-  count: number;
-  sum: number;
-}
-
-export function buildMonitorSummary(): {
-  totals: {
-    totalRequests: number;
-    totalSuccess: number;
-    totalErrors: number;
-    overallErrorRate: number;
-    overallAvgLatencyMs: number | null;
-    p95LatencyMs: null;
-    medianLatencyMs: null;
-  };
-  modeComparison: { streaming: null; nonStreaming: null };
-  accounts: never[];
-  topErrors: never[];
-  timeRange: null;
-  totalEntries: number;
-  capabilities: {
-    perAccount: false;
-    percentiles: false;
-    modes: false;
-    topErrors: false;
-  };
-} {
-  const total = metrics.get("requests.total")?.value ?? 0;
-  const errors = metrics.get("requests.errors")?.value ?? 0;
-  const totalRequests = typeof total === "number" ? total : 0;
-  const totalErrors = typeof errors === "number" ? errors : 0;
-  const totalSuccess = Math.max(0, totalRequests - totalErrors);
-
-  let avg: number | null = null;
-  const latencyPoint = metrics.get("latency.request");
-  const raw = latencyPoint?.value as unknown;
-  if (typeof raw === "object" && raw !== null) {
-    const agg = raw as Partial<HistogramAggregate>;
-    if (
-      typeof agg.count === "number" &&
-      typeof agg.sum === "number" &&
-      agg.count > 0
-    ) {
-      avg = Math.round(agg.sum / agg.count);
-    }
-  }
-
-  return {
-    totals: {
-      totalRequests,
-      totalSuccess,
-      totalErrors,
-      overallErrorRate:
-        totalRequests > 0
-          ? Math.round((totalErrors / totalRequests) * 10000) / 100
-          : 0,
-      overallAvgLatencyMs: avg,
-      // V1 collects no percentile data: explicit nulls, never fabricated.
-      p95LatencyMs: null,
-      medianLatencyMs: null,
-    },
-    modeComparison: { streaming: null, nonStreaming: null },
-    accounts: [],
-    topErrors: [],
-    timeRange: null,
-    totalEntries: totalRequests,
-    capabilities: {
-      perAccount: false,
-      percentiles: false,
-      modes: false,
-      topErrors: false,
-    },
-  };
-}
-
 dashboardApp.get("/accounts", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
@@ -310,13 +234,9 @@ dashboardApp.get("/pool/stats", (c) => {
 dashboardApp.get("/metrics/monitor", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
-  // V2: real in-memory AI-request ring (since process start). When no AI
-  // request has completed yet, fall back to the global HTTP counters so the
-  // page is still useful on a fresh boot.
+  // Monitor is the AI ring only. An empty ring is zero AI requests, never
+  // the generic HTTP counters (requests.total / requests.errors).
   const summary = getMonitorSummary();
-  if (summary.totalEntries === 0) {
-    return c.json(buildMonitorSummary());
-  }
   const emailById = new Map(
     loadAccounts().map((a) => [a.id, a.email] as [string, string]),
   );
@@ -327,7 +247,10 @@ dashboardApp.get("/metrics/monitor", (c) => {
       nonStreaming: summary.modeComparison.nonStreaming,
     },
     accounts: summary.accounts.map((a) => ({
-      email: emailById.get(a.accountId) ?? a.accountId,
+      email:
+        a.accountId === "unknown"
+          ? "Unassigned"
+          : (emailById.get(a.accountId) ?? a.accountId),
       accountId: a.accountId,
       totalRequests: a.totalRequests,
       successCount: a.successCount,
@@ -351,7 +274,7 @@ dashboardApp.get("/metrics/monitor", (c) => {
       percentiles: true,
       modes: true,
       topErrors: true,
-      window: "since process start (in-memory)",
+      window: "Last 1000 logical AI requests",
     },
   });
 });
@@ -404,28 +327,15 @@ dashboardApp.get("/api/usage", (c) => {
   const emailById = new Map(
     loadAccounts().map((a) => [a.id, a.email] as [string, string]),
   );
-  // Per-account × model breakdown derived from the retained AI-request
-  // window (top 5 models each). Real counts only — no daily buckets exist.
-  const modelsByAccount = new Map<string, Map<string, number>>();
-  for (const r of getRecentAIRequests(1000)) {
-    if (!r.accountId) continue;
-    let m = modelsByAccount.get(r.accountId);
-    if (!m) {
-      m = new Map<string, number>();
-      modelsByAccount.set(r.accountId, m);
-    }
-    m.set(r.model, (m.get(r.model) ?? 0) + 1);
-  }
   return c.json({
     window: usage.window,
     totals: usage.totals,
     accounts: usage.accounts.map((a) => ({
       ...a,
-      email: emailById.get(a.accountId) ?? a.accountId,
-      perModel: [...(modelsByAccount.get(a.accountId) ?? new Map()).entries()]
-        .map(([model, requests]) => ({ model, requests }))
-        .sort((x, y) => y.requests - x.requests)
-        .slice(0, 5),
+      email:
+        a.accountId === "unknown"
+          ? "Unassigned"
+          : (emailById.get(a.accountId) ?? a.accountId),
     })),
     models: usage.models,
     routes: usage.routes,

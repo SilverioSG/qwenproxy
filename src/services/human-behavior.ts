@@ -1,4 +1,5 @@
 import type { Page } from "patchright";
+import { captchaStageEnter, captchaStageExit } from "./captcha-probe.ts";
 
 export const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -186,24 +187,85 @@ export async function humanDrag(
   // Approach with its own path, then dwell before pressing: a pointer that
   // teleports onto the handle and clicks instantly is the classic automation
   // signature.
+  captchaStageEnter("drag_approach");
   await mouse(page.mouse.move(startX, startY, { steps: 8 }), "drag_approach");
+  captchaStageExit("drag_approach");
   await sleep(logNormalDelay(160, 0.5));
+  captchaStageEnter("drag_press");
   await mouse(page.mouse.down(), "drag_press");
+  captchaStageExit("drag_press");
+  const mouseDownSucceeded = true;
   await sleep(logNormalDelay(120, 0.5));
 
+  // A stalled renderer answers every CDP round-trip slower and slower until
+  // a mouse operation never settles. Issuing one more CDP call (mouse.up)
+  // against that session wedges the whole process: the pending promise
+  // retains the CDP chain and the event loop can no longer drain it (OOM).
+  // Track trajectory health explicitly and skip the release call when the
+  // renderer already proved degraded. The error always propagates; no throw
+  // here may override a previous one.
+  //
+  // Health is measured as accumulated CDP round-trip time, not wall time:
+  // the sleeps between samples are local timers and say nothing about the
+  // renderer. When the session is healthy each round-trip settles in
+  // milliseconds; when the accumulated CDP time of one drag exceeds the
+  // per-operation deadline, the session is degraded.
+  let hasTrajectoryError = false;
+  let trajectoryError: unknown;
+  let rendererDegraded = false;
+  let trajectoryCdpMs = 0;
   try {
+    captchaStageEnter("drag_trajectory");
     for (const sample of buildDragTrajectory(startX, startY, endX, endY)) {
       await sleep(sample.delayMs);
-      await mouse(
-        page.mouse.move(sample.x, sample.y, { steps: 1 }),
-        "drag_move",
-      );
+      const opStart = Date.now();
+      try {
+        await mouse(
+          page.mouse.move(sample.x, sample.y, { steps: 1 }),
+          "drag_move",
+        );
+      } finally {
+        trajectoryCdpMs += Date.now() - opStart;
+      }
     }
     // Dwell before release — humans verify the handle is in place.
     await sleep(logNormalDelay(220, 0.5));
-  } finally {
-    await mouse(page.mouse.up(), "drag_release");
+    captchaStageExit("drag_trajectory");
+  } catch (err) {
+    hasTrajectoryError = true;
+    trajectoryError = err;
+    if (err instanceof CaptchaCdpTimeoutError) rendererDegraded = true;
   }
+
+  if (
+    !hasTrajectoryError &&
+    mouseDownSucceeded &&
+    timeoutMs !== undefined &&
+    trajectoryCdpMs > timeoutMs
+  ) {
+    rendererDegraded = true;
+  }
+
+  if (rendererDegraded) {
+    if (hasTrajectoryError) throw trajectoryError;
+    throw new CaptchaCdpTimeoutError("drag_trajectory", trajectoryCdpMs);
+  }
+
+  if (hasTrajectoryError) {
+    try {
+      captchaStageEnter("drag_release");
+      await mouse(page.mouse.up(), "drag_release");
+      captchaStageExit("drag_release");
+    } catch {
+      // The release is best-effort here: the original trajectory error
+      // must propagate unchanged.
+    }
+    throw trajectoryError;
+  }
+
+  captchaStageEnter("drag_release");
+  await mouse(page.mouse.up(), "drag_release");
+  captchaStageExit("drag_release");
 }
 
 export async function subtlePageActivity(page: Page): Promise<void> {

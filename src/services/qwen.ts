@@ -27,9 +27,17 @@ import {
   syncModelMetadata,
 } from "../core/model-registry.ts";
 import { type Page, type BrowserContext } from "patchright";
-import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, onPlaywrightAccountDeath } from "./playwright.ts";
+import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, onPlaywrightAccountDeath, closePlaywrightForAccount, getPlaywrightAccountPresence } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
+import {
+  beginCaptureTrace,
+  capturePoint,
+  captureStageEnter,
+  captureStageError,
+  captureStageExit,
+  endCaptureTrace,
+} from "./capture-probe.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
 
 // Re-exported from extracted modules for backward compatibility
@@ -2405,6 +2413,75 @@ export function buildCompletionHeaders(
   return base;
 }
 
+export interface PostCaptchaResetDeps {
+  closeAccount?: (accountId: string) => Promise<void>;
+  presence?: (accountId: string) => { context: boolean; page: boolean };
+}
+
+/**
+ * FIX V1 (fase 2.17B): reset the account's BrowserContext after a solved
+ * CAPTCHA, before the headers refresh runs.
+ *
+ * Root cause: the Page/renderer used during CAPTCHA recovery can be left in
+ * an unstable/zombie state (renderer SIGTRAP observed ~4s before a fatal
+ * `refresh_goto` hang with neither EXIT nor ERROR, followed by event-loop
+ * stall and Node OOM). The old Page must not be reused for the refresh that
+ * immediately follows recovery.
+ *
+ * Reuses `closePlaywrightForAccount`: strictly per-account (mutex-guarded
+ * `close:` key, maps cleaned, profile/credentials/cooldowns untouched, the
+ * shared browser untouched). The next `getQwenHeaders(true, accountId)`
+ * lazily re-initializes a fresh context + page.
+ *
+ * Failure is controlled, never silent: if the old context cannot be closed
+ * or cannot be proven invalidated, a retryable `QwenNetworkError` is thrown
+ * (account rotation kicks in) instead of running `refresh_goto` on the
+ * suspect renderer. Returns true when a reset was performed, false when the
+ * challenge was not solved (no reset, no probes).
+ */
+export async function maybeResetContextAfterCaptchaRecovery(
+  accountId: string,
+  solved: boolean,
+  options: PostCaptchaResetDeps & { traceId?: string } = {},
+): Promise<boolean> {
+  if (!solved) return false;
+  const closeAccount = options.closeAccount ?? closePlaywrightForAccount;
+  const presence = options.presence ?? getPlaywrightAccountPresence;
+  const before = presence(accountId);
+  const startedAt = Date.now();
+  captureStageEnter("post_captcha_context_reset", {
+    old_context_present: before.context ? 1 : 0,
+    old_page_present: before.page ? 1 : 0,
+  });
+  const failControlled = (reason: string, errorKind: string): never => {
+    captureStageError("post_captcha_context_reset", errorKind);
+    if (options.traceId) endCaptureTrace(options.traceId, reason);
+    throw new QwenNetworkError(
+      `Post-CAPTCHA browser context reset ${reason} (account=${accountId}); refusing to refresh headers on the suspect renderer.`,
+    );
+  };
+  try {
+    await closeAccount(accountId);
+  } catch (error) {
+    failControlled(
+      "post_captcha_context_reset_error",
+      error instanceof Error ? error.name : "Error",
+    );
+  }
+  const after = presence(accountId);
+  if (after.context || after.page) {
+    failControlled(
+      "post_captcha_context_reset_incomplete",
+      "ResetIncomplete",
+    );
+  }
+  captureStageExit("post_captcha_context_reset", {
+    duration_ms: Date.now() - startedAt,
+    result: "reset",
+  });
+  return true;
+}
+
 export async function createQwenStream(
   prompt: string,
   enableThinking: boolean,
@@ -2850,18 +2927,51 @@ async function createQwenStreamInternal(
       const solved = await recoverBaxiaCaptcha(accountId, label, {
         challengeBody,
       });
-      if (!solved) return false;
+      const captureTraceId = beginCaptureTrace(accountId);
+      capturePoint("recovery_returned", { solved: solved ? 1 : 0 });
+      if (!solved) {
+        endCaptureTrace(captureTraceId, "unsolved");
+        return false;
+      }
+
+      // FIX V1 (fase 2.17B): break the continuity between the Page/renderer
+      // used during CAPTCHA recovery and the refresh_goto below. Resets only
+      // this account's BrowserContext; throws (retryable) in a controlled
+      // way when the old context cannot be invalidated.
+      await maybeResetContextAfterCaptchaRecovery(accountId, solved, {
+        traceId: captureTraceId,
+      });
 
       // The challenge may have rotated bx-* values or session cookies. Refresh
       // them only after the visible challenge was solved, then replay the same
       // payload on the same account.
-      const refreshed = await getQwenHeaders(true, accountId);
+      const headersRefreshStartedAt = Date.now();
+      captureStageEnter("headers_refresh");
+      let refreshed: Awaited<ReturnType<typeof getQwenHeaders>>;
+      try {
+        refreshed = await getQwenHeaders(true, accountId);
+      } catch (error) {
+        captureStageError(
+          "headers_refresh",
+          error instanceof Error ? error.name : "Error",
+        );
+        endCaptureTrace(captureTraceId, "headers_refresh_error");
+        throw error;
+      }
+      captureStageExit("headers_refresh", {
+        duration_ms: Date.now() - headersRefreshStartedAt,
+      });
       activeHeaders = refreshed.headers;
       if (config.captcha.retryDelayMs > 0) {
         await sleep(config.captcha.retryDelayMs);
       }
       ensureNotAborted();
-      response = await fetchCompletion(activeHeaders);
+      captureStageEnter("retry_fetch");
+      try {
+        response = await fetchCompletion(activeHeaders);
+      } finally {
+        endCaptureTrace(captureTraceId, "retry_fetch_started");
+      }
       return true;
     };
 

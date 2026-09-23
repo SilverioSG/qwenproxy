@@ -62,13 +62,21 @@ async function refreshMonitor() {
     entryBadge.className = 'badge ' + (t.totalErrors > 0 ? 'badge-warning' : 'badge-accent');
   }
 
-  // ── Data window label (honest scope) ──
+  // ── Data window label (honest scope: ring, not process lifetime) ──
   var timeEl = document.getElementById('timeRange');
   if (timeEl) {
+    var windowLabel =
+      (data.capabilities && data.capabilities.window) ||
+      'Last 1000 logical AI requests';
     if (data.timeRange && data.timeRange.from && data.timeRange.to) {
-      timeEl.textContent = 'AI requests from ' + fmtTime(data.timeRange.from) + ' to ' + fmtTime(data.timeRange.to);
-    } else if (data.capabilities && data.capabilities.window) {
-      timeEl.textContent = data.capabilities.window;
+      timeEl.textContent =
+        windowLabel +
+        ' · ' +
+        fmtTime(data.timeRange.from) +
+        ' to ' +
+        fmtTime(data.timeRange.to);
+    } else {
+      timeEl.textContent = windowLabel;
     }
   }
 

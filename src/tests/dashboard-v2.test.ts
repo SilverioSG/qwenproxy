@@ -446,3 +446,221 @@ test("syslog dedupe renders log-9/log-10/log-11 exactly once (no string-max free
     assert.equal(count, 1, `${id} rendered exactly once (got ${count})`);
   }
 });
+
+function seedLogical(n: number, opts: { extremeFirst?: boolean } = {}): void {
+  for (let i = 0; i < n; i++) {
+    const unassigned = i % 17 === 0;
+    const blankDims = i % 29 === 0;
+    stats.recordAIRequest({
+      requestId: `seed-${i}`,
+      route: blankDims ? "  " : i % 2 === 0 ? "Chat" : "Anthropic",
+      model: blankDims ? "" : i % 3 === 0 ? "model-a" : "model-b",
+      stream: i % 2 === 0,
+      accountId: unassigned ? null : i % 2 === 0 ? "acc-a" : "acc-b",
+      latencyMs: opts.extremeFirst && i === 0 ? 1_000_000 : 10 + (i % 50),
+      success: i % 5 !== 0,
+      error: i % 5 === 0 ? `err-${i % 7}` : null,
+      retryCount: i % 11 === 0 ? 3 : 0,
+      attemptedAccounts: i % 11 === 0 ? 4 : 1,
+    });
+  }
+}
+
+function assertMonitorInvariants(
+  summary: ReturnType<typeof stats.getMonitorSummary>,
+): void {
+  const { totals } = summary;
+  assert.equal(totals.totalSuccess + totals.totalErrors, totals.totalRequests);
+  let accountReqs = 0;
+  let accountSuccess = 0;
+  let accountErrors = 0;
+  let stream = 0;
+  let nonStream = 0;
+  for (const a of summary.accounts) {
+    accountReqs += a.totalRequests;
+    accountSuccess += a.successCount;
+    accountErrors += a.errorCount;
+    assert.equal(a.successCount + a.errorCount, a.totalRequests);
+    const s = a.byMode.streaming?.totalRequests ?? 0;
+    const n = a.byMode.nonStreaming?.totalRequests ?? 0;
+    assert.equal(s + n, a.totalRequests);
+    stream += s;
+    nonStream += n;
+  }
+  assert.equal(accountReqs, totals.totalRequests);
+  assert.equal(accountSuccess, totals.totalSuccess);
+  assert.equal(accountErrors, totals.totalErrors);
+  assert.equal(
+    (summary.modeComparison.streaming?.totalRequests ?? 0) +
+      (summary.modeComparison.nonStreaming?.totalRequests ?? 0),
+    totals.totalRequests,
+  );
+  assert.equal(stream + nonStream, totals.totalRequests);
+}
+
+function assertUsageInvariants(
+  usage: ReturnType<typeof stats.getUsageSummary>,
+  expected: number,
+): void {
+  assert.equal(usage.totals.totalRequests, expected);
+  assert.equal(
+    usage.totals.successCount + usage.totals.errorCount,
+    expected,
+  );
+  const accountSum = usage.accounts.reduce((s, a) => s + a.totalRequests, 0);
+  const modelSum = usage.models.reduce((s, m) => s + m.totalRequests, 0);
+  const routeSum = usage.routes.reduce((s, r) => s + r.totalRequests, 0);
+  let cross = 0;
+  for (const a of usage.accounts) {
+    assert.equal(a.successCount + a.errorCount, a.totalRequests);
+    for (const m of a.perModel) {
+      cross += m.requests;
+      assert.equal(m.successCount + m.errorCount, m.requests);
+    }
+  }
+  assert.equal(accountSum, expected);
+  assert.equal(modelSum, expected);
+  assert.equal(routeSum, expected);
+  assert.equal(cross, expected);
+}
+
+test("T1-T4 T6-T9 T12-T15 monitor ring vs usage lifetime", () => {
+  stats.resetDashboardStatsForTesting();
+  for (const n of [999, 1000]) {
+    stats.resetDashboardStatsForTesting();
+    seedLogical(n);
+    const monitor = stats.getMonitorSummary();
+    assert.equal(monitor.totals.totalRequests, n);
+    assertMonitorInvariants(monitor);
+    assertUsageInvariants(stats.getUsageSummary(), n);
+    assert.equal(monitor.totals.totalRequests, stats.getUsageSummary().totals.totalRequests);
+  }
+
+  for (const n of [stats.AI_REQUEST_RING_SIZE + 1, 1500]) {
+    stats.resetDashboardStatsForTesting();
+    seedLogical(n, { extremeFirst: true });
+    const monitor = stats.getMonitorSummary();
+    assert.equal(monitor.totals.totalRequests, stats.AI_REQUEST_RING_SIZE);
+    assertMonitorInvariants(monitor);
+    assertUsageInvariants(stats.getUsageSummary(), n);
+    assert.ok(stats.getUsageSummary().totals.totalRequests > monitor.totals.totalRequests);
+    const recent = stats.getRecentAIRequests(stats.AI_REQUEST_RING_SIZE);
+    assert.equal(recent.length, stats.AI_REQUEST_RING_SIZE);
+    assert.ok(!recent.some((r) => r.requestId === "seed-0"));
+    assert.ok((monitor.totals.overallAvgLatencyMs ?? 0) < 100_000);
+    const samples = recent.map((r) => r.latencyMs).sort((a, b) => a - b);
+    const median = samples[Math.floor(samples.length / 2)];
+    assert.equal(monitor.totals.medianLatencyMs, median);
+    const p95 = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.95))];
+    assert.equal(monitor.totals.p95LatencyMs, p95);
+    const avg = Math.round(samples.reduce((s, v) => s + v, 0) / samples.length);
+    assert.equal(monitor.totals.overallAvgLatencyMs, avg);
+  }
+  stats.resetDashboardStatsForTesting();
+});
+
+test("T5 T14 unknown account model route stay partitioned", () => {
+  stats.resetDashboardStatsForTesting();
+  stats.recordAIRequest({
+    requestId: "blank",
+    route: "",
+    model: "   ",
+    stream: false,
+    accountId: null,
+    latencyMs: 12,
+    success: false,
+    error: "no account yet",
+  });
+  const monitor = stats.getMonitorSummary();
+  assert.equal(monitor.accounts.length, 1);
+  assert.equal(monitor.accounts[0].accountId, stats.UNKNOWN_DIMENSION);
+  assert.equal(monitor.accounts[0].totalRequests, 1);
+  assert.equal(monitor.accounts[0].errorCount, 1);
+  assertMonitorInvariants(monitor);
+  const usage = stats.getUsageSummary();
+  assertUsageInvariants(usage, 1);
+  assert.equal(usage.accounts[0].accountId, "unknown");
+  assert.equal(usage.models[0].model, "unknown");
+  assert.equal(usage.routes[0].route, "unknown");
+  assert.equal(usage.accounts[0].perModel[0].model, "unknown");
+  stats.resetDashboardStatsForTesting();
+});
+
+test("T8 T9 one logical record despite retry metadata", () => {
+  stats.resetDashboardStatsForTesting();
+  stats.recordAIRequest({
+    requestId: "retry-once",
+    route: "Chat",
+    model: "m",
+    stream: true,
+    accountId: "acc-a",
+    latencyMs: 40,
+    success: true,
+    retryCount: 2,
+    attemptedAccounts: 3,
+  });
+  assert.equal(stats.getMonitorSummary().totals.totalRequests, 1);
+  assert.equal(stats.getUsageSummary().totals.totalRequests, 1);
+  assert.equal(stats.getRecentAIRequests(1)[0].retryCount, 2);
+  assert.equal(stats.getRecentAIRequests(1)[0].attemptedAccounts, 3);
+  stats.resetDashboardStatsForTesting();
+});
+
+test("T10 reset clears ring and lifetime maps", () => {
+  seedLogical(5);
+  stats.resetDashboardStatsForTesting();
+  const monitor = stats.getMonitorSummary();
+  const usage = stats.getUsageSummary();
+  assert.equal(monitor.totals.totalRequests, 0);
+  assert.equal(monitor.modeComparison.streaming, null);
+  assert.equal(monitor.modeComparison.nonStreaming, null);
+  assert.equal(usage.totals.totalRequests, 0);
+  assert.equal(usage.accounts.length, 0);
+  assert.equal(usage.models.length, 0);
+  assert.equal(usage.routes.length, 0);
+  assert.equal(Object.keys(stats.getModelHealth()).length, 0);
+});
+
+test("T11 non-AI HTTP traffic does not fill Monitor", async () => {
+  stats.resetDashboardStatsForTesting();
+  const res = await get("/health", false);
+  assert.equal(res.status, 200);
+  const monitorRes = await get("/metrics/monitor");
+  assert.equal(monitorRes.status, 200);
+  const body = (await monitorRes.json()) as {
+    totals: { totalRequests: number; totalSuccess: number; totalErrors: number };
+    accounts: unknown[];
+    modeComparison: { streaming: unknown; nonStreaming: unknown };
+    capabilities: { window: string; perAccount: boolean };
+  };
+  assert.equal(body.totals.totalRequests, 0);
+  assert.equal(body.totals.totalSuccess, 0);
+  assert.equal(body.totals.totalErrors, 0);
+  assert.equal(body.accounts.length, 0);
+  assert.equal(body.modeComparison.streaming, null);
+  assert.equal(body.modeComparison.nonStreaming, null);
+  assert.equal(body.capabilities.perAccount, true);
+  assert.match(body.capabilities.window, /Last 1000 logical AI requests/);
+  stats.resetDashboardStatsForTesting();
+});
+
+test("populated monitor keeps both mode buckets including zeros", () => {
+  stats.resetDashboardStatsForTesting();
+  stats.recordAIRequest({
+    requestId: "only-stream",
+    route: "Chat",
+    model: "m",
+    stream: true,
+    accountId: "acc-a",
+    latencyMs: 15,
+    success: true,
+  });
+  const summary = stats.getMonitorSummary();
+  assert.equal(summary.modeComparison.streaming?.totalRequests, 1);
+  assert.equal(summary.modeComparison.nonStreaming?.totalRequests, 0);
+  const only = summary.accounts[0];
+  assert.ok(only);
+  assert.equal(only.byMode.nonStreaming.totalRequests, 0);
+  assertMonitorInvariants(summary);
+  stats.resetDashboardStatsForTesting();
+});

@@ -83,6 +83,18 @@ import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
+import {
+  beginCaptureTrace,
+  captureBumpIntercept,
+  capturePoint,
+  captureSetActive,
+  captureSetAttempt,
+  captureStageEnter,
+  captureStageError,
+  captureStageExit,
+  currentCaptureTraceId,
+  withCaptureStage,
+} from "./capture-probe.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
@@ -2071,6 +2083,13 @@ export async function captureQwenHeaders(
   touchAccountActivity(accountId);
   const cache = getHeaderCache(accountId);
 
+  if (!currentCaptureTraceId()) {
+    beginCaptureTrace(accountId);
+  }
+  const captureStartedAt = Date.now();
+  captureStageEnter("capture");
+  captureSetActive(true);
+
   let cleanupRoute = async () => {};
   try {
     return await new Promise<void>((resolve, reject) => {
@@ -2107,6 +2126,10 @@ export async function captureQwenHeaders(
       const settle = (error?: Error) => {
         if (settled) return;
         settled = true;
+        capturePoint("capture_settle", {
+          outcome: error ? "error" : "ok",
+          ...(error ? { error: error.name } : {}),
+        });
         if (timeout) clearTimeout(timeout);
         void cleanupRoute();
         // A trigger loop parked between attempts has to be released, otherwise it
@@ -2198,10 +2221,15 @@ export async function captureQwenHeaders(
     };
 
     routeHandler = async (route: any, request: any) => {
+      const interceptCount = captureBumpIntercept();
+      captureStageEnter("route_handler", { intercept_count: interceptCount });
+      let routeResult = "error";
+      try {
       if (settled) {
         // A route installed immediately before timeout must not poison future
         // browser traffic after the capture operation has completed.
         await route.continue().catch(() => {});
+        routeResult = "continue";
         return;
       }
 
@@ -2242,6 +2270,7 @@ export async function captureQwenHeaders(
         // failing here would throw away a budget that is still nearly full.
         sawIncompleteHeaders = true;
         await route.abort("aborted").catch(() => {});
+        routeResult = "abort";
         // Aborting kills the UI's send, so nothing will re-fire on its own.
         retriggerRequested = true;
         wakeTrigger();
@@ -2262,8 +2291,12 @@ export async function captureQwenHeaders(
       touchAccountActivity(accountId);
 
       await route.abort("aborted").catch(() => {});
+      routeResult = "abort";
       await sleep(HEADER_CAPTURE_SETTLE_MS);
       settle();
+      } finally {
+        captureStageExit("route_handler", { result: routeResult });
+      }
     };
 
     // Navigate to the stable chat page. Only the first attempt pays for this:
@@ -2271,10 +2304,20 @@ export async function captureQwenHeaders(
     // would throw away the bx SDK state that just finished warming up.
     const openChatPage = async () => {
       if (settled || page.isClosed()) return;
-      await page.goto(qwenUrl("/"), {
-        waitUntil: "domcontentloaded",
-        timeout: Math.min(config.timeouts.navigation, timeoutMs),
-      });
+      captureStageEnter("capture_goto");
+      try {
+        await page.goto(qwenUrl("/"), {
+          waitUntil: "domcontentloaded",
+          timeout: Math.min(config.timeouts.navigation, timeoutMs),
+        });
+      } catch (error) {
+        captureStageError(
+          "capture_goto",
+          error instanceof Error ? error.name : "Error",
+        );
+        throw error;
+      }
+      captureStageExit("capture_goto");
       if (settled || page.isClosed()) return;
       await sleep(2000);
     };
@@ -2442,6 +2485,7 @@ export async function captureQwenHeaders(
         attempt++
       ) {
         retriggerRequested = false;
+        captureSetAttempt(attempt);
         // Driving a send is not the grace window: restore the overall budget
         // so the previous attempt's grace timer cannot expire mid-typing.
         armOverallDeadline();
@@ -2464,7 +2508,7 @@ export async function captureQwenHeaders(
             await openChatPage();
           }
           if (settled) return;
-          await triggerSend(attempt);
+          await withCaptureStage("trigger_send", () => triggerSend(attempt));
         } catch (error) {
           console.warn(
             `❌ [Playwright] Error triggering header capture for ${accountId}: ${getErrorMessage(error)}`,
@@ -2496,9 +2540,11 @@ export async function captureQwenHeaders(
 
     armOverallDeadline();
 
+    captureStageEnter("route_register");
     void page
       .route("**/api/v2/chat/completions*", routeHandler)
       .then(async () => {
+        captureStageExit("route_register");
         routeRegistered = true;
         if (settled) {
           cleanupRoute();
@@ -2508,6 +2554,10 @@ export async function captureQwenHeaders(
         await runTriggerLoop();
       })
       .catch((error) => {
+        captureStageError(
+          "route_register",
+          error instanceof Error ? error.name : "Error",
+        );
         console.warn(
           `[Playwright] Error registering header capture route: ${getErrorMessage(error)}`,
         );
@@ -2520,6 +2570,8 @@ export async function captureQwenHeaders(
     });
   } finally {
     await cleanupRoute();
+    captureStageExit("capture", { duration_ms: Date.now() - captureStartedAt });
+    captureSetActive(false);
   }
 }
 type CookieSnapshot = Awaited<ReturnType<BrowserContext["cookies"]>>;
@@ -2597,6 +2649,7 @@ async function refreshHeadersInternal(
     const page = accountPages.get(accountId);
     if (page) {
       try {
+        captureStageEnter("refresh_goto");
         await page.goto(qwenUrl("/"), {
           waitUntil: "domcontentloaded",
           timeout: Math.min(
@@ -2605,6 +2658,7 @@ async function refreshHeadersInternal(
             SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
           ),
         });
+        captureStageExit("refresh_goto");
         const url = page.url();
         if (url.includes("auth") || url.includes("login")) {
           console.warn(
@@ -2623,6 +2677,10 @@ async function refreshHeadersInternal(
           }
         }
       } catch (navErr) {
+        captureStageError(
+          "refresh_goto",
+          navErr instanceof Error ? navErr.name : "Error",
+        );
         console.warn(
           `[Playwright] Navigation check failed during refresh for ${accountId}:`,
           (navErr as Error).message,
@@ -2658,11 +2716,22 @@ export async function refreshHeaders(
   timeoutMs = config.timeouts.headers,
 ): Promise<void> {
   const boundedTimeoutMs = Math.max(1_000, timeoutMs);
-  const release = await acquireAccountMutex(
-    accountId,
-    `refresh:${accountId.substring(0, 12)}`,
-    boundedTimeoutMs,
-  );
+  captureStageEnter("mutex_acquire");
+  let release: () => void;
+  try {
+    release = await acquireAccountMutex(
+      accountId,
+      `refresh:${accountId.substring(0, 12)}`,
+      boundedTimeoutMs,
+    );
+  } catch (error) {
+    captureStageError(
+      "mutex_acquire",
+      error instanceof Error ? error.name : "Error",
+    );
+    throw error;
+  }
+  captureStageExit("mutex_acquire");
   try {
     await refreshHeadersInternal(accountId, timeoutMs);
   } finally {
@@ -3383,6 +3452,23 @@ export async function closeAllPlaywright(): Promise<void> {
 
 export function isPlaywrightInitialized(accountId: string): boolean {
   return accountPages.has(accountId);
+}
+
+/**
+ * FIX V1 (fase 2.17B) helper: report whether an account still holds a live
+ * browser context and/or page. Used by the post-CAPTCHA reset to observe
+ * (`old_context_present` / `old_page_present` probe fields) and to verify
+ * that the old state was actually invalidated before the headers refresh
+ * runs on a fresh context. Read-only.
+ */
+export function getPlaywrightAccountPresence(accountId: string): {
+  context: boolean;
+  page: boolean;
+} {
+  return {
+    context: accountContexts.has(accountId),
+    page: accountPages.has(accountId),
+  };
 }
 
 /**

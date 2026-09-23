@@ -9,6 +9,11 @@ import {
   sanitizeCaptchaErrorDetail,
   solveBaxiaCaptcha,
 } from "./captcha-solver.ts";
+import {
+  beginCaptchaTrace,
+  endCaptchaTrace,
+  withCaptchaStage,
+} from "./captcha-probe.ts";
 
 const CHALLENGE_NAVIGATION_TIMEOUT_MS = 8_000;
 const CHALLENGE_PATH_MARKER = "_____tmd_____";
@@ -55,7 +60,11 @@ export async function solveChallengeOnPage(
   // Qwen's own Baxia SDK sometimes renders the dialog for the background
   // fetch. When it did, solve it in place: navigating away would discard the
   // challenge the SDK is waiting on.
-  if (await solveBaxiaCaptcha(page, { ...solverOptions, waitForMs: 0 })) {
+  if (
+    await withCaptchaStage("solve_inplace", () =>
+      solveBaxiaCaptcha(page, { ...solverOptions, waitForMs: 0 }),
+    )
+  ) {
     return true;
   }
 
@@ -64,15 +73,21 @@ export async function solveChallengeOnPage(
     { source: challengeUrl ? "response_body" : "chat_reload" },
     true,
   );
-  await gotoBestEffort(page, challengeUrl ?? qwenUrl("/"));
+  await withCaptchaStage("navigate_challenge", () =>
+    gotoBestEffort(page, challengeUrl ?? qwenUrl("/")),
+  );
 
   try {
-    return await solveBaxiaCaptcha(page, { ...solverOptions, waitForMs });
+    return await withCaptchaStage("solve_visible", () =>
+      solveBaxiaCaptcha(page, { ...solverOptions, waitForMs }),
+    );
   } finally {
     // Never leave the account page parked on the punish document: a stale
     // challenge page makes the next detection pass find itself.
     if (page.url().includes(CHALLENGE_PATH_MARKER)) {
-      await gotoBestEffort(page, qwenUrl("/"));
+      await withCaptchaStage("navigate_home", () =>
+        gotoBestEffort(page, qwenUrl("/")),
+      );
     }
   }
 }
@@ -123,6 +138,7 @@ export async function recoverBaxiaCaptcha(
   );
 
   try {
+    beginCaptchaTrace(accountId);
     // recoverOnTimeout: false ensures that if the captcha solve times out,
     // withAccountPage does NOT destructively kill the browser context, which
     // previously caused "Target page, context or browser has been closed" mid-slider.
@@ -160,5 +176,7 @@ export async function recoverBaxiaCaptcha(
       detail,
     });
     return false;
+  } finally {
+    endCaptchaTrace();
   }
 }

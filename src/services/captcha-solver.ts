@@ -5,6 +5,11 @@ import {
   sleep,
   withCdpDeadline,
 } from "./human-behavior.ts";
+import {
+  captchaStageEnter,
+  captchaStageExit,
+  withCaptchaStage,
+} from "./captcha-probe.ts";
 
 export { CaptchaCdpTimeoutError };
 
@@ -355,7 +360,9 @@ async function withCaptchaMouseLock<T>(
   const previous = captchaMouseLock;
   const { promise: gate, resolve } = Promise.withResolvers<void>();
   captchaMouseLock = gate;
+  captchaStageEnter("await_mouse_lock");
   await previous;
+  captchaStageExit("await_mouse_lock");
   try {
     // The run is raced against an explicit deadline INSIDE the try/finally,
     // so the gate is released even when the inner CDP work never settles
@@ -440,7 +447,9 @@ async function solveBaxiaCaptchaUnlocked(
   // nothing; after a renderer crash they would hang forever.
   const perActionMs = sliderTimeoutMs;
 
-  const detected = await detectBaxiaChallenge(page, waitForMs, perActionMs);
+  const detected = await withCaptchaStage("detect", () =>
+    detectBaxiaChallenge(page, waitForMs, perActionMs),
+  );
   if (!detected) return false;
 
   const scope = detected.target.iframeSelector ? "iframe" : "top_level";
@@ -474,35 +483,35 @@ async function solveBaxiaCaptchaUnlocked(
       const reloadLink = frame.locator(BAXIA_RELOAD_SELECTOR).first();
       if (await isVisible(reloadLink, perActionMs)) {
         logBaxiaCaptcha("challenge_reload", { attempt });
-        await withCdpDeadline(
-          reloadLink.click({ force: true }),
-          perActionMs,
-          "reload_click",
-        ).catch(() => {});
+        await withCaptchaStage("reload_click", () =>
+          withCdpDeadline(
+            reloadLink.click({ force: true }),
+            perActionMs,
+            "reload_click",
+          ).catch(() => {}),
+        );
         await sleep(500);
       }
 
-      await slider.waitFor({ state: "visible", timeout: sliderTimeoutMs });
+      await withCaptchaStage("slider_wait", () =>
+        slider.waitFor({ state: "visible", timeout: sliderTimeoutMs }),
+      );
       if (!sliderFoundReported) {
         logBaxiaCaptcha("slider_found");
         sliderFoundReported = true;
       }
 
       stage = "geometry";
-      const sliderBox = await withCdpDeadline(
-        slider.boundingBox(),
-        perActionMs,
-        "slider_bounds",
+      const sliderBox = await withCaptchaStage("slider_bounds", () =>
+        withCdpDeadline(slider.boundingBox(), perActionMs, "slider_bounds"),
       );
       if (!sliderBox) {
         lastReason = "bounds_unavailable";
         logBaxiaCaptcha("attempt_bounds_unavailable", { attempt });
       } else {
         const track = frame.locator(BAXIA_TRACK_SELECTOR);
-        const trackBox = await withCdpDeadline(
-          track.boundingBox(),
-          perActionMs,
-          "track_bounds",
+        const trackBox = await withCaptchaStage("track_bounds", () =>
+          withCdpDeadline(track.boundingBox(), perActionMs, "track_bounds"),
         );
         const trackWidth = trackBox?.width ?? 300;
         const dragDistance = Math.max(0, trackWidth - sliderBox.width);
@@ -518,26 +527,30 @@ async function solveBaxiaCaptchaUnlocked(
 
         if (dragDistance > 0) {
           stage = "drag";
-          await humanDrag(
-            page,
-            sliderBox.x + sliderBox.width / 2,
-            sliderBox.y + sliderBox.height / 2,
-            sliderBox.x + sliderBox.width / 2 + dragDistance,
-            sliderBox.y + sliderBox.height / 2,
-            perActionMs,
+          await withCaptchaStage("drag", () =>
+            humanDrag(
+              page,
+              sliderBox.x + sliderBox.width / 2,
+              sliderBox.y + sliderBox.height / 2,
+              sliderBox.x + sliderBox.width / 2 + dragDistance,
+              sliderBox.y + sliderBox.height / 2,
+              perActionMs,
+            ),
           );
         }
       }
 
       stage = "settle";
       if (
-        await waitForSolvedState(
-          detected.target.locator,
-          detected.dialogLocator,
-          detected.contentLocator,
-          frame,
-          settleMs,
-          perActionMs,
+        await withCaptchaStage("settle", () =>
+          waitForSolvedState(
+            detected.target.locator,
+            detected.dialogLocator,
+            detected.contentLocator,
+            frame,
+            settleMs,
+            perActionMs,
+          ),
         )
       ) {
         logBaxiaCaptcha(

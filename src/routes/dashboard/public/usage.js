@@ -1,7 +1,7 @@
 /* QwenProxy dashboard usage page.
  * Layout follows QwenGate public/usage.js + usage.html. Honest adaptation:
  * QwenProxy keeps no daily history — the window is "since process start"
- * (in-memory ring). No today/yesterday/7-days, no rate-limit walls, no
+ * (lifetime RAM counters, not the Monitor ring). No today/yesterday/7-days, no rate-limit walls, no
  * daily budgets are shown or implied.
  */
 

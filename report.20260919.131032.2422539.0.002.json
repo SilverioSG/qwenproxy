@@ -1,0 +1,597 @@
+
+{
+  "header": {
+    "reportVersion": 5,
+    "event": "Allocation failed - JavaScript heap out of memory",
+    "trigger": "OOMError",
+    "filename": "report.20260919.131032.2422539.0.002.json",
+    "dumpEventTime": "2026-09-19T13:10:32Z",
+    "dumpEventTimeStamp": "1789816232610",
+    "processId": 2422539,
+    "threadId": null,
+    "cwd": "/home/silver/Apps/qwenproxy",
+    "commandLine": [
+      "/usr/bin/node",
+      "--require",
+      "/home/silver/Apps/qwenproxy/node_modules/tsx/dist/preflight.cjs",
+      "--import",
+      "file:///home/silver/Apps/qwenproxy/node_modules/tsx/dist/loader.mjs",
+      "src/index.ts"
+    ],
+    "nodejsVersion": "v26.8.1",
+    "glibcVersionRuntime": "2.44",
+    "glibcVersionCompiler": "2.44",
+    "wordSize": 64,
+    "arch": "x64",
+    "platform": "linux",
+    "componentVersions": {
+      "acorn": "8.18.0",
+      "ada": "4.0.0",
+      "amaro": "1.1.11",
+      "ares": "1.34.8",
+      "brotli": "1.2.0",
+      "cldr": "48.0",
+      "icu": "78.3",
+      "libffi": "3.8.0",
+      "lief": "0.17.0",
+      "llhttp": "9.4.3",
+      "merve": "1.2.2",
+      "modules": "147",
+      "napi": "10",
+      "nbytes": "0.1.4",
+      "ncrypto": "0.0.1",
+      "nghttp2": "1.70.0",
+      "nghttp3": "",
+      "ngtcp2": "",
+      "node": "26.8.1",
+      "openssl": "3.6.4",
+      "simdjson": "4.6.9",
+      "simdutf": "7.7.0",
+      "sqlite": "3.53.4",
+      "tz": "2026a",
+      "undici": "8.10.0",
+      "unicode": "17.0",
+      "uv": "1.52.1",
+      "uvwasi": "0.0.23",
+      "v8": "14.6.202.34-node.28",
+      "zlib": "1.3.1.zlib-ng",
+      "zstd": "1.5.7"
+    },
+    "release": {
+      "name": "node",
+      "headersUrl": "https://nodejs.org/download/release/v26.8.1/node-v26.8.1-headers.tar.gz",
+      "sourceUrl": "https://nodejs.org/download/release/v26.8.1/node-v26.8.1.tar.gz"
+    },
+    "osName": "Linux",
+    "osRelease": "7.2.2-1-cachyos",
+    "osVersion": "#1 SMP PREEMPT_DYNAMIC Fri, 28 Aug 2026 11:45:06 +0000",
+    "osMachine": "x86_64",
+    "cpus": [
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 9180410,
+        "nice": 5615600,
+        "sys": 6695890,
+        "idle": 155913440,
+        "irq": 2321410
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 8130150,
+        "nice": 5262290,
+        "sys": 6030180,
+        "idle": 160425820,
+        "irq": 2125620
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 7404170,
+        "nice": 5511930,
+        "sys": 5301820,
+        "idle": 163247470,
+        "irq": 1604590
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6816450,
+        "nice": 5463640,
+        "sys": 4854170,
+        "idle": 165085100,
+        "irq": 1421840
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6410790,
+        "nice": 5230000,
+        "sys": 4573070,
+        "idle": 166340760,
+        "irq": 1265250
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6312250,
+        "nice": 5320260,
+        "sys": 4427590,
+        "idle": 167044700,
+        "irq": 1199630
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6080360,
+        "nice": 5140610,
+        "sys": 4431570,
+        "idle": 167750500,
+        "irq": 1164920
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6077810,
+        "nice": 5337320,
+        "sys": 4301930,
+        "idle": 167727410,
+        "irq": 1136910
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 10219920,
+        "nice": 5646390,
+        "sys": 6768040,
+        "idle": 157368310,
+        "irq": 2240350
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 9047050,
+        "nice": 5329290,
+        "sys": 5995190,
+        "idle": 160760350,
+        "irq": 1865340
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 8144560,
+        "nice": 5196420,
+        "sys": 5300340,
+        "idle": 163458660,
+        "irq": 1566630
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 7358060,
+        "nice": 4866770,
+        "sys": 4853750,
+        "idle": 165571620,
+        "irq": 1367040
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6839700,
+        "nice": 4684980,
+        "sys": 4583700,
+        "idle": 166781400,
+        "irq": 1232830
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6674500,
+        "nice": 4614260,
+        "sys": 4452160,
+        "idle": 167516310,
+        "irq": 1152090
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6516740,
+        "nice": 4558810,
+        "sys": 4404380,
+        "idle": 166947260,
+        "irq": 1162760
+      },
+      {
+        "model": "AMD EPYC Processor (with IBPB)",
+        "speed": 0,
+        "user": 6361100,
+        "nice": 4696310,
+        "sys": 4347340,
+        "idle": 167748880,
+        "irq": 1099100
+      }
+    ],
+    "networkInterfaces": [
+      {
+        "name": "lo",
+        "internal": true,
+        "mac": "00:00:00:00:00:00",
+        "address": "127.0.0.1",
+        "netmask": "255.0.0.0",
+        "family": "IPv4"
+      },
+      {
+        "name": "eth0",
+        "internal": false,
+        "mac": "00:50:56:5d:54:02",
+        "address": "75.119.151.189",
+        "netmask": "255.255.224.0",
+        "family": "IPv4"
+      },
+      {
+        "name": "wg0",
+        "internal": false,
+        "mac": "00:00:00:00:00:00",
+        "address": "10.8.0.7",
+        "netmask": "255.255.255.255",
+        "family": "IPv4"
+      },
+      {
+        "name": "lo",
+        "internal": true,
+        "mac": "00:00:00:00:00:00",
+        "address": "::1",
+        "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "family": "IPv6",
+        "scopeid": 0
+      },
+      {
+        "name": "eth0",
+        "internal": false,
+        "mac": "00:50:56:5d:54:02",
+        "address": "2a02:c207:2283:4924::1",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 0
+      },
+      {
+        "name": "eth0",
+        "internal": false,
+        "mac": "00:50:56:5d:54:02",
+        "address": "fe80::250:56ff:fe5d:5402",
+        "netmask": "ffff:ffff:ffff:ffff::",
+        "family": "IPv6",
+        "scopeid": 2
+      }
+    ],
+    "host": "quant"
+  },
+  "javascriptStack": {
+    "message": "No stack.",
+    "stack": [
+      "Unavailable."
+    ],
+    "errorProperties": {
+    }
+  },
+  "javascriptHeap": {
+    "totalMemory": 8673464320,
+    "executableMemory": 4874240,
+    "totalCommittedMemory": 8669474816,
+    "availableMemory": 19663776,
+    "totalGlobalHandlesMemory": 40960,
+    "usedGlobalHandlesMemory": 27776,
+    "usedMemory": 8654210968,
+    "memoryLimit": 8791261184,
+    "mallocedMemory": 1065024,
+    "externalMemory": 31994801,
+    "peakMallocedMemory": 9931968,
+    "nativeContextCount": 1,
+    "detachedContextCount": 0,
+    "doesZapGarbage": 0,
+    "heapSpaces": {
+      "read_only_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "new_space": {
+        "memorySize": 1048576,
+        "committedMemory": 1048576,
+        "capacity": 1048512,
+        "used": 0,
+        "available": 1048512
+      },
+      "old_space": {
+        "memorySize": 8659402752,
+        "committedMemory": 8655581184,
+        "capacity": 8642717712,
+        "used": 8642284592,
+        "available": 433120
+      },
+      "code_space": {
+        "memorySize": 4718592,
+        "committedMemory": 4558848,
+        "capacity": 4159552,
+        "used": 4159552,
+        "available": 0
+      },
+      "shared_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "trusted_space": {
+        "memorySize": 4456448,
+        "committedMemory": 4448256,
+        "capacity": 3977112,
+        "used": 3977112,
+        "available": 0
+      },
+      "shared_trusted_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "new_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 1048576,
+        "used": 0,
+        "available": 1048576
+      },
+      "large_object_space": {
+        "memorySize": 3682304,
+        "committedMemory": 3682304,
+        "capacity": 3637072,
+        "used": 3637072,
+        "available": 0
+      },
+      "code_large_object_space": {
+        "memorySize": 155648,
+        "committedMemory": 155648,
+        "capacity": 152640,
+        "used": 152640,
+        "available": 0
+      },
+      "shared_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "shared_trusted_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      },
+      "trusted_large_object_space": {
+        "memorySize": 0,
+        "committedMemory": 0,
+        "capacity": 0,
+        "used": 0,
+        "available": 0
+      }
+    }
+  },
+  "nativeStack": [
+    {
+      "pc": "0x0000561408e8d012",
+      "symbol": "node::TriggerNodeReport[abi:cxx11](v8::Isolate*, node::Environment*, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, v8::Local<v8::Value>) [/usr/bin/node]"
+    },
+    {
+      "pc": "0x0000561408f6ada2",
+      "symbol": "node::TriggerNodeReport[abi:cxx11](v8::Isolate*, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, std::basic_string_view<char, std::char_traits<char> >, v8::Local<v8::Value>) [/usr/bin/node]"
+    },
+    {
+      "pc": "0x000056140914b4f7",
+      "symbol": "node::OOMErrorHandler(char const*, v8::OOMDetails const&) [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005614095fd663",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00005614095fd7f3",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x0000561409733af8",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x000056140972d291",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x000056140a42f5a4",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x000056140a42a7fb",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x000056140a42a5dd",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x0000561409f643d5",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x000056140a0c36fb",
+      "symbol": " [/usr/bin/node]"
+    },
+    {
+      "pc": "0x00007f287ae3d8b6",
+      "symbol": ""
+    }
+  ],
+  "resourceUsage": {
+    "free_memory": 18978238464,
+    "total_memory": 67416576000,
+    "rss": 39922798592,
+    "constrained_memory": 18446744073709551615,
+    "available_memory": 18978238464,
+    "userCpuSeconds": 1419.1,
+    "kernelCpuSeconds": 58.273,
+    "cpuConsumptionPercent": 95.2529,
+    "userCpuConsumptionPercent": 91.4957,
+    "kernelCpuConsumptionPercent": 3.75712,
+    "maxRss": 50721968128,
+    "pageFaults": {
+      "IORequired": 1,
+      "IONotRequired": 9528118
+    },
+    "fsActivity": {
+      "reads": 33440,
+      "writes": 22621728
+    }
+  },
+  "uvthreadResourceUsage": {
+    "userCpuSeconds": 1019.75,
+    "kernelCpuSeconds": 49.5695,
+    "cpuConsumptionPercent": 68.9441,
+    "userCpuConsumptionPercent": 65.7481,
+    "kernelCpuConsumptionPercent": 3.19597,
+    "fsActivity": {
+      "reads": 33432,
+      "writes": 22613592
+    }
+  },
+  "libuv": [
+  ],
+  "workers": [
+  ],
+  "environmentVariables": {
+    "SHELL": "/bin/bash",
+    "npm_command": "start",
+    "npm_config_userconfig": "/home/silver/.npmrc",
+    "npm_config_cache": "/home/silver/.npm",
+    "NODE": "/usr/bin/node",
+    "NODE_OPTIONS": "--max-old-space-size=8192 --require /tmp/mem-probe.cjs --heapsnapshot-near-heap-limit=1 --report-on-fatalerror --diagnostic-dir=/home/silver/.local/state/qwenproxy/diagnostics",
+    "MEMORY_PRESSURE_WRITE": "c29tZSAyMDAwMDAgMjAwMDAwMAA=",
+    "COLOR": "0",
+    "npm_config_local_prefix": "/home/silver/Apps/qwenproxy",
+    "npm_config_globalconfig": "/etc/npmrc",
+    "EDITOR": "vi",
+    "PWD": "/home/silver/Apps/qwenproxy",
+    "LOGNAME": "silver",
+    "npm_config_init_module": "/home/silver/.npm-init.js",
+    "SYSTEMD_EXEC_PID": "2422511",
+    "XAUTHORITY": "/tmp/xauth_baiEkH",
+    "HOME": "/home/silver",
+    "LANG": "es_ES.UTF-8",
+    "npm_package_version": "1.0.23",
+    "MEMORY_PRESSURE_WATCH": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/qwenproxy.service/memory.pressure",
+    "INVOCATION_ID": "1349ee69cab04ab98816a479e176a495",
+    "MANAGERPID": "595",
+    "INIT_CWD": "/home/silver/Apps/qwenproxy",
+    "npm_lifecycle_script": "tsx src/index.ts",
+    "npm_config_npm_version": "12.0.2",
+    "npm_package_name": "qwenproxy-cli",
+    "npm_config_prefix": "/home/silver/.local/npm-global",
+    "USER": "silver",
+    "DISPLAY": ":0",
+    "npm_lifecycle_event": "start",
+    "SHLVL": "0",
+    "MANAGERPIDFDID": "49166",
+    "npm_config_user_agent": "npm/12.0.2 node/v26.8.1 linux x64 workspaces/false",
+    "npm_execpath": "/usr/lib/node_modules/npm/bin/npm-cli.js",
+    "XDG_RUNTIME_DIR": "/run/user/1000",
+    "npm_package_bin_qpx": "bin/qwenproxy.js",
+    "npm_package_json": "/home/silver/Apps/qwenproxy/package.json",
+    "JOURNAL_STREAM": "10:21889893",
+    "XDG_DATA_DIRS": "/home/silver/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/",
+    "npm_config_allow_scripts": "true",
+    "npm_config_noproxy": "",
+    "PATH": "/home/silver/Apps/qwenproxy/node_modules/.bin:/home/silver/Apps/node_modules/.bin:/home/silver/node_modules/.bin:/home/node_modules/.bin:/node_modules/.bin:/usr/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/usr/local/bin:/usr/bin",
+    "npm_config_node_gyp": "/usr/lib/node_modules/node-gyp/bin/node-gyp.js",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+    "npm_config_global_prefix": "/home/silver/.local/npm-global",
+    "npm_config_global_ignore_file": "/home/silver/.local/npm-global/etc/npmignore",
+    "npm_node_execpath": "/usr/bin/node",
+    "npm_package_engines_node": ">=22",
+    "_": "/home/silver/Apps/qwenproxy/node_modules/.bin/tsx",
+    "QWEN_ACCOUNTS": "1cuentatest1@gmail.com:Gmail_User1!;1cuentatest2@gmail.com:Gmail_User1!;macmamaman@proton.me:QwentUser1!;qwtestfdgdtmepfp@emalupe.com:QwenUser1!;jaymeeseparate@emalupe.com:QwenUser1!;qwenusuario1@emalupe.com:QwenUser1!;qwenusuario2@emalupe.com:QwenUser1!;tatianiagold@emalupe.com:QwenUser1!;rayna54@emalupe.com:QwenUser1!;67mead@emalupe.com:QwenUser1!;tatianadamaged@emalupe.com:QwenUser1!;othellaliterary@emalupe.com:QwenUser1!;6630silvia@emalupe.com:QwenUser1!;privatejaneta@emalupe.com:QwenUser1!;extended274@emalupe.com:QwenUser1!;vidaamber@emalupe.com:QwenUser1!;deenadriving@emalupe.com:QwenUser1!;stronglinell@emalupe.com:QwenUser1!;apricotexciting@emalupe.com:QwenUser1!;comprehensiveloraine@emalupe.com:QwenUser1!;modelocuantitativo+test1@gmail.com:QwenUser1!;modelocuantitativo+test2@gmail.com:Gmail_User1!",
+    "DOTENV_CONFIG_QUIET": "true"
+  },
+  "userLimits": {
+    "core_file_size_blocks": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "data_seg_size_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "file_size_blocks": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "max_locked_memory_bytes": {
+      "soft": 8388608,
+      "hard": 8388608
+    },
+    "max_memory_size_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "open_files": {
+      "soft": 1048576,
+      "hard": 1048576
+    },
+    "stack_size_bytes": {
+      "soft": 8388608,
+      "hard": "unlimited"
+    },
+    "cpu_time_seconds": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    },
+    "max_user_processes": {
+      "soft": 257081,
+      "hard": 257081
+    },
+    "virtual_memory_bytes": {
+      "soft": "unlimited",
+      "hard": "unlimited"
+    }
+  },
+  "sharedObjects": [
+    "linux-vdso.so.1",
+    "/usr/lib/libz.so.1",
+    "/usr/lib/libuv.so.1",
+    "/usr/lib/libada.so.4",
+    "/usr/lib/libsimdjson.so.33",
+    "/usr/lib/libbrotlidec.so.1",
+    "/usr/lib/libbrotlienc.so.1",
+    "/usr/lib/libcares.so.2",
+    "/usr/lib/libnghttp2.so.14",
+    "/usr/lib/libffi.so.8",
+    "/usr/lib/libzstd.so.1",
+    "/usr/lib/libcrypto.so.3",
+    "/usr/lib/libssl.so.3",
+    "/usr/lib/libicui18n.so.78",
+    "/usr/lib/libicuuc.so.78",
+    "/usr/lib/libstdc++.so.6",
+    "/usr/lib/libm.so.6",
+    "/usr/lib/libgcc_s.so.1",
+    "/usr/lib/libc.so.6",
+    "/lib64/ld-linux-x86-64.so.2",
+    "/usr/lib/libbrotlicommon.so.1",
+    "/usr/lib/libicudata.so.78",
+    "/home/silver/Apps/qwenproxy/node_modules/better-sqlite3/prebuilds/linux-x64.node"
+  ]
+}

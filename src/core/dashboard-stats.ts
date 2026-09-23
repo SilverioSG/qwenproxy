@@ -5,8 +5,14 @@
  * changes: producers call `recordNetworkEvent` / `recordAIRequest` with
  * already-known values; every aggregate below is derived on read.
  *
- * Data window: since process start (exposed as `windowSince` so the UI can
- * label it honestly instead of faking "today / 7 days").
+ * Two windows, never mixed:
+ * - Monitor (`getMonitorSummary`) reads only `aiRing` (last
+ *   AI_REQUEST_RING_SIZE logical AI requests). Avg, median and p95 share
+ *   that same population. Restart clears it.
+ * - Usage (`getUsageSummary`) reads only process-lifetime Maps incremented
+ *   once per logical AI request. Restart clears them. No disk restore.
+ *
+ * `getModelHealth` stays on the lifetime `perModel` map (not the ring).
  *
  * Nothing stored here contains prompts, responses, headers, cookies or
  * tokens — error strings are truncated and redacted on ingest.
@@ -23,6 +29,9 @@ export const LATENCY_SAMPLES_PER_KEY = 200;
 export const RECENT_ERRORS_PER_ACCOUNT = 8;
 export const TOP_ERRORS_LIMIT = 10;
 export const ERROR_TEXT_MAX = 200;
+
+/** Dimension bucket for null/empty account, model or route. Not a real id. */
+export const UNKNOWN_DIMENSION = "unknown";
 
 const bootTime = Date.now();
 
@@ -56,27 +65,16 @@ export interface AIRequestRecord {
   attemptedAccounts: number;
 }
 
-interface LatencyAccumulator {
-  count: number;
-  sum: number;
-  samples: number[];
-}
-
-interface ModelAccumulator {
+interface LifetimeBucket {
   requests: number;
   success: number;
   errors: number;
   lastActivity: number;
+  latencySum: number;
+  latencyCount: number;
+  /** Usage percentiles only. Capped at LATENCY_SAMPLES_PER_KEY. */
   latencies: number[];
-}
-
-interface AccountAccumulator {
-  requests: number;
-  success: number;
-  errors: number;
-  lastActivity: number;
-  latencies: number[];
-  recentErrors: string[];
+  recentErrors?: string[];
 }
 
 interface RouteAccumulator {
@@ -88,29 +86,23 @@ interface RouteAccumulator {
 let nextId = 1;
 const networkRing: NetworkEvent[] = [];
 const aiRing: AIRequestRecord[] = [];
-const globalLatency: LatencyAccumulator = { count: 0, sum: 0, samples: [] };
-const perModel = new Map<string, ModelAccumulator>();
-const perAccount = new Map<string, AccountAccumulator>();
+const perModel = new Map<string, LifetimeBucket>();
+const perAccount = new Map<string, LifetimeBucket>();
 const perRoute = new Map<string, RouteAccumulator>();
+/** Lifetime account × model. Both keys pass through normalizeDimension. */
+const perAccountModel = new Map<string, Map<string, LifetimeBucket>>();
 const errorCounts = new Map<string, number>();
+
+export function normalizeDimension(value: string | null | undefined): string {
+  if (typeof value !== "string") return UNKNOWN_DIMENSION;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : UNKNOWN_DIMENSION;
+}
 
 function pushBounded<T>(ring: T[], item: T, cap: number): void {
   ring.push(item);
   if (ring.length > cap) {
     ring.splice(0, ring.length - cap);
-  }
-}
-
-function pushLatencySample(
-  acc: LatencyAccumulator,
-  latencyMs: number,
-  cap: number,
-): void {
-  acc.count += 1;
-  acc.sum += latencyMs;
-  acc.samples.push(latencyMs);
-  if (acc.samples.length > cap) {
-    acc.samples.splice(0, acc.samples.length - cap);
   }
 }
 
@@ -146,6 +138,47 @@ export function p95Of(values: number[]): number | null {
 export function avgOf(count: number, sum: number): number | null {
   if (count <= 0) return null;
   return Math.round(sum / count);
+}
+
+function emptyLifetime(): LifetimeBucket {
+  return {
+    requests: 0,
+    success: 0,
+    errors: 0,
+    lastActivity: 0,
+    latencySum: 0,
+    latencyCount: 0,
+    latencies: [],
+  };
+}
+
+function touchLifetime(
+  bucket: LifetimeBucket,
+  success: boolean,
+  latencyMs: number,
+  timestamp: number,
+): void {
+  bucket.requests += 1;
+  if (success) bucket.success += 1;
+  else bucket.errors += 1;
+  bucket.lastActivity = timestamp;
+  if (Number.isFinite(latencyMs)) {
+    bucket.latencySum += latencyMs;
+    bucket.latencyCount += 1;
+    bucket.latencies.push(latencyMs);
+    if (bucket.latencies.length > LATENCY_SAMPLES_PER_KEY) {
+      bucket.latencies.splice(0, bucket.latencies.length - LATENCY_SAMPLES_PER_KEY);
+    }
+  }
+}
+
+function getOrCreateLifetime(map: Map<string, LifetimeBucket>, key: string): LifetimeBucket {
+  let bucket = map.get(key);
+  if (!bucket) {
+    bucket = emptyLifetime();
+    map.set(key, bucket);
+  }
+  return bucket;
 }
 
 export function recordNetworkEvent(event: {
@@ -202,68 +235,36 @@ export function recordAIRequest(input: {
     attemptedAccounts: input.attemptedAccounts ?? 1,
   };
   pushBounded(aiRing, record, AI_REQUEST_RING_SIZE);
-  pushLatencySample(globalLatency, record.latencyMs, LATENCY_SAMPLES_GLOBAL);
 
-  let model = perModel.get(record.model);
-  if (!model) {
-    model = {
-      requests: 0,
-      success: 0,
-      errors: 0,
-      lastActivity: 0,
-      latencies: [],
-    };
-    perModel.set(record.model, model);
-  }
-  model.requests += 1;
-  if (record.success) model.success += 1;
-  else model.errors += 1;
-  model.lastActivity = record.timestamp;
-  model.latencies.push(record.latencyMs);
-  if (model.latencies.length > LATENCY_SAMPLES_PER_KEY) {
-    model.latencies.splice(0, model.latencies.length - LATENCY_SAMPLES_PER_KEY);
-  }
-  // Samples back median/p95; the exact sum backs the average.
-  (model as unknown as { latencySum: number }).latencySum =
-    ((model as unknown as { latencySum: number }).latencySum ?? 0) +
-    record.latencyMs;
+  const accountKey = normalizeDimension(record.accountId);
+  const modelKey = normalizeDimension(record.model);
+  const routeKey = normalizeDimension(record.route);
 
-  if (record.accountId) {
-    let account = perAccount.get(record.accountId);
-    if (!account) {
-      account = {
-        requests: 0,
-        success: 0,
-        errors: 0,
-        lastActivity: 0,
-        latencies: [],
-        recentErrors: [],
-      };
-      perAccount.set(record.accountId, account);
-    }
-    account.requests += 1;
-    if (record.success) account.success += 1;
-    else account.errors += 1;
-    account.lastActivity = record.timestamp;
-    account.latencies.push(record.latencyMs);
-    if (account.latencies.length > LATENCY_SAMPLES_PER_KEY) {
-      account.latencies.splice(0, account.latencies.length - LATENCY_SAMPLES_PER_KEY);
-    }
-    (account as unknown as { latencySum: number }).latencySum =
-      ((account as unknown as { latencySum: number }).latencySum ?? 0) +
-      record.latencyMs;
-    if (error && !account.recentErrors.includes(error)) {
-      account.recentErrors.unshift(error);
-      if (account.recentErrors.length > RECENT_ERRORS_PER_ACCOUNT) {
-        account.recentErrors.length = RECENT_ERRORS_PER_ACCOUNT;
-      }
+  const model = getOrCreateLifetime(perModel, modelKey);
+  touchLifetime(model, record.success, record.latencyMs, record.timestamp);
+
+  const account = getOrCreateLifetime(perAccount, accountKey);
+  if (!account.recentErrors) account.recentErrors = [];
+  touchLifetime(account, record.success, record.latencyMs, record.timestamp);
+  if (error && !account.recentErrors.includes(error)) {
+    account.recentErrors.unshift(error);
+    if (account.recentErrors.length > RECENT_ERRORS_PER_ACCOUNT) {
+      account.recentErrors.length = RECENT_ERRORS_PER_ACCOUNT;
     }
   }
 
-  let route = perRoute.get(record.route);
+  let modelsForAccount = perAccountModel.get(accountKey);
+  if (!modelsForAccount) {
+    modelsForAccount = new Map();
+    perAccountModel.set(accountKey, modelsForAccount);
+  }
+  const accountModel = getOrCreateLifetime(modelsForAccount, modelKey);
+  touchLifetime(accountModel, record.success, record.latencyMs, record.timestamp);
+
+  let route = perRoute.get(routeKey);
   if (!route) {
     route = { requests: 0, success: 0, errors: 0 };
-    perRoute.set(record.route, route);
+    perRoute.set(routeKey, route);
   }
   route.requests += 1;
   if (record.success) route.success += 1;
@@ -309,10 +310,32 @@ function errorRate(errors: number, total: number): number {
   return Math.round((errors / total) * 10000) / 100;
 }
 
-function getLatencySum(holder: unknown, samples: number[]): number {
-  const exact = (holder as { latencySum?: number }).latencySum;
-  if (typeof exact === "number") return exact;
-  return samples.reduce((a, b) => a + b, 0);
+interface RingAccountBucket {
+  requests: number;
+  success: number;
+  errors: number;
+  stream: number;
+  nonStream: number;
+  latencySum: number;
+  latencyCount: number;
+  latencies: number[];
+  recentErrors: string[];
+  lastActivity: number;
+}
+
+function emptyRingAccount(): RingAccountBucket {
+  return {
+    requests: 0,
+    success: 0,
+    errors: 0,
+    stream: 0,
+    nonStream: 0,
+    latencySum: 0,
+    latencyCount: 0,
+    latencies: [],
+    recentErrors: [],
+    lastActivity: 0,
+  };
 }
 
 export function getMonitorSummary(): {
@@ -332,8 +355,8 @@ export function getMonitorSummary(): {
   accounts: Array<
     AccountSummary & {
       byMode: {
-        streaming: { totalRequests: number } | null;
-        nonStreaming: { totalRequests: number } | null;
+        streaming: { totalRequests: number };
+        nonStreaming: { totalRequests: number };
       };
     }
   >;
@@ -346,61 +369,88 @@ export function getMonitorSummary(): {
   let streamCount = 0;
   let streamSuccess = 0;
   let streamSum = 0;
+  let streamLatencyCount = 0;
   let nonStreamCount = 0;
   let nonStreamSuccess = 0;
   let nonStreamSum = 0;
-  const byAccountMode = new Map<
-    string,
-    { stream: number; nonStream: number }
-  >();
+  let nonStreamLatencyCount = 0;
+  let latencySum = 0;
+  let latencyCount = 0;
+  const ringLatencies: number[] = [];
+  const ringErrors = new Map<string, number>();
+  const ringAccounts = new Map<string, RingAccountBucket>();
   for (const r of aiRing) {
     if (r.success) success += 1;
     else errors += 1;
+    const hasLatency = Number.isFinite(r.latencyMs);
+    if (hasLatency) {
+      latencySum += r.latencyMs;
+      latencyCount += 1;
+      ringLatencies.push(r.latencyMs);
+    }
     if (r.stream) {
       streamCount += 1;
       if (r.success) streamSuccess += 1;
-      streamSum += r.latencyMs;
+      if (hasLatency) {
+        streamSum += r.latencyMs;
+        streamLatencyCount += 1;
+      }
     } else {
       nonStreamCount += 1;
       if (r.success) nonStreamSuccess += 1;
-      nonStreamSum += r.latencyMs;
-    }
-    if (r.accountId) {
-      let m = byAccountMode.get(r.accountId);
-      if (!m) {
-        m = { stream: 0, nonStream: 0 };
-        byAccountMode.set(r.accountId, m);
+      if (hasLatency) {
+        nonStreamSum += r.latencyMs;
+        nonStreamLatencyCount += 1;
       }
-      if (r.stream) m.stream += 1;
-      else m.nonStream += 1;
+    }
+    const accountKey = normalizeDimension(r.accountId);
+    let bucket = ringAccounts.get(accountKey);
+    if (!bucket) {
+      bucket = emptyRingAccount();
+      ringAccounts.set(accountKey, bucket);
+    }
+    bucket.requests += 1;
+    if (r.success) bucket.success += 1;
+    else bucket.errors += 1;
+    if (r.stream) bucket.stream += 1;
+    else bucket.nonStream += 1;
+    if (hasLatency) {
+      bucket.latencySum += r.latencyMs;
+      bucket.latencyCount += 1;
+      bucket.latencies.push(r.latencyMs);
+    }
+    bucket.lastActivity = r.timestamp;
+    if (r.error && !bucket.recentErrors.includes(r.error)) {
+      bucket.recentErrors.unshift(r.error);
+      if (bucket.recentErrors.length > RECENT_ERRORS_PER_ACCOUNT) {
+        bucket.recentErrors.length = RECENT_ERRORS_PER_ACCOUNT;
+      }
+    }
+    if (r.error) {
+      ringErrors.set(r.error, (ringErrors.get(r.error) ?? 0) + 1);
     }
   }
   const total = aiRing.length;
 
-  const accounts = [...perAccount.entries()].map(([accountId, a]) => {
-    const sum = getLatencySum(a, a.latencies);
-    const modes = byAccountMode.get(accountId);
-    return {
-      accountId,
-      totalRequests: a.requests,
-      successCount: a.success,
-      errorCount: a.errors,
-      errorRate: errorRate(a.errors, a.requests),
-      avgLatencyMs: avgOf(a.requests, sum),
-      medianLatencyMs: medianOf(a.latencies),
-      p95LatencyMs: p95Of(a.latencies),
-      lastActivity: a.lastActivity,
-      recentErrors: [...a.recentErrors],
-      byMode: {
-        streaming: modes && modes.stream > 0 ? { totalRequests: modes.stream } : null,
-        nonStreaming:
-          modes && modes.nonStream > 0 ? { totalRequests: modes.nonStream } : null,
-      },
-    };
-  });
+  const accounts = [...ringAccounts.entries()].map(([accountId, a]) => ({
+    accountId,
+    totalRequests: a.requests,
+    successCount: a.success,
+    errorCount: a.errors,
+    errorRate: errorRate(a.errors, a.requests),
+    avgLatencyMs: avgOf(a.latencyCount, a.latencySum),
+    medianLatencyMs: medianOf(a.latencies),
+    p95LatencyMs: p95Of(a.latencies),
+    lastActivity: a.lastActivity,
+    recentErrors: [...a.recentErrors],
+    byMode: {
+      streaming: { totalRequests: a.stream },
+      nonStreaming: { totalRequests: a.nonStream },
+    },
+  }));
   accounts.sort((x, y) => y.lastActivity - x.lastActivity);
 
-  const topErrors = [...errorCounts.entries()]
+  const topErrors = [...ringErrors.entries()]
     .map(([message, count]) => ({ message, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, TOP_ERRORS_LIMIT);
@@ -411,27 +461,27 @@ export function getMonitorSummary(): {
       totalSuccess: success,
       totalErrors: errors,
       overallErrorRate: errorRate(errors, total),
-      overallAvgLatencyMs: avgOf(globalLatency.count, globalLatency.sum),
-      medianLatencyMs: medianOf(globalLatency.samples),
-      p95LatencyMs: p95Of(globalLatency.samples),
+      overallAvgLatencyMs: avgOf(latencyCount, latencySum),
+      medianLatencyMs: medianOf(ringLatencies),
+      p95LatencyMs: p95Of(ringLatencies),
     },
     modeComparison: {
       streaming:
-        streamCount > 0
+        total > 0
           ? {
               totalRequests: streamCount,
               successCount: streamSuccess,
               errorCount: streamCount - streamSuccess,
-              avgLatencyMs: avgOf(streamCount, streamSum),
+              avgLatencyMs: avgOf(streamLatencyCount, streamSum),
             }
           : null,
       nonStreaming:
-        nonStreamCount > 0
+        total > 0
           ? {
               totalRequests: nonStreamCount,
               successCount: nonStreamSuccess,
               errorCount: nonStreamCount - nonStreamSuccess,
-              avgLatencyMs: avgOf(nonStreamCount, nonStreamSum),
+              avgLatencyMs: avgOf(nonStreamLatencyCount, nonStreamSum),
             }
           : null,
     },
@@ -442,27 +492,44 @@ export function getMonitorSummary(): {
   };
 }
 
+export interface AccountModelCount {
+  model: string;
+  requests: number;
+  successCount: number;
+  errorCount: number;
+}
+
 export function getUsageSummary(): {
-  window: { since: number; label: string };
+  window: { since: number; label: string; kind: "process-lifetime" };
   totals: { totalRequests: number; successCount: number; errorCount: number };
-  accounts: AccountSummary[];
+  accounts: Array<AccountSummary & { perModel: AccountModelCount[] }>;
   models: ModelSummary[];
   routes: RouteSummary[];
 } {
-  const accounts: AccountSummary[] = [...perAccount.entries()].map(
-    ([accountId, a]) => ({
+  const accounts = [...perAccount.entries()].map(([accountId, a]) => {
+    const perModelRows: AccountModelCount[] = [
+      ...(perAccountModel.get(accountId)?.entries() ?? []),
+    ].map(([model, m]) => ({
+      model,
+      requests: m.requests,
+      successCount: m.success,
+      errorCount: m.errors,
+    }));
+    perModelRows.sort((x, y) => y.requests - x.requests);
+    return {
       accountId,
       totalRequests: a.requests,
       successCount: a.success,
       errorCount: a.errors,
       errorRate: errorRate(a.errors, a.requests),
-      avgLatencyMs: avgOf(a.requests, getLatencySum(a, a.latencies)),
+      avgLatencyMs: avgOf(a.latencyCount, a.latencySum),
       medianLatencyMs: medianOf(a.latencies),
       p95LatencyMs: p95Of(a.latencies),
       lastActivity: a.lastActivity,
-      recentErrors: [...a.recentErrors],
-    }),
-  );
+      recentErrors: [...(a.recentErrors ?? [])],
+      perModel: perModelRows,
+    };
+  });
   accounts.sort((x, y) => y.totalRequests - x.totalRequests);
 
   const models: ModelSummary[] = [...perModel.entries()].map(
@@ -471,7 +538,7 @@ export function getUsageSummary(): {
       totalRequests: m.requests,
       successCount: m.success,
       errorCount: m.errors,
-      avgLatencyMs: avgOf(m.requests, getLatencySum(m, m.latencies)),
+      avgLatencyMs: avgOf(m.latencyCount, m.latencySum),
       lastActivity: m.lastActivity,
     }),
   );
@@ -487,17 +554,23 @@ export function getUsageSummary(): {
   );
   routes.sort((x, y) => y.totalRequests - x.totalRequests);
 
+  let totalRequests = 0;
   let success = 0;
   let errors = 0;
-  for (const r of aiRing) {
-    if (r.success) success += 1;
-    else errors += 1;
+  for (const a of perAccount.values()) {
+    totalRequests += a.requests;
+    success += a.success;
+    errors += a.errors;
   }
 
   return {
-    window: { since: bootTime, label: "since process start (in-memory)" },
+    window: {
+      since: bootTime,
+      label: "since process start (in-memory)",
+      kind: "process-lifetime",
+    },
     totals: {
-      totalRequests: aiRing.length,
+      totalRequests,
       successCount: success,
       errorCount: errors,
     },
@@ -517,7 +590,10 @@ export function getRecentAIRequests(limit = 50): AIRequestRecord[] {
   return aiRing.slice(-n).reverse();
 }
 
-/** QwenGate-shaped model health, now backed by real per-model counters. */
+/**
+ * Lifetime per-model counters since process start (not the Monitor ring).
+ * Empty until the first logical AI request of this process.
+ */
 export function getModelHealth(): Record<
   string,
   { successCount: number; errorCount: number; lastActivity: number }
@@ -556,11 +632,9 @@ export function getStatsSnapshot(): {
 export function resetDashboardStatsForTesting(): void {
   networkRing.length = 0;
   aiRing.length = 0;
-  globalLatency.count = 0;
-  globalLatency.sum = 0;
-  globalLatency.samples.length = 0;
   perModel.clear();
   perAccount.clear();
+  perAccountModel.clear();
   perRoute.clear();
   errorCounts.clear();
 }
