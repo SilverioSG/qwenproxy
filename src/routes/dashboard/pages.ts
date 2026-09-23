@@ -59,6 +59,13 @@ const NAV_ITEMS: NavItem[] = [
 
 const LOGO = `<img src="/dashboard/static/logo.svg" width="60" height="60" alt="QwenProxy">`;
 
+/** Same key and class as shared.js. Runs before stylesheets so a persisted
+ * dark preference is on <html> before first paint (DeepSeekGate paints the
+ * class server-side; QwenProxy stores the preference only in localStorage). */
+const THEME_BOOTSTRAP = `<script>
+try{if(localStorage.getItem('qwenproxyDarkMode')==='true')document.documentElement.classList.add('dark-mode')}catch(e){}
+</script>`;
+
 export function sidebarHtml(activePageId: string): string {
   const navLinks = NAV_ITEMS.map(
     (item) =>
@@ -105,6 +112,7 @@ export const overviewHtml = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QwenProxy — Dashboard Overview</title>
+${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="/dashboard/static/shared.css">
   <link rel="stylesheet" href="/dashboard/static/overview.css">
 </head>
@@ -193,6 +201,7 @@ export const accountsHtml = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QwenProxy — Accounts</title>
+${THEME_BOOTSTRAP}
 <link rel="stylesheet" href="/dashboard/static/shared.css">
 <link rel="stylesheet" href="/dashboard/static/accounts.css">
 </head>
@@ -278,6 +287,7 @@ export const monitorHtml = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QwenProxy — Monitor</title>
+${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="/dashboard/static/shared.css">
   <link rel="stylesheet" href="/dashboard/static/overview.css">
   <link rel="stylesheet" href="/dashboard/static/monitor.css">
@@ -390,6 +400,7 @@ export const settingsHtml = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QwenProxy — Settings</title>
+${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="/dashboard/static/shared.css">
   <link rel="stylesheet" href="/dashboard/static/settings.css">
 </head>
@@ -424,6 +435,7 @@ export const usageHtml = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QwenProxy — Usage</title>
+${THEME_BOOTSTRAP}
 <link rel="stylesheet" href="/dashboard/static/shared.css">
 <link rel="stylesheet" href="/dashboard/static/overview.css">
 <link rel="stylesheet" href="/dashboard/static/usage.css">
@@ -507,6 +519,7 @@ export const networkHtml = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QwenProxy — Network</title>
+${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="/dashboard/static/shared.css">
   <link rel="stylesheet" href="/dashboard/static/network.css">
 </head>

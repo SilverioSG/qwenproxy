@@ -39,6 +39,29 @@ test("dashboard pages serve 200 HTML", async () => {
   }
 });
 
+test("theme bootstrap runs in head before stylesheets", async () => {
+  const pages = [
+    "/dashboard",
+    "/dashboard/accounts",
+    "/dashboard/usage",
+    "/dashboard/network",
+    "/dashboard/monitor",
+    "/dashboard/settings",
+  ];
+  for (const path of pages) {
+    const body = await (await get(path, false)).text();
+    const head = body.slice(body.indexOf("<head>"), body.indexOf("</head>"));
+    const boot = head.indexOf("qwenproxyDarkMode");
+    const css = head.indexOf('rel="stylesheet"');
+    assert.ok(boot >= 0, `${path} bootstrap in head`);
+    assert.ok(css > boot, `${path} bootstrap before stylesheet`);
+    assert.match(head, /classList\.add\('dark-mode'\)/);
+    assert.match(head, /===\s*'true'/);
+    assert.doesNotMatch(head, /===\s*'false'/);
+    assert.equal(body.indexOf("qwenproxyDarkMode"), boot + body.indexOf("<head>"));
+  }
+});
+
 test("root redirects to dashboard", async () => {
   const res = await get("/", false);
   assert.equal(res.status, 302);
