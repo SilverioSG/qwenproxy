@@ -178,6 +178,7 @@ test("/metrics/uptime shape", async () => {
   assert.equal(res.status, 200);
   const body = (await res.json()) as Record<string, unknown>;
   assert.equal(typeof body.uptimeSeconds, "number");
+  assert.ok((body.uptimeSeconds as number) >= 0);
   assert.equal(typeof body.version, "string");
 });
 

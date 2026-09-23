@@ -25,8 +25,9 @@ function updateUptime() {
  */
 async function refreshHealth() {
   var data = await apiFetch('/health');
-  if (data && data.uptime != null) {
-    uptimeSeconds = data.uptime;
+  var uptimeData = await apiFetch('/metrics/uptime');
+  if (uptimeData && uptimeData.uptimeSeconds != null) {
+    uptimeSeconds = uptimeData.uptimeSeconds;
     uptimeBase = Date.now();
     updateUptime();
   }
