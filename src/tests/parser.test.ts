@@ -808,3 +808,137 @@ test("StreamingToolParser: parses <qpx_call> even after an unclosed stray backti
   const totalText = res1.text + res2.text + flushed.text;
   assert.ok(!totalText.includes("<qpx_call>"), "raw <qpx_call> must never leak in client text");
 });
+
+test("StreamingToolParser: heals truncated tool call when prior tool calls were already emitted", () => {
+  const SPAWN_TOOLS = [
+    {
+      name: "tool1",
+      description: "first tool",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+    } as any,
+    {
+      name: "spawn_agent",
+      description: "spawn an agent",
+      parameters: {
+        type: "object",
+        properties: { label: { type: "string" }, message: { type: "string" } },
+      },
+    } as any,
+  ];
+
+  const parser = new StreamingToolParser(SPAWN_TOOLS, { incrementalToolCalls: true });
+
+  // Step 1: Tool call 1 finishes cleanly
+  const chunk1 = '<qpx_call>\n{"name": "tool1", "arguments": {"path": "test.txt"}}\n</qpx_call>\n';
+  const res1 = parser.feed(chunk1);
+  assert.strictEqual(parser.getEmittedToolCallCount(), 1, "first tool call should be emitted");
+
+  // Step 2: Tool call 2 starts and gets cut off mid-string at end of stream (exact production failure)
+  const chunk2 = '<qpx_call>\n{"name": "spawn_agent", "arguments": {"label": "audit-vvrn", "message": "Você é um Senior Minecraft AntiCheat Engineer auditando um anticheat';
+  const res2 = parser.feed(chunk2);
+
+  // Step 3: Stream ends, flush is called
+  const flushed = parser.flush();
+
+  // Collect all toolCallDeltas emitted across all chunks for tool index 1
+  const allDeltas = [...res1.toolCallDeltas, ...res2.toolCallDeltas, ...flushed.toolCallDeltas];
+  const tool1Deltas = allDeltas.filter((d) => d.index === 1);
+
+  const accumulatedArgs = tool1Deltas.map((d) => d.function.arguments || "").join("");
+  assert.ok(accumulatedArgs.length > 0, "arguments must be streamed to client");
+
+  // Crucial invariant: The accumulated arguments must be VALID, parseable JSON on client side
+  let parsedClientArgs: any;
+  assert.doesNotThrow(() => {
+    parsedClientArgs = JSON.parse(accumulatedArgs);
+  }, "client must not encounter SyntaxError: Unexpected end of JSON input");
+  assert.strictEqual(parsedClientArgs.label, "audit-vvrn");
+  assert.ok(parsedClientArgs.message.startsWith("Você é um Senior"));
+  assert.ok(
+    parsedClientArgs.message.includes("TRUNCATED BY UPSTREAM MODEL OUTPUT LIMIT"),
+    "prompt must carry truncation warning so subagent knows it was cut off",
+  );
+  assert.strictEqual(parser.getEmittedToolCallCount(), 2, "both tool calls must be finalized");
+});
+
+test("StreamingToolParser: write_file truncation injects explicit code comment warning", () => {
+  const WRITE_TOOLS = [
+    {
+      name: "tool1",
+      description: "first tool",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+    } as any,
+    {
+      name: "write_file",
+      description: "write a file",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+      },
+    } as any,
+  ];
+
+  const parser = new StreamingToolParser(WRITE_TOOLS, { incrementalToolCalls: true });
+  parser.feed('<qpx_call>\n{"name": "tool1", "arguments": {"path": "test.txt"}}\n</qpx_call>\n');
+  parser.feed('<qpx_call>\n{"name": "write_file", "arguments": {"path": "src/main.rs", "content": "fn main() {\\n    let a = 10;');
+  const flushed = parser.flush();
+
+  const allDeltas = flushed.toolCallDeltas.filter((d) => d.index === 1);
+  const accumulatedArgs = allDeltas.map((d) => d.function.arguments || "").join("");
+  const parsed = JSON.parse(accumulatedArgs);
+  assert.ok(
+    parsed.content.includes("/* [TRUNCATED BY UPSTREAM MODEL OUTPUT LIMIT"),
+    "truncated file content must carry code comment warning so agent does not treat it as complete",
+  );
+});
+
+test("StreamingToolParser: bash truncation injects exit 1 guard to prevent dangerous execution", () => {
+  const BASH_TOOLS = [
+    {
+      name: "tool1",
+      description: "first tool",
+      parameters: { type: "object" },
+    } as any,
+    {
+      name: "bash",
+      description: "run bash",
+      parameters: { type: "object", properties: { command: { type: "string" } } },
+    } as any,
+  ];
+
+  const parser = new StreamingToolParser(BASH_TOOLS, { incrementalToolCalls: true });
+  parser.feed('<qpx_call>\n{"name": "tool1", "arguments": {}}\n</qpx_call>\n');
+  parser.feed('<qpx_call>\n{"name": "bash", "arguments": {"command": "find /var/log -type f');
+  const flushed = parser.flush();
+
+  const allDeltas = flushed.toolCallDeltas.filter((d) => d.index === 1);
+  const accumulatedArgs = allDeltas.map((d) => d.function.arguments || "").join("");
+  const parsed = JSON.parse(accumulatedArgs);
+  assert.ok(
+    parsed.command.includes("exit 1"),
+    "truncated bash command must append exit 1 so shell fails safely instead of running incomplete command",
+  );
+});
+
+test("StreamingToolParser: recovers edit_file with missing opening quote on property key (e.g. ,old_text:)", () => {
+  const EDIT_TOOLS = [
+    {
+      name: "edit_file",
+      description: "edit file",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, edits: { type: "array" } },
+      },
+    } as any,
+  ];
+  const parser = new StreamingToolParser(EDIT_TOOLS);
+  // Exact pattern from production logs:
+  const brokenInput =
+    '<qpx_call>\n{"name":"edit_file","arguments":{"edits":[{"new_text":"new",old_text":"old"}],"path":"file.java"}}\n</qpx_call>';
+  const res = parser.feed(brokenInput);
+  const flushed = parser.flush();
+  const calls = [...res.toolCalls, ...flushed.toolCalls];
+  assert.strictEqual(calls.length, 1, "tool call with missing quote on key must be repaired");
+  assert.strictEqual(calls[0].name, "edit_file");
+  assert.deepStrictEqual((calls[0].arguments as any).edits, [{ new_text: "new", old_text: "old" }]);
+});

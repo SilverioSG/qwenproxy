@@ -5,9 +5,15 @@
 import type { TuiView, ProxyStatusSnapshot } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
 import { theme, glyphs, drawBox, stringWidth, truncate, stripAnsi, pad, wrapContentLine } from "../theme.ts";
-import { streamChatCompletions, fetchLiveModels } from "../proxy-client.ts";
+import {
+  fetchLiveModels,
+  streamChatCompletions,
+  DEFAULT_FALLBACK_MODELS,
+} from "../proxy-client.ts";
 import { ServerManager } from "../server-manager.ts";
 import { formatMarkdown, formatReasoning } from "../markdown.ts";
+import { loadTuiSettings, saveTuiSettings } from "../settings.ts";
+import { setRuntimeChatMode, getRuntimeChatMode } from "../../core/config.ts";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -20,7 +26,11 @@ interface ChatMessage {
   cachedReasoningBox?: string[];
   cachedWidth?: number;
 }
-export function classifyModel(modelId: string): { badge: string; category: string } {
+export function classifyModel(modelId: string): {
+  badge: string;
+  category: string;
+  supportsReasoning: boolean;
+} {
   const lower = modelId.toLowerCase();
   if (
     lower.includes("image") ||
@@ -28,12 +38,35 @@ export function classifyModel(modelId: string): { badge: string; category: strin
     lower.includes("t2i") ||
     lower.includes("i2i")
   ) {
-    return { badge: theme.lavender("[Imagem]"), category: "Geração de Imagem" };
+    return {
+      badge: theme.lavender("[Imagem]"),
+      category: "Geração de Imagem",
+      supportsReasoning: false,
+    };
   }
   if (lower.includes("video") || lower.includes("t2v") || lower.includes("i2v")) {
-    return { badge: theme.peach("[Vídeo] "), category: "Geração de Vídeo" };
+    return {
+      badge: theme.peach("[Vídeo] "),
+      category: "Geração de Vídeo",
+      supportsReasoning: false,
+    };
   }
-  return { badge: theme.cyan("[Texto] "), category: "Texto & Raciocínio" };
+  if (
+    lower.includes("omni") ||
+    lower.includes("audio") ||
+    lower.includes("speech")
+  ) {
+    return {
+      badge: theme.green("[Omni]  "),
+      category: "Multimodal / Omni",
+      supportsReasoning: true,
+    };
+  }
+  return {
+    badge: theme.cyan("[Texto] "),
+    category: "Texto & Raciocínio",
+    supportsReasoning: true,
+  };
 }
 
 export class ChatView implements TuiView {
@@ -41,14 +74,7 @@ export class ChatView implements TuiView {
   public readonly title = "Chat";
   public readonly tabNumber = 2;
 
-  private availableModels = [
-    "qwen3.8-max",
-    "qwen3.7-plus",
-    "qwen3.7-max",
-    "z-image-turbo",
-    "qwen-image-3.0-pro",
-    "wan3.0-video",
-  ];
+  private availableModels = [...DEFAULT_FALLBACK_MODELS];
   private selectedModelIndex = 0;
   private messages: ChatMessage[] = [];
   private inputBuffer = "";
@@ -58,13 +84,15 @@ export class ChatView implements TuiView {
   private lastHeight = 24;
   private lastMaxOffset = 0;
   private lastVisibleCapacity = 0;
-  private hoveredHeaderBtn: "model" | "effort" | null = null;
+  private hoveredHeaderBtn: "model" | "effort" | "mode" | null = null;
   private isScrollbarHovered = false;
   private isDraggingScrollbar = false;
   private modelBtnStartCol = 0;
   private modelBtnEndCol = 0;
   private effortBtnStartCol = 0;
   private effortBtnEndCol = 0;
+  private modeBtnStartCol = 0;
+  private modeBtnEndCol = 0;
   private isModelModalOpen = false;
   private modalSelectedIndex = 0;
   private availableEfforts: Array<{
@@ -95,6 +123,40 @@ export class ChatView implements TuiView {
   private selectedEffort: "high" | "medium" | "low" = "high";
   private isEffortModalOpen = false;
   private effortSelectedIndex = 0;
+  private availableModes: Array<{
+    id: "thread" | "thread-temp" | "stateless" | "stateless-temp";
+    label: string;
+    desc: string;
+    badge: string;
+  }> = [
+    {
+      id: "thread",
+      label: "thread (Padrão)",
+      desc: "Persistente Web (Delta ~1KB, salva na conta Qwen)",
+      badge: theme.cyan("[thread]"),
+    },
+    {
+      id: "thread-temp",
+      label: "thread-temp",
+      desc: "Efêmero Rápido (Delta ~1KB, não salva no site)",
+      badge: theme.green("[thread-temp]"),
+    },
+    {
+      id: "stateless-temp",
+      label: "stateless-temp",
+      desc: "Oficial OpenAI Efêmero (Histórico total, não salva)",
+      badge: theme.yellow("[stateless-temp]"),
+    },
+    {
+      id: "stateless",
+      label: "stateless",
+      desc: "Oficial OpenAI Salvo (Histórico total, salva no site)",
+      badge: theme.lavender("[stateless]"),
+    },
+  ];
+  private selectedChatMode: "thread" | "thread-temp" | "stateless" | "stateless-temp" = "thread";
+  private isModeModalOpen = false;
+  private modeSelectedIndex = 0;
   private isGenerating = false;
   private currentAbortController: AbortController | null = null;
   private statusNote = "";
@@ -122,14 +184,41 @@ export class ChatView implements TuiView {
 
   constructor(onNeedsRender?: () => void) {
     this.onNeedsRender = onNeedsRender;
+    const saved = loadTuiSettings();
+    if (saved.chat?.model) {
+      const idx = this.availableModels.indexOf(saved.chat.model);
+      if (idx !== -1) {
+        this.selectedModelIndex = idx;
+      }
+    }
+    const savedEffort = saved.chat?.effort;
+    if (savedEffort && ["high", "medium", "low"].includes(savedEffort)) {
+      this.selectedEffort = savedEffort;
+      const effIdx = this.availableEfforts.findIndex((e) => e.id === savedEffort);
+      if (effIdx !== -1) {
+        this.effortSelectedIndex = effIdx;
+      }
+    }
+    const runtimeMode = getRuntimeChatMode();
+    this.selectedChatMode = runtimeMode;
+    const mIdx = this.availableModes.findIndex((m) => m.id === runtimeMode);
+    if (mIdx !== -1) {
+      this.modeSelectedIndex = mIdx;
+    }
     void this.refreshModels();
   }
   public onActivate(): void {
+    const runtimeMode = getRuntimeChatMode();
+    this.selectedChatMode = runtimeMode;
+    const mIdx = this.availableModes.findIndex((m) => m.id === runtimeMode);
+    if (mIdx !== -1) {
+      this.modeSelectedIndex = mIdx;
+    }
     void this.refreshModels();
   }
 
   public isModalOpen(): boolean {
-    return this.isModelModalOpen || this.isEffortModalOpen;
+    return this.isModelModalOpen || this.isEffortModalOpen || this.isModeModalOpen;
   }
 
   public async refreshModels(): Promise<void> {
@@ -138,7 +227,13 @@ export class ChatView implements TuiView {
       if (live.length > 0) {
         const current = this.availableModels[this.selectedModelIndex];
         this.availableModels = live;
-        const foundIdx = this.availableModels.indexOf(current);
+        let foundIdx = this.availableModels.indexOf(current);
+        if (foundIdx === -1) {
+          const saved = loadTuiSettings();
+          if (saved.chat?.model) {
+            foundIdx = this.availableModels.indexOf(saved.chat.model);
+          }
+        }
         this.selectedModelIndex = foundIdx !== -1 ? foundIdx : 0;
         this.onNeedsRender?.();
       }
@@ -157,6 +252,12 @@ export class ChatView implements TuiView {
         { key: "Esc", label: `${glyphs.cross} Manter` },
       ];
     }
+    if (this.isModeModalOpen) {
+      return [
+        { key: "Enter", label: `${glyphs.enter} Confirmar` },
+        { key: "Esc", label: `${glyphs.cross} Manter` },
+      ];
+    }
     return [
       { key: "Enter", label: `${glyphs.enter} Enviar` },
       { key: "Esc", label: `${glyphs.cross} Parar` },
@@ -169,9 +270,15 @@ export class ChatView implements TuiView {
     if (!chosen) return;
     this.selectedModelIndex = idx;
     this.isModelModalOpen = false;
-
+    saveTuiSettings({
+      chat: {
+        model: chosen,
+        effort: this.selectedEffort,
+        mode: this.selectedChatMode,
+      },
+    });
     const info = classifyModel(chosen);
-    if (info.category === "Texto & Raciocínio") {
+    if (info.supportsReasoning) {
       this.isEffortModalOpen = true;
       const effIdx = this.availableEfforts.findIndex((e) => e.id === this.selectedEffort);
       this.effortSelectedIndex = effIdx !== -1 ? effIdx : 0;
@@ -234,8 +341,9 @@ export class ChatView implements TuiView {
     if (this.isEffortModalOpen) {
       if (key.name === "hover" && key.mouse) {
         const { row } = key.mouse;
-        if (row >= 9 && row < 9 + this.availableEfforts.length) {
-          const hoverIdx = row - 9;
+        const startRow = 12;
+        if (row >= startRow && row < startRow + this.availableEfforts.length) {
+          const hoverIdx = row - startRow;
           if (this.effortSelectedIndex !== hoverIdx) {
             this.effortSelectedIndex = hoverIdx;
             this.onNeedsRender?.();
@@ -245,11 +353,19 @@ export class ChatView implements TuiView {
       }
       if (key.name === "click" && key.mouse) {
         const { row } = key.mouse;
-        if (row >= 9 && row < 9 + this.availableEfforts.length) {
-          this.selectedEffort = this.availableEfforts[row - 9].id;
+        const startRow = 12;
+        if (row >= startRow && row < startRow + this.availableEfforts.length) {
+          const chosenIdx = row - startRow;
+          this.selectedEffort = this.availableEfforts[chosenIdx].id;
           this.isEffortModalOpen = false;
           const currentM = this.availableModels[this.selectedModelIndex];
-          this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[row - 9].label}`;
+          saveTuiSettings({
+            chat: {
+              model: currentM,
+              effort: this.selectedEffort,
+            },
+          });
+          this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[chosenIdx].label}`;
           this.onNeedsRender?.();
           return true;
         }
@@ -274,6 +390,13 @@ export class ChatView implements TuiView {
         this.selectedEffort = this.availableEfforts[this.effortSelectedIndex].id;
         this.isEffortModalOpen = false;
         const currentM = this.availableModels[this.selectedModelIndex];
+        saveTuiSettings({
+          chat: {
+            model: currentM,
+            effort: this.selectedEffort,
+            mode: this.selectedChatMode,
+          },
+        });
         this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[this.effortSelectedIndex].label}`;
         this.onNeedsRender?.();
         return true;
@@ -286,15 +409,90 @@ export class ChatView implements TuiView {
       return true;
     }
 
-    // 3. Header button hover (rows 4 to 6: Model, Effort)
+    // 3. Chat Mode Selection Modal Active
+    if (this.isModeModalOpen) {
+      if (key.name === "hover" && key.mouse) {
+        const { row } = key.mouse;
+        const startRow = 12;
+        if (row >= startRow && row < startRow + this.availableModes.length) {
+          const hoverIdx = row - startRow;
+          if (this.modeSelectedIndex !== hoverIdx) {
+            this.modeSelectedIndex = hoverIdx;
+            this.onNeedsRender?.();
+            return true;
+          }
+        }
+      }
+      if (key.name === "click" && key.mouse) {
+        const { row } = key.mouse;
+        const startRow = 12;
+        if (row >= startRow && row < startRow + this.availableModes.length) {
+          const chosenIdx = row - startRow;
+          this.selectedChatMode = this.availableModes[chosenIdx].id;
+          this.isModeModalOpen = false;
+          setRuntimeChatMode(this.selectedChatMode);
+          saveTuiSettings({
+            chat: {
+              model: this.availableModels[this.selectedModelIndex],
+              effort: this.selectedEffort,
+              mode: this.selectedChatMode,
+            },
+          });
+          this.statusNote = theme.green(`✓ Modo global da API alterado para: ${this.selectedChatMode}`);
+          this.onNeedsRender?.();
+          return true;
+        }
+        this.isModeModalOpen = false;
+        this.onNeedsRender?.();
+        return true;
+      }
+      if (key.name === "up" || key.name === "wheelup" || (key.name === "k" && !key.ctrl)) {
+        this.modeSelectedIndex = Math.max(0, this.modeSelectedIndex - 1);
+        this.onNeedsRender?.();
+        return true;
+      }
+      if (key.name === "down" || key.name === "wheeldown" || (key.name === "j" && !key.ctrl)) {
+        this.modeSelectedIndex = Math.min(
+          this.availableModes.length - 1,
+          this.modeSelectedIndex + 1,
+        );
+        this.onNeedsRender?.();
+        return true;
+      }
+      if (key.name === "return") {
+        this.selectedChatMode = this.availableModes[this.modeSelectedIndex].id;
+        this.isModeModalOpen = false;
+        setRuntimeChatMode(this.selectedChatMode);
+        saveTuiSettings({
+          chat: {
+            model: this.availableModels[this.selectedModelIndex],
+            effort: this.selectedEffort,
+            mode: this.selectedChatMode,
+          },
+        });
+        this.statusNote = theme.green(`✓ Modo global da API alterado para: ${this.selectedChatMode}`);
+        this.onNeedsRender?.();
+        return true;
+      }
+      if (key.name === "escape") {
+        this.isModeModalOpen = false;
+        this.onNeedsRender?.();
+        return true;
+      }
+      return true;
+    }
+
+    // 4. Header button hover (rows 4 to 6: Model, Effort, Mode)
     if (key.name === "hover" && key.mouse) {
       const { row, col } = key.mouse;
-      if (row >= 4 && row <= 6 && !this.isModelModalOpen && !this.isEffortModalOpen) {
-        let target: "model" | "effort" | null = null;
+      if (row >= 4 && row <= 6 && !this.isModelModalOpen && !this.isEffortModalOpen && !this.isModeModalOpen) {
+        let target: "model" | "effort" | "mode" | null = null;
         if (this.modelBtnStartCol > 0 && col >= this.modelBtnStartCol - 1 && col <= this.modelBtnEndCol + 1) {
           target = "model";
         } else if (this.effortBtnStartCol > 0 && col >= this.effortBtnStartCol - 1 && col <= this.effortBtnEndCol + 1) {
           target = "effort";
+        } else if (this.modeBtnStartCol > 0 && col >= this.modeBtnStartCol - 1 && col <= this.modeBtnEndCol + 1) {
+          target = "mode";
         }
         if (this.hoveredHeaderBtn !== target) {
           this.hoveredHeaderBtn = target;
@@ -308,17 +506,19 @@ export class ChatView implements TuiView {
       }
     }
 
-    // 4. Header button click (rows 4 to 6: Model, Effort)
+    // 5. Header button click (rows 4 to 6: Model, Effort, Mode)
     if (
       key.name === "click" &&
       key.mouse &&
       key.mouse.row >= 4 &&
       key.mouse.row <= 6 &&
       !this.isModelModalOpen &&
-      !this.isEffortModalOpen
+      !this.isEffortModalOpen &&
+      !this.isModeModalOpen
     ) {
       const col = key.mouse.col;
       if (this.modelBtnStartCol > 0 && col >= this.modelBtnStartCol - 1 && col <= this.modelBtnEndCol + 1) {
+        void this.refreshModels();
         this.isModelModalOpen = true;
         this.modalSelectedIndex = this.selectedModelIndex;
         this.hoveredHeaderBtn = null;
@@ -329,6 +529,14 @@ export class ChatView implements TuiView {
         this.isEffortModalOpen = true;
         const idx = this.availableEfforts.findIndex((e) => e.id === this.selectedEffort);
         this.effortSelectedIndex = idx !== -1 ? idx : 0;
+        this.hoveredHeaderBtn = null;
+        this.onNeedsRender?.();
+        return true;
+      }
+      if (this.modeBtnStartCol > 0 && col >= this.modeBtnStartCol - 1 && col <= this.modeBtnEndCol + 1) {
+        this.isModeModalOpen = true;
+        const idx = this.availableModes.findIndex((m) => m.id === this.selectedChatMode);
+        this.modeSelectedIndex = idx !== -1 ? idx : 0;
         this.hoveredHeaderBtn = null;
         this.onNeedsRender?.();
         return true;
@@ -351,13 +559,21 @@ export class ChatView implements TuiView {
     if (key.name === "f3") {
       const currentM = this.availableModels[this.selectedModelIndex] || "qwen3.8-max";
       const info = classifyModel(currentM);
-      if (info.category === "Texto & Raciocínio") {
+      if (info.supportsReasoning) {
         this.isEffortModalOpen = true;
         const idx = this.availableEfforts.findIndex((e) => e.id === this.selectedEffort);
         this.effortSelectedIndex = idx !== -1 ? idx : 0;
         this.onNeedsRender?.();
         return true;
       }
+    }
+
+    if (key.name === "f4") {
+      this.isModeModalOpen = true;
+      const idx = this.availableModes.findIndex((m) => m.id === this.selectedChatMode);
+      this.modeSelectedIndex = idx !== -1 ? idx : 0;
+      this.onNeedsRender?.();
+      return true;
     }
 
     // 5. Scrollbar hover, click & drag
@@ -623,10 +839,11 @@ export class ChatView implements TuiView {
       .map((m) => ({ role: m.role, content: m.content }));
 
     try {
-      const isReasoning = classifyModel(model).category === "Texto & Raciocínio";
+      const isReasoning = classifyModel(model).supportsReasoning;
       const result = await streamChatCompletions({
         model,
         reasoning_effort: isReasoning ? this.selectedEffort : undefined,
+        chatMode: this.selectedChatMode,
         messages: conversationPayload,
         signal: this.currentAbortController.signal,
         onReasoning: (chunk) => {
@@ -699,7 +916,7 @@ export class ChatView implements TuiView {
     const currentModel = this.availableModels[this.selectedModelIndex] || "qwen3.8-max";
     const currentInfo = classifyModel(currentModel);
     const totalModels = this.availableModels.length;
-    const isReasoning = currentInfo.category === "Texto & Raciocínio";
+    const isReasoning = currentInfo.supportsReasoning;
 
     const modelLabel = `[ ${currentModel} ]`;
     const styledModel = this.hoveredHeaderBtn === "model"
@@ -708,10 +925,10 @@ export class ChatView implements TuiView {
 
     const effortLabel = isReasoning
       ? this.selectedEffort === "high"
-        ? "[ Effort: High (Thinking) ]"
+        ? "[ Effort: High ]"
         : this.selectedEffort === "medium"
-          ? "[ Effort: Medium (Auto) ]"
-          : "[ Effort: Low (Fast) ]"
+          ? "[ Effort: Med ]"
+          : "[ Effort: Low ]"
       : "";
 
     let styledEffort = "";
@@ -725,7 +942,18 @@ export class ChatView implements TuiView {
             : theme.cyan(effortLabel);
     }
 
-    const shortcutsLabel = `[ F2: Modelo${isReasoning ? " | F3: Effort" : ""} (${this.selectedModelIndex + 1}/${totalModels}) ]`;
+    const modeLabel = `[ Modo: ${this.selectedChatMode} ]`;
+    const styledMode = this.hoveredHeaderBtn === "mode"
+      ? theme.bgHover(` ${theme.bold(theme.white(modeLabel))} `)
+      : this.selectedChatMode === "thread"
+        ? theme.cyan(modeLabel)
+        : this.selectedChatMode === "thread-temp"
+          ? theme.green(modeLabel)
+          : this.selectedChatMode === "stateless-temp"
+            ? theme.yellow(modeLabel)
+            : theme.lavender(modeLabel);
+
+    const shortcutsLabel = `[ F2: Modelo${isReasoning ? " | F3: Effort" : ""} | F4: Modo ]`;
     const styledShortcuts = theme.yellow(shortcutsLabel);
 
     // Non-text models show their category badge ([Imagem] / [Vídeo]), while text models omit [Texto]
@@ -733,7 +961,7 @@ export class ChatView implements TuiView {
     const nonTextCategory = !isReasoning ? theme.muted(`• ${currentInfo.category}`) : "";
 
     const headerLine = hasAccounts
-      ? `  ${theme.bold("Modelo:")} ${styledModel}  ${nonTextBadge}${isReasoning ? styledEffort : nonTextCategory}   ${styledShortcuts}`
+      ? `  ${theme.bold("Modelo:")} ${styledModel}  ${nonTextBadge}${isReasoning ? styledEffort + "  " : nonTextCategory + "  "}${styledMode}   ${styledShortcuts}`
       : `  ${theme.bold("Modelo:")} ${styledModel}   ${theme.yellow("[ [!] Sem Contas: Adicione em [5] Contas ]")}`;
 
     // Compute dynamic interactive column bounds:
@@ -742,16 +970,25 @@ export class ChatView implements TuiView {
     this.modelBtnStartCol = modelStart;
     this.modelBtnEndCol = modelEnd;
 
+    let nextStart = modelEnd + 3;
     if (isReasoning) {
-      const effortStart = modelEnd + 3; // 2 spaces
+      const effortStart = nextStart;
       const effortEnd = effortStart + stringWidth(effortLabel) - 1;
       this.effortBtnStartCol = effortStart;
       this.effortBtnEndCol = effortEnd;
+      nextStart = effortEnd + 3;
     } else {
       this.effortBtnStartCol = 0;
       this.effortBtnEndCol = 0;
+      if (nonTextCategory) {
+        nextStart = modelEnd + stringWidth(`  ${nonTextBadge}${nonTextCategory}  `);
+      }
     }
 
+    const modeStart = nextStart;
+    const modeEnd = modeStart + stringWidth(modeLabel) - 1;
+    this.modeBtnStartCol = modeStart;
+    this.modeBtnEndCol = modeEnd;
     const headerBox = drawBox({
       title: "Chat Tester",
       width,
@@ -814,6 +1051,33 @@ export class ChatView implements TuiView {
         content: modalLines,
       });
       totalLines.push(...modalBox);
+    } else if (this.isModeModalOpen) {
+      const modalLines: string[] = [
+        "",
+        `  ${theme.bold("Modo de Conversa:")} ${theme.cyan(this.selectedChatMode)}`,
+        `  ${theme.dim("Escolha como o histórico é transmitido e persistido no Qwen:")}`,
+        "",
+      ];
+      for (let i = 0; i < this.availableModes.length; i++) {
+        const m = this.availableModes[i];
+        const isSel = i === this.modeSelectedIndex;
+        const isCurrent = m.id === this.selectedChatMode;
+        const pointer = isSel ? theme.cyan("▸ ") : "  ";
+        const radio = isCurrent ? theme.green(glyphs.radioOn) : theme.muted(glyphs.radioOff);
+        const line = `${pointer}${radio} ${pad(m.badge, 17)} ${pad(m.label, 17)} • ${m.desc}`;
+        modalLines.push(isSel ? theme.bgSelected(line) : line);
+      }
+      modalLines.push("");
+
+      const modalBox = drawBox({
+        title: "Selecionar Modo de Conversa [ Enter: Confirmar  •  Esc: Manter ]",
+        width,
+        height: chatHeight,
+        borderColor: theme.borderActive,
+        titleColor: theme.cyan,
+        content: modalLines,
+      });
+      totalLines.push(...modalBox);
     } else {
       const chatContent: string[] = [];
 
@@ -831,48 +1095,42 @@ export class ChatView implements TuiView {
         }
       }
       for (const msg of this.messages) {
-        chatContent.push("");
         if (msg.role === "user") {
-          const userLines = msg.content.split(/\r?\n/);
-          for (let u = 0; u < userLines.length; u++) {
-            if (u === 0) {
-              chatContent.push(`  ${theme.blue(glyphs.pointer + " Você:")} ${theme.white(userLines[u])}`);
-            } else {
-              chatContent.push(`    ${theme.white(userLines[u])}`);
-            }
+          chatContent.push("");
+          const cardW = Math.max(20, innerChatW - 4);
+          const userLines = wrapContentLine(msg.content, cardW - 4);
+
+          // Top padding inside user card (gives height and breathability)
+          chatContent.push(`  ${theme.cyan("▌")}${theme.bgUserCard(" ".repeat(cardW))}`);
+
+          // Content lines with distinct lighter background
+          for (const u of userLines) {
+            chatContent.push(
+              `  ${theme.cyan("▌")}${theme.bgUserCard("   " + pad(theme.bold(theme.white(u)), cardW - 3))}`,
+            );
           }
+
+          // Bottom padding inside user card
+          chatContent.push(`  ${theme.cyan("▌")}${theme.bgUserCard(" ".repeat(cardW))}`);
+          chatContent.push("");
         } else {
           const messageModel = msg.model || currentModel;
-          chatContent.push(`  ${theme.green(glyphs.bullet + " Qwen (" + messageModel + "):")}`);
-          // 1. Dedicated Thinking (Reasoning) Container - Opaque, Dimmed, and Cached
-          if (msg.reasoning && msg.reasoning.trim().length > 0) {
-            const thinkWidth = Math.max(20, innerChatW - 4);
-            let thinkLines: string[];
 
-            if (msg.cachedWidth === innerChatW && msg.cachedReasoningBox) {
-              thinkLines = msg.cachedReasoningBox;
+          // 1. OpenCode-style Thinking (Reasoning): Clean, indented, dimmed and unboxed
+          if (msg.reasoning && msg.reasoning.trim().length > 0) {
+            chatContent.push("");
+            const isStillThinking = this.isGenerating && !msg.content && this.messages.indexOf(msg) === this.messages.length - 1;
+            const spinner = this.spinnerFrames[this.spinnerIndex] || "⠋";
+
+            if (isStillThinking) {
+              chatContent.push(`    ${theme.yellow(`🧠 ${spinner} Raciocinando...`)}`);
             } else {
-              const rLines = formatReasoning(msg.reasoning, thinkWidth - 4).map((l) => ` ${l}`);
-              if (this.isGenerating && !msg.content && this.messages.indexOf(msg) === this.messages.length - 1) {
-                const spinner = this.spinnerFrames[this.spinnerIndex] || "⠋";
-                rLines.push("");
-                rLines.push(` ${theme.yellow(`${spinner} Raciocinando...`)}`);
-              }
-              thinkLines = drawBox({
-                title: "🧠 Raciocínio",
-                width: thinkWidth,
-                borderColor: theme.borderInactive,
-                titleColor: theme.muted,
-                content: rLines,
-              });
-              if (!this.isGenerating) {
-                msg.cachedReasoningBox = thinkLines;
-                msg.cachedWidth = innerChatW;
-              }
+              chatContent.push(`    ${theme.yellow("🧠 Raciocínio:")}`);
             }
 
-            for (const line of thinkLines) {
-              chatContent.push(`  ${line}`);
+            const rLines = formatReasoning(msg.reasoning, innerChatW - 8);
+            for (const r of rLines) {
+              chatContent.push(`      ${r}`);
             }
             chatContent.push("");
           }
@@ -897,11 +1155,18 @@ export class ChatView implements TuiView {
             chatContent.push(`    ${theme.yellow(`${spinner} Pensando...`)}`);
           }
 
-          if (msg.totalTimeMs) {
+          // 3. OpenCode-style execution badge with model and timing metadata
+          const isDoneGenerating = !this.isGenerating || this.messages.indexOf(msg) !== this.messages.length - 1;
+          if (isDoneGenerating && (msg.content || msg.reasoning)) {
+            const timingStr = msg.totalTimeMs
+              ? ` ${theme.dim("·")} ${theme.dim(`${(msg.totalTimeMs / 1000).toFixed(2)}s`)}${msg.ttfbMs ? ` ${theme.dim(`(TTFB ${msg.ttfbMs}ms)`)}` : ""}`
+              : "";
+            chatContent.push("");
             chatContent.push(
-              `    ${theme.dim(`[TTFB: ${msg.ttfbMs}ms | Total: ${(msg.totalTimeMs / 1000).toFixed(2)}s]`)}`,
+              `    ${theme.cyan("▣")} ${theme.bold("Qwen")} ${theme.dim("·")} ${theme.cyan(messageModel)}${timingStr}`,
             );
           }
+          chatContent.push("");
         }
       }
 
@@ -1003,13 +1268,18 @@ export class ChatView implements TuiView {
       ? `${spinner} Gerando... (Esc para cancelar)`
       : actionLabel;
 
+    const defaultFooter = `${currentModel} · ${isReasoning ? `Effort: ${this.selectedEffort}` : currentInfo.category} · Modo: ${this.selectedChatMode}`;
+    const inputFooter = this.statusNote
+      ? stripAnsi(this.statusNote)
+      : defaultFooter;
+
     const inputBox = drawBox({
       title: inputTitle,
       width,
       height: 3,
       borderColor: this.isGenerating ? theme.yellow : theme.borderActive,
       titleColor: this.isGenerating ? theme.yellow : theme.cyan,
-      footer: this.statusNote ? stripAnsi(this.statusNote) : undefined,
+      footer: inputFooter,
       content: inputContent,
     });
     totalLines.push(...inputBox);

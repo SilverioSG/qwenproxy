@@ -37,4 +37,5 @@ Thumbs.db
 
 # IDE / Editor
 AGENTS.md
+.serena/
 message*.txt

@@ -3,7 +3,8 @@ import net from "node:net";
 import { v4 as uuidv4 } from "uuid";
 import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
-import { config } from "../core/config.js";
+import { config, getRuntimeChatMode, setRuntimeChatMode } from "../core/config.js";
+import { saveTuiSettings } from "../tui/settings.ts";
 import { metrics } from "../core/metrics.js";
 import { logger, maskEmail, recordDashboardSystemLog } from "../core/logger.js";
 import { MemoryCache } from "../cache/memory-cache.js";
@@ -23,7 +24,19 @@ import { recordNetworkEvent } from "../core/dashboard-stats.ts";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
+import {
+  assertBindAllowed,
+  ensureRuntimeApiKey,
+  getRuntimeApiKey,
+  isLoopbackHost,
+  isPlaceholderApiKey,
+} from "../core/local-auth.ts";
 
+import {
+  hookServerConsoleForLogging,
+  getServerLogHistory,
+  subscribeServerLogStream,
+} from "../core/server-log-buffer.ts";
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
 let watchdog: Watchdog | undefined;
@@ -143,36 +156,58 @@ export function setCacheForTesting(nextCache: MemoryCache | undefined): void {
 
 // Middleware must be registered BEFORE routes
 
-// CORS: browser-based clients (OpenWebUI, web frontends on another origin)
-// preflight before the Authorization header is sent, so OPTIONS short-circuits
-// BEFORE the /v1/* auth middleware. Default is permissive (doc checklist item
-// 2); set CORS_ORIGIN to lock it down.
-const corsOrigin = process.env.CORS_ORIGIN || "*";
+// Explicit CORS configuration wins. Without it, browser clients running on a
+// loopback origin are allowed while arbitrary pages cannot drive the local API.
+function getCorsOrigin(requestOrigin?: string): string {
+  const configured = (process.env.CORS_ORIGIN || "").trim();
+  if (configured) return configured;
+  if (!requestOrigin) return "";
+
+  try {
+    const origin = new URL(requestOrigin);
+    if (
+      (origin.protocol === "http:" || origin.protocol === "https:") &&
+      isLoopbackHost(origin.hostname)
+    ) {
+      return requestOrigin;
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
 app.use("*", async (c, next) => {
-  c.header("Access-Control-Allow-Origin", corsOrigin);
-  c.header(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  );
-  c.header(
-    "Access-Control-Allow-Headers",
-    "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id",
-  );
-  c.header(
-    "Access-Control-Expose-Headers",
-    "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
-  );
+  const corsOrigin = getCorsOrigin(c.req.header("Origin"));
+  if (corsOrigin) {
+    c.header("Access-Control-Allow-Origin", corsOrigin);
+    c.header("Vary", "Origin");
+    c.header(
+      "Access-Control-Allow-Methods",
+      "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    );
+    c.header(
+      "Access-Control-Allow-Headers",
+      "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id, X-QwenProxy-Chat-Mode",
+    );
+    c.header(
+      "Access-Control-Expose-Headers",
+      "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
+    );
+  }
   if (c.req.method === "OPTIONS") {
-    // Hono does not merge c.header() values into a manually constructed
-    // Response, so the preflight carries its CORS headers explicitly.
+    if (!corsOrigin) {
+      return new Response(null, { status: 204 });
+    }
     return new Response(null, {
       status: 204,
       headers: {
         "Access-Control-Allow-Origin": corsOrigin,
+        Vary: "Origin",
         "Access-Control-Allow-Methods":
           "GET, POST, PUT, PATCH, DELETE, OPTIONS",
         "Access-Control-Allow-Headers":
-          "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id",
+          "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id, X-QwenProxy-Chat-Mode",
         "Access-Control-Expose-Headers":
           "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
       },
@@ -201,12 +236,23 @@ app.use("*", async (c, next) => {
     String(Math.max(0, ratelimit.tokens - 1)),
   );
   c.header("x-ratelimit-reset-tokens", "0");
+  const isProbe =
+    c.req.path === "/health" ||
+    c.req.path === "/metrics" ||
+    c.req.path === "/logs" ||
+    c.req.path.startsWith("/logs") ||
+    c.req.path.startsWith("/diagnostics") ||
+    c.req.path === "/favicon.ico";
 
-  metrics.increment("requests.total");
+  if (!isProbe) {
+    metrics.increment("requests.total");
+  }
   const start = Date.now();
   await next();
   const duration = Date.now() - start;
-  metrics.histogram("latency.request", duration);
+  if (!isProbe) {
+    metrics.histogram("latency.request", duration);
+  }
   c.header("X-Response-Time", `${duration}ms`);
   c.header("openai-processing-ms", String(duration));
   // Dashboard V2 passive hook: record every HTTP request in the bounded
@@ -276,7 +322,10 @@ function extractProvidedApiKeys(c: Context): string[] {
 }
 
 export function verifyApiKey(c: Context): Response | null {
-  const apiKey = process.env.API_KEY || config.apiKey;
+  const apiKey = (process.env.API_KEY || config.apiKey || "").trim();
+  if (isLoopbackHost(config.server.host) && isPlaceholderApiKey(apiKey)) {
+    return null;
+  }
   if (!apiKey) return null;
 
   const candidates = extractProvidedApiKeys(c);
@@ -338,7 +387,22 @@ app.post("/v1/upload", uploadFile);
 app.post("/v1/images/generations", imagesGenerations);
 app.post("/v1/videos/generations", videosGenerations);
 app.get("/v1/tasks/status/:taskId", videoTaskStatus);
-
+app.get("/v1/chat/mode", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json({ mode: getRuntimeChatMode() });
+});
+app.post("/v1/chat/mode", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const body = (await c.req.json().catch(() => ({}))) as { mode?: string };
+  if (!body.mode) {
+    return c.json({ error: { message: "Field 'mode' is required" } }, 400);
+  }
+  const updated = setRuntimeChatMode(body.mode);
+  saveTuiSettings({ chat: { mode: updated } });
+  return c.json({ success: true, mode: updated });
+});
 // OpenAI Responses API compatible routes
 app.route("", responsesApp);
 app.route("", anthropicApp);
@@ -365,8 +429,21 @@ for (const [from, to] of LEGACY_REDIRECTS) {
 
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();
-  return c.json({
+  const publicBody = {
     status: status?.overall || "unknown",
+    timestamp: Date.now(),
+  };
+  const apiKeyConfigured = Boolean(getRuntimeApiKey() || config.apiKey);
+  const authError = verifyApiKey(c);
+  if (apiKeyConfigured && authError) {
+    return c.json(publicBody);
+  }
+  if (!apiKeyConfigured) {
+    return c.json(publicBody);
+  }
+
+  return c.json({
+    ...publicBody,
     ram: status?.ram || "unknown",
     streams: status?.streams || "unknown",
     // Additive for dashboard V2 (QwenGate health also carried uptime).
@@ -381,11 +458,26 @@ app.get("/health", async (c) => {
           usagePercent: Number(status.heap.usagePercent.toFixed(2)),
         }
       : undefined,
-    timestamp: Date.now(),
     readyAccounts: (await import("../core/account-manager.js")).getHeadersReadyAccountIds(),
     activeAccounts: (await import("../services/playwright.js")).getActivePlaywrightAccountIds(),
     metrics: {
       cache: await cache?.getStats(),
+      requestsTotal: Number(metrics.get("requests.total")?.value ?? 0),
+      requestsErrors: Number(metrics.get("requests.errors")?.value ?? 0),
+      latencyAvgMs: (() => {
+        const hist = metrics.get("latency.request")?.value;
+        if (hist && typeof hist === "object" && (hist as any).count > 0) {
+          return Math.round((hist as any).sum / (hist as any).count);
+        }
+        return 0;
+      })(),
+      deltasCount: Number(metrics.get("requests.delta")?.value ?? 0),
+      fullReplaysCount: Number(metrics.get("requests.full")?.value ?? 0),
+      toolCallsCount: Number(metrics.get("toolcalls.total")?.value ?? 0),
+      toolCallsRecovered: Number(metrics.get("toolcalls.recovered")?.value ?? 0),
+      captchasDetected: Number(metrics.get("captcha.challenges.detected")?.value ?? 0),
+      captchasSolved: Number(metrics.get("captcha.solves.succeeded")?.value ?? 0),
+      chatsCleaned: Number(metrics.get("chats.cleaned")?.value ?? 0),
     },
   });
 });
@@ -419,9 +511,58 @@ app.get("/metrics", (c) => {
   });
 });
 
+app.get("/logs", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  return c.json(getServerLogHistory());
+});
+
+app.get("/logs/live", (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const encoder = new TextEncoder();
+  return c.body(
+    new ReadableStream({
+      start(controller) {
+        const past = getServerLogHistory();
+        for (const entry of past) {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
+          } catch {}
+        }
+
+        const unsubscribe = subscribeServerLogStream((entry) => {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
+          } catch {
+            unsubscribe();
+          }
+        });
+
+        c.req.raw.signal.addEventListener("abort", () => {
+          unsubscribe();
+        });
+      },
+    }),
+    200,
+    {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  );
+});
+
 app.onError((err, c) => {
   const requestId = c.req.header("X-Request-Id") || "unknown";
-  metrics.increment("requests.errors");
+  const isProbe =
+    c.req.path === "/health" ||
+    c.req.path === "/metrics" ||
+    c.req.path.startsWith("/diagnostics") ||
+    c.req.path === "/favicon.ico";
+  if (!isProbe) {
+    metrics.increment("requests.errors");
+  }
   logger.error("API Error", {
     requestId,
     error: err instanceof Error ? err.message : String(err),
@@ -738,6 +879,7 @@ export async function startServer(options?: {
   installSignalHandlers?: boolean;
   showBanner?: boolean;
 }): Promise<StartedServerInfo> {
+  hookServerConsoleForLogging();
   if (server) {
     if (options?.installSignalHandlers !== false) installSignalHandlers();
     return buildStartedServerInfo();
@@ -751,9 +893,8 @@ export async function startServer(options?: {
     cache = new MemoryCache();
     await cache.connect();
 
-    if (!config.apiKey && config.server.host === "0.0.0.0") {
-      // API key status will be shown in startup banner
-    }
+    ensureRuntimeApiKey(config.server.host);
+    assertBindAllowed(config.server.host, getRuntimeApiKey() || config.apiKey);
 
     const { loadAccounts, getAccountCredentials } =
       await import("../core/accounts.ts");
@@ -1005,6 +1146,9 @@ export async function startServer(options?: {
       await import("../core/account-concurrency.ts");
     startLeaseSweepTimer();
 
+    const { scheduleStartupChatCleanup } =
+      await import("../services/chat-cleanup.ts");
+    scheduleStartupChatCleanup();
     const serverInstance = serve({
       fetch: app.fetch,
       port: config.server.port,

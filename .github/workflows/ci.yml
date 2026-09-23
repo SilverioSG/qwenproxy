@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
@@ -32,7 +32,7 @@ jobs:
         run: npm run typecheck
 
       - name: Mock tests
-        run: npm run test:mock
+        run: npm run test:mock:fast
         env:
           CI: true
           TEST_MOCK_QWEN_AUTH: true
@@ -73,3 +73,113 @@ jobs:
       - name: Build Docker image (smoke test)
         if: steps.secrets.outputs.available != 'true'
         run: docker build --tag qwenproxy:test .
+
+  release:
+    name: Auto Release & NPM Publish
+    runs-on: ubuntu-latest
+    needs: [check, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check version and tag status
+        id: check_version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          TAG="v$VERSION"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ Tag $TAG already exists, skipping release."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "🚀 New version $TAG detected! Proceeding with release."
+          fi
+
+      - name: Create Git Tag and GitHub Release
+        if: steps.check_version.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.check_version.outputs.tag }}
+        run: |
+          TAG="${{ steps.check_version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          export PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          # Generate standardized English release notes from commit history
+          node -e '
+            const { execSync } = require("child_process");
+            const fs = require("fs");
+            const tag = process.env.TAG;
+            const prevTag = process.env.PREV_TAG;
+            const range = prevTag ? `${prevTag}..HEAD` : "HEAD";
+            let rawLog = "";
+            try {
+              rawLog = execSync(`git log ${range} --pretty=format:"%B---COMMIT_DELIMITER---"`, { encoding: "utf-8" });
+            } catch {}
+
+            const commits = rawLog.split("---COMMIT_DELIMITER---").map(c => c.trim()).filter(Boolean);
+            const features = [];
+            const fixes = [];
+            const other = [];
+
+            for (const c of commits) {
+              const lines = c.split("\n").map(l => l.trim()).filter(Boolean);
+              if (lines.length === 0) continue;
+              const header = lines[0];
+              const bullets = lines.slice(1).filter(l => l.startsWith("-") || l.startsWith("*"));
+              const target = header.startsWith("fix") ? fixes : header.startsWith("feat") ? features : other;
+              target.push({ header, bullets });
+            }
+
+            let body = "";
+            if (features.length > 0) {
+              body += "### 🚀 Features & Enhancements\n";
+              for (const item of features) {
+                body += `- **${item.header}**\n`;
+                for (const b of item.bullets) body += `  ${b}\n`;
+              }
+              body += "\n";
+            }
+            if (fixes.length > 0) {
+              body += "### 🛠️ Bug Fixes\n";
+              for (const item of fixes) {
+                body += `- **${item.header}**\n`;
+                for (const b of item.bullets) body += `  ${b}\n`;
+              }
+              body += "\n";
+            }
+            if (other.length > 0) {
+              body += "### 📦 Other Changes\n";
+              for (const item of other) {
+                body += `- **${item.header}**\n`;
+                for (const b of item.bullets) body += `  ${b}\n`;
+              }
+              body += "\n";
+            }
+            if (prevTag) {
+              body += `**Full Changelog**: https://github.com/johngbl/qwenproxy/compare/${prevTag}...${tag}\n`;
+            }
+            fs.writeFileSync("RELEASE_NOTES.md", body.trim() || `Release ${tag}\n`, "utf-8");
+          '
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md
+
+      - name: Publish to NPM Registry
+        if: steps.check_version.outputs.exists == 'false' && env.NODE_AUTH_TOKEN != ''
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

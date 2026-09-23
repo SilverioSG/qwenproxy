@@ -43,14 +43,7 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
   const body: OpenAIRequest = await c.req.json();
   logIncomingChatRequest(c, body);
   const isStream = body.stream ?? false;
-  const conversationKey =
-    typeof body.session_id === "string" && body.session_id.trim().length > 0
-      ? body.session_id.trim()
-      : typeof body.conversation_id === "string" &&
-          body.conversation_id.trim().length > 0
-        ? body.conversation_id.trim()
-        : null;
-
+  const conversationKey = extractExplicitConversationKey(c, body);
   const messages = body.messages || [];
   let uploadHeaders: Record<string, string> | null = null;
 
@@ -328,6 +321,63 @@ function contentLength(value: unknown): number {
   return 0;
 }
 
+export function extractExplicitConversationKey(
+  c: Context,
+  body: OpenAIRequest,
+): string | null {
+  const b = body as any;
+
+  // 1. Direct body properties (OpenAI-compatible extensions)
+  if (typeof b?.session_id === "string" && b.session_id.trim().length > 0) {
+    return b.session_id.trim();
+  }
+  if (typeof b?.conversation_id === "string" && b.conversation_id.trim().length > 0) {
+    return b.conversation_id.trim();
+  }
+  if (typeof b?.chat_id === "string" && b.chat_id.trim().length > 0) {
+    return b.chat_id.trim();
+  }
+
+  // 2. HTTP headers sent natively by coding agents
+  const headerCandidates = [
+    c.req.header("x-session-id"),             // OpenCode, Cline, AI-SDK, custom
+    c.req.header("x-session-affinity"),       // OpenCode / AI-SDK
+    c.req.header("session-id"),               // OpenAI Codex CLI
+    c.req.header("x-claude-code-session-id"), // Claude Code CLI
+    c.req.header("x-conversation-id"),        // Standard agents
+    c.req.header("conversation-id"),          // Standard agents
+    c.req.header("x-client-request-id"),      // Client fallback ID
+  ];
+
+  for (const candidate of headerCandidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  // 3. Metadata payloads (Claude Code embeds session_id in user_id metadata JSON)
+  if (b?.metadata && typeof b.metadata === "object") {
+    if (typeof b.metadata.session_id === "string" && b.metadata.session_id.trim().length > 0) {
+      return b.metadata.session_id.trim();
+    }
+    if (typeof b.metadata.user_id === "string" && b.metadata.user_id.includes('"session_id":')) {
+      try {
+        const parsed = JSON.parse(b.metadata.user_id);
+        if (typeof parsed?.session_id === "string" && parsed.session_id.trim().length > 0) {
+          return parsed.session_id.trim();
+        }
+      } catch {}
+    }
+  }
+
+  // 4. Prompt cache key (used by Codex for session consistency)
+  if (typeof b?.prompt_cache_key === "string" && b.prompt_cache_key.trim().length > 0) {
+    return b.prompt_cache_key.trim();
+  }
+
+  return null;
+}
+
 function logIncomingChatRequest(c: Context, body: OpenAIRequest): void {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const tools = Array.isArray((body as any).tools) ? (body as any).tools : [];
@@ -492,6 +542,11 @@ function injectToolInstructions(body: OpenAIRequest): string {
 
   if (!shouldParseToolCalls) return "";
 
+  // If tool_choice is explicitly "none", suppress tool instructions so the model
+  // generates a regular conversational message per OpenAI / Anthropic spec.
+  if (bodyAny.tool_choice === "none" || bodyAny.tool_choice?.type === "none") {
+    return "";
+  }
   if (isToolcallDebugEnabled()) {
     logger.debug("[chat] tools provided in request", {
       toolsCount: declaredTools.length,

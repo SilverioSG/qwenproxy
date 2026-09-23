@@ -122,6 +122,39 @@ test("classifyRetryAction: acquire deadline exceeded quarantines account and rot
   assert.equal(action.reason, "account_initialization_failed");
 });
 
+test("classifyRetryAction: header capture timeout classifies as account initialization failure", () => {
+  const err = new Error("Header capture timed out for 799e3be5-6fe5-4434-a87a-f396a379811c");
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.accountCooldownMs, config.concurrency.initFailureCooldownMs);
+  assert.equal(action.reason, "account_initialization_failed");
+});
+
+test("classifyRetryAction: upstream CreateChatInvalidResponse with Unauthorized cools account and rotates", () => {
+  const err = Object.assign(
+    new Error('Qwen create chat returned unexpected payload: {"success":false,"data":{"code":"Unauthorized"}}'),
+    { code: "CreateChatInvalidResponse" },
+  );
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, true);
+  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.accountCooldownMs, config.concurrency.initFailureCooldownMs);
+  assert.equal(action.reason, "account_initialization_failed");
+});
+
+test("classifyRetryAction: upstream 401 details cools account and rotates", () => {
+  const err = new Error('response={"success":false,"data":{"code":"Unauthorized","details":"401 Não Autorizado"}}');
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.reason, "account_initialization_failed");
+});
+
 test("classifyRetryAction: invalid_input forces new chat + full prompt + switch", () => {
   const err = Object.assign(
     new Error("invalid_input: Entrada ou anexo inválido. Verifique e tente novamente."),

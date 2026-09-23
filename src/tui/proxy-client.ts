@@ -3,6 +3,7 @@
  */
 
 import { config, type ChatMode } from "../core/config.ts";
+import { localApiAuthHeaders } from "../core/local-auth.ts";
 import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
 import {
   getAccountCooldownInfo,
@@ -13,6 +14,7 @@ import {
 import { isPlaywrightInitialized } from "../services/playwright.ts";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.ts";
 import { getRssUsageSnapshot } from "../core/memory-usage.ts";
+import { metrics } from "../core/metrics.ts";
 import type { ProxyStatusSnapshot } from "./types.ts";
 
 export function maskAccountIdentifier(idOrEmail: string): string {
@@ -55,6 +57,7 @@ let lastOnlineState = false;
 let lastOverallStatus = "offline";
 let lastServerReadyAccounts: Set<string> | null = null;
 let lastServerActiveAccounts: Set<string> | null = null;
+let lastMetricsData: any = null;
 export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
   const port = config.server?.port || 7936;
   const configuredHost = config.server?.host;
@@ -66,7 +69,10 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
     isHealthCheckPending = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 350);
-    fetch(`http://${host}:${port}/health`, { signal: controller.signal })
+    fetch(`http://${host}:${port}/health`, {
+      signal: controller.signal,
+      headers: localApiAuthHeaders(),
+    })
       .then(async (resp) => {
         clearTimeout(timeout);
         if (resp.ok) {
@@ -78,6 +84,9 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
           }
           if (Array.isArray(data.activeAccounts)) {
             lastServerActiveAccounts = new Set(data.activeAccounts);
+          }
+          if (data.metrics) {
+            lastMetricsData = data.metrics;
           }
         } else {
           lastOnlineState = false;
@@ -106,8 +115,9 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
 
     cachedAccounts = rawAccounts.map((acc) => {
       const cooldownInfo = getAccountCooldownInfo(acc.id);
-      const onCooldown = Boolean(cooldownInfo?.onCooldown);
-      const remainingCooldownMs = cooldownInfo?.remainingMs || 0;
+      const onCooldown = Boolean(cooldownInfo?.onCooldown || (acc.cooldown_until && acc.cooldown_until > now));
+      const remainingCooldownMs = cooldownInfo?.remainingMs || (acc.cooldown_until && acc.cooldown_until > now ? acc.cooldown_until - now : 0);
+      const cooldownReason = cooldownInfo?.reason || acc.cooldown_reason || (onCooldown ? "RateLimited" : null);
       const headersReady = lastServerReadyAccounts !== null
         ? lastServerReadyAccounts.has(acc.id)
         : isAccountHeadersReady(acc.id);
@@ -121,26 +131,37 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
         cooldownUntil: acc.cooldown_until || null,
         onCooldown,
         remainingCooldownMs,
+        cooldownReason,
         headersReady,
         isInitialized,
       };
     });
   }
-  const accounts = cachedAccounts;
   const online = lastOnlineState;
   const overallStatus = lastOverallStatus;
 
   // Concurrency stats
   let activeStreams = 0;
   let waitingStreams = 0;
+  const concurrencyMap = new Map<string, { active: number; waiting: number; limit: number }>();
   try {
     const snapshot = getAccountConcurrencySnapshot();
     for (const item of snapshot) {
       activeStreams += item.active;
       waitingStreams += item.waiting;
+      concurrencyMap.set(item.accountId, item);
     }
   } catch {}
 
+  // Attach concurrency to accounts
+  const accounts = cachedAccounts.map((acc) => {
+    const concurrency = concurrencyMap.get(acc.id);
+    return {
+      ...acc,
+      activeStreams: concurrency?.active ?? 0,
+      streamLimit: concurrency?.limit ?? config.concurrency.maxStreamsPerAccount,
+    };
+  });
   // RAM usage
   let rssMb = 0;
   let systemMemoryPct = 0;
@@ -150,20 +171,58 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
     systemMemoryPct = Math.round(rssSnap.usagePercent * 10) / 10;
   } catch {}
 
+  const totalReqs = lastMetricsData?.requestsTotal ?? Number(metrics.get("requests.total")?.value ?? 0);
+  const totalErrs = lastMetricsData?.requestsErrors ?? Number(metrics.get("requests.errors")?.value ?? 0);
+  const successRate = totalReqs > 0 ? Number((((totalReqs - totalErrs) / totalReqs) * 100).toFixed(1)) : 100;
+  const latencyAvgMs = lastMetricsData?.latencyAvgMs ?? (() => {
+    const hist = metrics.get("latency.request")?.value;
+    if (hist && typeof hist === "object" && (hist as any).count > 0) {
+      return Math.round((hist as any).sum / (hist as any).count);
+    }
+    return 0;
+  })();
+  const deltasCount = lastMetricsData?.deltasCount ?? Number(metrics.get("requests.delta")?.value ?? 0);
+  const fullReplaysCount = lastMetricsData?.fullReplaysCount ?? Number(metrics.get("requests.full")?.value ?? 0);
+  const totalModes = deltasCount + fullReplaysCount;
+  const deltaRatio = totalModes > 0 ? Number(((deltasCount / totalModes) * 100).toFixed(1)) : (deltasCount > 0 ? 100 : 0);
+  const toolCallsCount = lastMetricsData?.toolCallsCount ?? Number(metrics.get("toolcalls.total")?.value ?? 0);
+  const toolCallsRecovered = lastMetricsData?.toolCallsRecovered ?? Number(metrics.get("toolcalls.recovered")?.value ?? 0);
+  const captchasDetected = lastMetricsData?.captchasDetected ?? Number(metrics.get("captcha.challenges.detected")?.value ?? 0);
+  const captchasSolved = lastMetricsData?.captchasSolved ?? Number(metrics.get("captcha.solves.succeeded")?.value ?? 0);
+  const chatsCleaned = lastMetricsData?.chatsCleaned ?? Number(metrics.get("chats.cleaned")?.value ?? 0);
+  const cacheHitRatio = lastMetricsData?.cache?.hitRatio;
+  const cacheBytesSaved = lastMetricsData?.cache?.bytesSaved;
+
   return {
-    online,
+    online: lastOnlineState,
     port,
     host,
-    overallStatus,
+    chatMode: config.qwen.chatMode as any,
+    overallStatus: lastOverallStatus,
     uptimeSeconds,
     rssMb,
     systemMemoryPct,
     activeStreams,
     waitingStreams,
+    metrics: {
+      requestsTotal: totalReqs,
+      requestsErrors: totalErrs,
+      successRate,
+      latencyAvgMs,
+      deltasCount,
+      fullReplaysCount,
+      deltaRatio,
+      toolCallsCount,
+      toolCallsRecovered,
+      captchasDetected,
+      captchasSolved,
+      chatsCleaned,
+      cacheHitRatio,
+      cacheBytesSaved,
+    },
     accounts,
   };
 }
-
 export function resetAllCooldowns(): number {
   return clearAllAccountCooldowns();
 }
@@ -191,7 +250,7 @@ export async function streamChatCompletions(
   const port = config.server?.port || 7936;
   const configuredHost = config.server?.host;
   const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
-  const apiKey = config.apiKey || "sk-qwenproxy-local";
+  const apiKeyHeaders = localApiAuthHeaders();
 
   const startTime = Date.now();
   let ttfbMs = 0;
@@ -203,7 +262,7 @@ export async function streamChatCompletions(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        ...apiKeyHeaders,
         "x-qwenproxy-chat-mode": chatMode,
       },
       body: JSON.stringify({
@@ -281,18 +340,17 @@ export async function streamChatCompletions(
 let cachedLiveModels: string[] | null = null;
 let liveModelsPromise: Promise<string[]> | null = null;
 
-const DEFAULT_FALLBACK_MODELS = [
-  "qwen3.8-max",
-  "qwen3.7-plus",
-  "qwen3.7-max",
-  "z-image-turbo",
-  "qwen-image-3.0-pro",
-  "qwen-image-3.0",
-  "wan2.7-image-pro",
-  "wan2.7-image",
-  "wan3.0-video",
-  "wan2.7-t2v",
-];
+export { DEFAULT_FALLBACK_MODELS } from "../core/model-alias.ts";
+import { DEFAULT_FALLBACK_MODELS } from "../core/model-alias.ts";
+
+export function getCachedLiveModels(): string[] | null {
+  return cachedLiveModels;
+}
+
+export function resetCachedLiveModelsForTests(): void {
+  cachedLiveModels = null;
+  liveModelsPromise = null;
+}
 
 export async function fetchLiveModels(forceRefresh = false): Promise<string[]> {
   if (!forceRefresh && cachedLiveModels && cachedLiveModels.length > 0) {
@@ -306,14 +364,15 @@ export async function fetchLiveModels(forceRefresh = false): Promise<string[]> {
   const port = config.server?.port || 7936;
   const configuredHost = config.server?.host;
   const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
-  const apiKey = config.apiKey || "sk-qwenproxy-local";
 
   liveModelsPromise = (async () => {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
+    // Cold start with Playwright navigation and bx security token acquisition can take 5-12s
+    const timeoutMs = cachedLiveModels ? 4000 : 12000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const resp = await fetch(`http://${host}:${port}/v1/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { ...localApiAuthHeaders() },
         signal: controller.signal,
       });
       if (resp.ok) {
@@ -334,7 +393,9 @@ export async function fetchLiveModels(forceRefresh = false): Promise<string[]> {
           }
         }
       }
-    } catch {} finally {
+    } catch {
+      // Don't poison cachedLiveModels on network error so subsequent polls can retry
+    } finally {
       clearTimeout(timeout);
       liveModelsPromise = null;
     }

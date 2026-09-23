@@ -115,7 +115,7 @@ test("createQwenStream matches the latest browser completion payload", async () 
     assert.equal(capturedPayload.messages[0].id, null);
     assert.equal(capturedPayload.messages[0].model, "");
     assert.equal(capturedPayload.messages[0].childrenIds.length, 1);
-    assert.equal(capturedPayload.messages[0].feature_config.auto_search, true);
+    assert.equal(capturedPayload.messages[0].feature_config.auto_search, false);
     assert.equal(capturedPayload.messages[0].feature_config.thinking_enabled, false);
     assert.equal(capturedPayload.messages[0].feature_config.thinking_mode, "Fast");
     assert.equal(

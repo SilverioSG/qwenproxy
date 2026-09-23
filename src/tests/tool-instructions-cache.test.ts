@@ -39,6 +39,12 @@ test("buildToolInstructions: includes forced tool instruction when toolChoice is
   assert.ok(result.includes("special_tool"));
 });
 
+test("buildToolInstructions: includes required tool instruction when toolChoice is 'required'", () => {
+  const toolsJson = '[{"name": "any_tool"}]';
+  const result = buildToolInstructions(toolsJson, "required");
+  assert.ok(result.includes("MUST call at least one tool"));
+});
+
 test("buildToolInstructions: cache respects max entries limit", () => {
   // Create more than 64 unique inputs to trigger cache eviction
   for (let i = 0; i < 70; i++) {

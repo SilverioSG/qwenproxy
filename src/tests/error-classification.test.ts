@@ -95,6 +95,16 @@ test("C: non-thinking parallel-escape still gets the tight 15s cap", () => {
   assert.ok(ms <= 15_000, `auxiliary non-thinking idle must stay short, got ${ms}ms`);
 });
 
+test("C: large non-thinking parallel-escape (e.g. Zed context compaction) does NOT get the tight 15s cap", () => {
+  const ms = computeDynamicIdleTimeout({
+    enableThinking: false,
+    parallelEscape: true,
+    baseTimeoutMs: 60_000,
+    payloadSize: 100_000, // 100KB context compaction
+  });
+  assert.ok(ms >= 60_000, `large compaction request must get the full dynamic window, got ${ms}ms`);
+});
+
 test("C: normal (non-escape) streams keep the dynamic per-MB idle", () => {
   const ms = computeDynamicIdleTimeout({
     enableThinking: true,

@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { getQwenHeaders, isAuthMockEnabled } from "./auth-playwright.ts";
-import { config, type ChatMode } from "../core/config.ts";
+import { config, type ChatMode, isLocalChatMode, isStatelessChatMode } from "../core/config.ts";
 import { logger, isToolcallDebugEnabled } from "../core/logger.ts";
 import {
   computeQuotaCooldownMs,
@@ -83,9 +83,8 @@ export function buildChatNewBody(
     project_id: "",
     timestamp: Date.now(),
     chat_type: "t2t",
-    // thread → normal (persisted), temp / temp-thread → local (ephemeral, not listed).
-    chat_mode:
-      chatMode === "temp" || chatMode === "temp-thread" ? "local" : "normal",
+    // normal: thread & stateless (persisted in Qwen); local: thread-temp & stateless-temp (ephemeral)
+    chat_mode: isLocalChatMode(chatMode) ? "local" : "normal",
   };
 }
 
@@ -201,7 +200,7 @@ export async function acquireNewQwenChatSession(
   accountId?: string,
   chatMode: ChatMode = "thread",
 ): Promise<{ chatId: string; leasedFromPool: boolean }> {
-  if (isQwenChatPoolEnabled() && chatMode !== "temp") {
+  if (isQwenChatPoolEnabled() && !isStatelessChatMode(chatMode)) {
     const key = chatPoolKey(accountId, model);
     const pooled = precreatedChatSessions.get(key);
     const chatId = pooled?.shift();

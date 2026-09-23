@@ -61,7 +61,7 @@ import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
 // acyclic, while the reverse direction would drag the browser layer into core.
 import { hasActiveAccountLease } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
-import { maskEmail } from "../core/logger.ts";
+import { maskEmail, logger } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
 import {
   markAccountHeadersReady,
@@ -223,6 +223,22 @@ async function recoverStuckAccountMutex(
   // account be initialized again instead of remaining permanently wedged.
   if (accountMutexes.get(accountId) !== mutex) return;
 
+  const lockState = mutex.state();
+  // A lock is only considered stuck if it has been held for at least PLAYWRIGHT_MUTEX_WAIT_MS (60s).
+  // A waiter with a short timeout (e.g. 5s) timing out does NOT mean the lock holder is stuck!
+  // Furthermore, never nuke an account while it is initializing (init: takes 20-30s)
+  // or while it is actively serving a stream to a user.
+  if (
+    lockState.heldForMs < PLAYWRIGHT_MUTEX_WAIT_MS ||
+    lockState.heldBy.startsWith("init:") ||
+    isAccountServingStream(accountId)
+  ) {
+    logger.warn(
+      `[Playwright] Skipping destructive mutex recovery | account=${accountId} | heldBy=${lockState.heldBy} | heldFor=${lockState.heldForMs}ms | limit=${PLAYWRIGHT_MUTEX_WAIT_MS}ms | servingStream=${isAccountServingStream(accountId)}`,
+    );
+    return;
+  }
+
   console.warn(
     `[Playwright] Recovering stuck account mutex | account=${accountId} | key=${key}`,
   );
@@ -375,10 +391,7 @@ export async function isPageLoggedIn(
           const res = await fetch("/api/v1/auths/", { method: "GET" });
           return res.status === 200;
         } catch {
-          const btn = document.querySelector(
-            ".header-right-auth-button, button.header-right-auth-button, a[href*='/auth'], a[href*='/login']",
-          );
-          return !btn || (btn as HTMLElement).offsetWidth === 0;
+          return false;
         }
       })
       .catch(() => false);
@@ -1489,7 +1502,7 @@ export async function initPlaywrightForAccount(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
               const ok = await loginToQwen(account.id, account.email, account.password);
-              if (!ok) {
+              if (!ok || !(await isPageLoggedIn(acctPage))) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
                 );
@@ -1867,37 +1880,46 @@ async function loginViaApi(
       .digest("hex");
     const signinUrl = qwenUrl("/api/v2/auths/signin");
 
+    const requestId = crypto.randomUUID();
     const result = await page.evaluate(
-      async ({ email, password, signinUrl }) => {
+      async ({ email, password, signinUrl, requestId }) => {
         try {
           const response = await fetch(signinUrl, {
             method: "POST",
             signal: AbortSignal.timeout(10_000),
+            credentials: "include",
             headers: {
               accept: "application/json, text/plain, */*",
               "content-type": "application/json",
               source: "web",
               timezone: new Date().toString().split(" (")[0],
-              "x-request-id": crypto.randomUUID(),
+              "x-request-id": requestId,
             },
             body: JSON.stringify({ email, password, login_type: "email" }),
           });
           const data = await response.json().catch(() => null);
-          return { ok: response.ok, status: response.status, data };
+          const token = data?.data?.token || data?.token;
+          if (token) {
+            try {
+              localStorage.setItem("token", token);
+              document.cookie = `token=${encodeURIComponent(token)}; path=/; domain=.qwen.ai; max-age=31536000`;
+            } catch {}
+          }
+          return { ok: response.ok, status: response.status, data, token };
         } catch (e: any) {
           return { ok: false, error: e.message };
         }
       },
-      { email, password: hashedPassword, signinUrl },
+      { email, password: hashedPassword, signinUrl, requestId },
     );
 
     if (result.data) {
-      if (result.data.success === true) {
+      if (result.data.success === true || result.token) {
         await page.goto(qwenUrl("/"), {
           waitUntil: "domcontentloaded",
           timeout: config.timeouts.navigation,
         });
-        const loggedIn = !page.url().includes("auth") && !page.url().includes("login");
+        const loggedIn = await isPageLoggedIn(page);
         if (loggedIn) {
           return { success: true };
         }
@@ -1919,13 +1941,12 @@ async function loginViaApi(
         waitUntil: "domcontentloaded",
         timeout: config.timeouts.navigation,
       });
-      const loggedIn = !page.url().includes("auth") && !page.url().includes("login");
+      const loggedIn = await isPageLoggedIn(page);
       return {
         success: loggedIn,
-        reason: loggedIn ? undefined : "Redirecionado de volta para /auth após signin",
+        reason: loggedIn ? undefined : "Sessão não autenticada após signin",
       };
     }
-
     return {
       success: false,
       reason: result.error || `HTTP ${result.status || "desconhecido"} sem corpo JSON válido`,
@@ -2020,6 +2041,8 @@ async function loginViaUi(
     }).catch(() => {});
     // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
     const errorSelector = [
+      ".qwen-chat-v2-toast-text",
+      ".qwen-chat-v2-toast-content",
       ".ant-form-item-explain-error",
       ".ant-message-error",
       ".ant-message-notice",
@@ -2041,8 +2064,7 @@ async function loginViaUi(
     }
 
     // Check if login was successful
-    const isLoggedIn =
-      !page.url().includes("auth") && !page.url().includes("login");
+    const isLoggedIn = await isPageLoggedIn(page);
 
     if (isLoggedIn) {
       await page.goto(qwenUrl("/"), {
@@ -2345,7 +2367,7 @@ export async function captureQwenHeaders(
             `⚠️  [Playwright] Session expired during header capture for ${accountId}; re-authenticating...`,
           );
           const ok = await loginToQwen(accountId, creds.email, creds.password);
-          if (!ok) {
+          if (!ok || !(await isPageLoggedIn(page))) {
             settle(
               new Error(
                 `Header capture failed for ${accountId}: re-login after session expiry did not succeed`,
@@ -2405,19 +2427,30 @@ export async function captureQwenHeaders(
         1,
         Math.min(CHAT_INPUT_ACTION_TIMEOUT_MS, remainingBudgetMs()),
       );
-      try {
-        await page.focus(inputSelector, { timeout: inputActionTimeoutMs });
+      let interactionSucceeded = false;
+      for (let interactionTry = 1; interactionTry <= 2; interactionTry++) {
         if (settled || page.isClosed()) return;
-        await page.fill(inputSelector, "", { timeout: inputActionTimeoutMs });
-        if (settled || page.isClosed()) return;
-        await page.type(inputSelector, "a", {
-          delay: 100,
-          timeout: inputActionTimeoutMs,
-        });
-      } catch {
+        try {
+          await page.focus(inputSelector, { timeout: inputActionTimeoutMs });
+          if (settled || page.isClosed()) return;
+          await page.fill(inputSelector, "", { timeout: inputActionTimeoutMs });
+          if (settled || page.isClosed()) return;
+          await page.type(inputSelector, "a", {
+            delay: 100,
+            timeout: inputActionTimeoutMs,
+          });
+          interactionSucceeded = true;
+          break;
+        } catch {
+          if (settled || page.isClosed()) return;
+          if (interactionTry === 1) {
+            await sleep(300);
+          }
+        }
+      }
+      if (!interactionSucceeded) {
         // The input detached mid-interaction (challenge overlay, SPA
-        // re-render): same diagnosis as never appearing — only a fresh load
-        // recovers it.
+        // re-render): only a fresh load recovers it.
         if (settled || page.isClosed()) return;
         console.warn(
           `⏱️  [Playwright] Chat input interaction failed for ${accountId} (attempt ${attempt}); reloading`,
@@ -2660,7 +2693,9 @@ async function refreshHeadersInternal(
         });
         captureStageExit("refresh_goto");
         const url = page.url();
-        if (url.includes("auth") || url.includes("login")) {
+        const isAuthUrl = url.includes("auth") || url.includes("login");
+        const isLoggedIn = isAuthUrl ? false : await isPageLoggedIn(page, 5_000);
+        if (isAuthUrl || !isLoggedIn) {
           console.warn(
             `⚠️  [Playwright] Session expired during refresh for ${accountId}, re-authenticating...`,
           );
@@ -2668,8 +2703,10 @@ async function refreshHeadersInternal(
           const creds = getAccountCredentials(accountId);
           if (creds && creds.email && creds.password) {
             await loginToQwen(accountId, creds.email, creds.password);
-            // Invalidate cookie cache after re-login
             cookieCaches.delete(accountId);
+            if (!(await isPageLoggedIn(page, 5_000))) {
+              throw new Error(`Re-login for ${accountId} did not restore an authenticated session`);
+            }
           } else {
             console.warn(
               `[Playwright] No credentials available for re-login of ${accountId}`,
@@ -2785,9 +2822,10 @@ export async function withAccountPage<T>(
       // cleanup below — which notifies account death and wakes parked
       // browser streams — would never run.
       if (
-        message.includes("Playwright page operation timed out") ||
-        error instanceof CaptchaCdpTimeoutError ||
-        (recoverOnTimeout && isPlaywrightAlreadyClosedError(error))
+        (recoverOnTimeout &&
+          (message.includes("Playwright page operation timed out") ||
+            isPlaywrightAlreadyClosedError(error))) ||
+        error instanceof CaptchaCdpTimeoutError
       ) {
         console.warn(
           `⏱️  [Playwright] Resetting account context after a stuck page operation: ${accountId}`,
@@ -3452,6 +3490,18 @@ export async function closeAllPlaywright(): Promise<void> {
 
 export function isPlaywrightInitialized(accountId: string): boolean {
   return accountPages.has(accountId);
+}
+
+export function isPlaywrightInitializing(accountId: string): boolean {
+  return inFlightAccountInits.has(accountId);
+}
+
+export function isAccountRecentlyActive(
+  accountId: string,
+  maxIdleMs = 300_000,
+): boolean {
+  const last = lastAccountActivity.get(accountId) ?? 0;
+  return last > 0 && Date.now() - last < maxIdleMs;
 }
 
 /**

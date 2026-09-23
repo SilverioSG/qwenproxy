@@ -578,3 +578,37 @@ test("recoverBaxiaCaptcha does not kill browser context when page operation time
     unregisterPlaywrightAccountForTests(accountId);
   }
 });
+
+test("withAccountPage respects recoverOnTimeout=false and does not destroy context on timeout", async () => {
+  const {
+    withAccountPage,
+    registerPlaywrightAccountForTests,
+    unregisterPlaywrightAccountForTests,
+    isPlaywrightInitialized,
+  } = await import("../services/playwright.ts");
+
+  const accountId = "test-recover-false-" + Date.now();
+  const mockPage = { isClosed: () => false };
+  registerPlaywrightAccountForTests(accountId, mockPage as any, Date.now());
+
+  try {
+    await assert.rejects(
+      () =>
+        withAccountPage(
+          accountId,
+          () => new Promise((resolve) => setTimeout(resolve, 2000)),
+          1000,
+          5000,
+          false,
+        ),
+    );
+
+    assert.strictEqual(
+      isPlaywrightInitialized(accountId),
+      true,
+      "Account page must remain registered when recoverOnTimeout=false",
+    );
+  } finally {
+    unregisterPlaywrightAccountForTests(accountId);
+  }
+});

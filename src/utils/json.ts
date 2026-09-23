@@ -124,6 +124,29 @@ function closeBraces(
 }
 
 /**
+ * Compute the exact missing closing tokens (closing quote, closing braces/brackets)
+ * needed to turn a truncated JSON prefix into parseable JSON.
+ */
+export function computeMissingJsonClosingTokens(
+  rawJson: string,
+  appendInsideUnclosedString?: string,
+): string {
+  if (!rawJson) return "}";
+  const { recoveredUnclosedString, openStack, openBraces, openBrackets } =
+    sanitizeAndBalance(rawJson);
+  let closing = "";
+  if (recoveredUnclosedString) {
+    if (appendInsideUnclosedString) {
+      const escapedNotice = JSON.stringify(appendInsideUnclosedString).slice(1, -1);
+      closing += escapedNotice;
+    }
+    closing += '"';
+  }
+  closing += closeBraces("", openBraces, openBrackets, openStack);
+  return closing;
+}
+
+/**
  * Fixes missing opening quotes in JSON values.
  * Handles cases like: {"key": value_without_quotes"}
  * Upstream: a63f054, 9328bde

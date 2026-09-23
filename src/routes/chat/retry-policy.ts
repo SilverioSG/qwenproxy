@@ -220,6 +220,7 @@ export function isAccountInitializationError(err: unknown): boolean {
   return (
     code === "acquire_deadline" ||
     message.includes("acquire deadline") ||
+    message.includes("header capture timed out") ||
     message.includes("header capture returned incomplete anti-fraud headers") ||
     message.includes("required qwen anti-fraud headers are unavailable") ||
     message.includes("playwright not initialized for account") ||
@@ -479,6 +480,28 @@ export function classifyRetryAction(
     });
   }
 
+  // Upstream 401 / Unauthorized on chat creation or API requests:
+  // Account session is invalid or expired. Cool down account with AuthInitFailed so the
+  // proxy rotates to a valid account instead of looping endlessly on 503s.
+  if (
+    code === "createchatinvalidresponse" ||
+    code === "createchatfailed" ||
+    code === "unauthorized" ||
+    message.includes("401 não autorizado") ||
+    message.includes("não tem permissão para acessar") ||
+    message.includes("401 unauthorized") ||
+    message.includes('"code":"unauthorized"') ||
+    message.includes('"code": "unauthorized"')
+  ) {
+    return makeRetryAction("account_initialization_failed", {
+      switchAccount: true,
+      forceNewChat: true,
+      retryWithFullPrompt: true,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "AuthInitFailed",
+    });
+  }
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)
     // Corrupted chat history must win over broad "invalid input" matches.
     // Try a fresh chat on the SAME account first — the corruption is in the

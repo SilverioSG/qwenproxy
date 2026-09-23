@@ -5,7 +5,7 @@
 
 import { TuiApp } from "./app.ts";
 
-function parseInitialTab(): number {
+function parseInitialTab(): number | undefined {
   const args = process.argv.slice(2);
   const tabArgIdx = args.findIndex((a) => a === "--tab" || a === "-t");
   if (tabArgIdx !== -1 && args[tabArgIdx + 1]) {
@@ -21,8 +21,11 @@ function parseInitialTab(): number {
     return parseInt(firstNumeric, 10);
   }
 
-  return 1;
+  return undefined;
 }
+try {
+  process.title = "QwenProxy";
+} catch {}
 
 async function main() {
   if (!process.stdout.isTTY || !process.stdin.isTTY) {

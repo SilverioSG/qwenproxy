@@ -1,6 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isNewerVersion, getUpdateArgs, detectPackageManager } from "../update-cli.js";
+import {
+  isNewerVersion,
+  getUpdateArgs,
+  detectPackageManager,
+  fetchLatestNpmVersion,
+} from "../update-cli.js";
 
 describe("update-cli helper", () => {
   describe("isNewerVersion", () => {
@@ -44,6 +49,14 @@ describe("update-cli helper", () => {
     it("returns a valid package manager string", () => {
       const pm = detectPackageManager();
       assert.ok(["npm", "pnpm", "bun", "yarn"].includes(pm));
+    });
+  });
+
+  describe("fetchLatestNpmVersion", () => {
+    it("fetches a valid semver version from npm registry", async () => {
+      const version = await fetchLatestNpmVersion("qwenproxy-cli");
+      assert.ok(typeof version === "string");
+      assert.ok(/^\d+\.\d+\.\d+/.test(version));
     });
   });
 });

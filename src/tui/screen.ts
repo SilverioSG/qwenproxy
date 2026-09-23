@@ -47,13 +47,20 @@ export class Screen {
     if (!process.stdout.isTTY || !process.stdin.isTTY) {
       return false;
     }
-
+    try {
+      process.title = "QwenProxy";
+    } catch {}
     this.active = true;
     this.prevRenderedRows = [];
-    // Switch to alternate screen buffer, clear screen, hide cursor, and enable mouse tracking
+    // Switch to alternate screen buffer, clear screen, hide cursor, enable mouse tracking, and set terminal title
     ServerManager.getInstance().withTuiRendering(() => {
       process.stdout.write(
-        ANSI.enterAltScreen + "\x1b[2J" + ANSI.cursorHome + ANSI.hideCursor + ANSI.enableMouse,
+        ANSI.enterAltScreen +
+          "\x1b[2J" +
+          ANSI.cursorHome +
+          ANSI.hideCursor +
+          ANSI.enableMouse +
+          ANSI.setTitle("QwenProxy"),
       );
     });
     // Setup raw keyboard input

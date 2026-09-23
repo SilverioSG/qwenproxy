@@ -133,3 +133,56 @@ test("T5: incremental deltas are not emitted beyond the cap", () => {
   assert.strictEqual(parser.getCappedToolCalls().length, 2, "calls 3 and 4 are capped");
   assert.strictEqual(parser.getMalformedToolCalls().length, 0);
 });
+
+// Reproduces the infinite WebSearch/WebFetch loop from 2026-09-18:
+// Qwen-native tool calls (WebSearch, WebFetch) are not in the client's
+// declared tools. The parser correctly preserves them as literal text, but
+// MUST count them toward the per-turn cap so isToolCapReached() fires and
+// the stream handler cancels the upstream. Without this, the model can
+// generate hundreds of undeclared calls without ever hitting the cap.
+test("T5: undeclared tool calls count toward the per-turn cap", () => {
+  const parser = new StreamingToolParser(READ_FILE_TOOLS, {
+    maxToolCallsPerTurn: 3,
+  });
+
+  function undeclaredCall(query: string): string {
+    return `<qpx_call>{"name": "WebSearch", "arguments": {"query": "${query}"}}</qpx_call>`;
+  }
+
+  assert.strictEqual(parser.isToolCapReached(), false);
+
+  // Feed 4 undeclared tool calls — cap is 3
+  const result = parser.feed(
+    undeclaredCall("a") + undeclaredCall("b") + undeclaredCall("c") + undeclaredCall("d"),
+  );
+  parser.flush();
+
+  // No structured tool calls emitted (they're undeclared)
+  assert.strictEqual(result.toolCalls.length, 0, "undeclared calls must not emit as structured tool calls");
+
+  // But the cap MUST be reached so the stream handler stops the upstream
+  assert.ok(parser.isToolCapReached(), "cap must fire on undeclared tool calls to prevent infinite generation");
+  assert.ok(parser.getEmittedToolCallCount() >= 3, "undeclared calls must count toward emittedToolCallCount");
+});
+
+test("T5: mix of declared and undeclared calls shares the same cap", () => {
+  const parser = new StreamingToolParser(READ_FILE_TOOLS, {
+    maxToolCallsPerTurn: 3,
+  });
+
+  // 1 declared + 3 undeclared → cap at 3
+  const result = parser.feed(
+    callBlock("a.txt") +
+    `<qpx_call>{"name": "WebSearch", "arguments": {"query": "test"}}</qpx_call>` +
+    `<qpx_call>{"name": "WebFetch", "arguments": {"url": "http://example.com"}}</qpx_call>` +
+    `<qpx_call>{"name": "WebSearch", "arguments": {"query": "more"}}</qpx_call>`,
+  );
+  parser.flush();
+
+  // Only the declared call is emitted as structured
+  assert.strictEqual(result.toolCalls.length, 1, "only declared call emitted");
+  assert.strictEqual(result.toolCalls[0].name, "read_file");
+
+  // Cap reached via combined count
+  assert.ok(parser.isToolCapReached(), "cap must fire from combined declared + undeclared count");
+});

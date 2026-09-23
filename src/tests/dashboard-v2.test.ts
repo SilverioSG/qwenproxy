@@ -266,8 +266,17 @@ test("uptime is real on /health and /metrics/uptime", async () => {
   const health = await get("/health", false);
   assert.equal(health.status, 200);
   const healthBody = (await health.json()) as Record<string, unknown>;
-  assert.equal(typeof healthBody.uptime, "number");
-  assert.ok((healthBody.uptime as number) >= 0);
+  // Unauthenticated /health is the public subset (status + timestamp).
+  // Uptime stays on the authenticated body and on /metrics/uptime.
+  assert.equal(typeof healthBody.status, "string");
+  assert.equal(typeof healthBody.timestamp, "number");
+  assert.equal(healthBody.uptime, undefined);
+
+  const authed = await get("/health");
+  assert.equal(authed.status, 200);
+  const authedBody = (await authed.json()) as Record<string, unknown>;
+  assert.equal(typeof authedBody.uptime, "number");
+  assert.ok((authedBody.uptime as number) >= 0);
 
   const uptime = await get("/metrics/uptime");
   assert.equal(uptime.status, 200);

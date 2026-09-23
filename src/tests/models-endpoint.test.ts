@@ -115,3 +115,28 @@ test("models endpoint returns a single model and 404 for missing model", async (
     globalThis.fetch = originalFetch;
   }
 });
+
+test("models endpoint falls back gracefully to default models when upstream auth/network fails", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("/api/models")) {
+      return new Response(JSON.stringify({ success: false, code: "Unauthorized", details: "Session expired" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return originalFetch(input, init);
+  }) as typeof globalThis.fetch;
+
+  try {
+    const res = await app.fetch(new Request("http://localhost/v1/models"));
+    assert.equal(res.status, 200, "Must return 200 with fallback models instead of 401");
+    const body = (await res.json()) as any;
+    assert.equal(body.object, "list");
+    assert.ok(body.data.length > 0, "Must return models list");
+    assert.ok(body.data.some((m: any) => m.id === "qwen-test-model" || m.id === "qwen3.8-max"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

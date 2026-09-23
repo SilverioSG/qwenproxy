@@ -11,7 +11,7 @@ const envSchema = z
         return port >= 1 && port <= 65535;
       }, "PORT must be between 1 and 65535")
       .default("7936"),
-    HOST: z.string().default("0.0.0.0"),
+    HOST: z.string().default("127.0.0.1"),
     INTERNAL_HOST: z.string().default("127.0.0.1"),
     USER_AGENT: z
       .string()
@@ -35,7 +35,18 @@ const envSchema = z
     // temp chat (chat_mode:"local") for every request and sends the full
     // history inline (OpenAI standard). Temp chats are ephemeral and never
     // appear in the account's chat list (live-probed).
-    QWEN_CHAT_MODE: z.enum(["thread", "temp", "temp-thread"]).default("thread"),
+    QWEN_CHAT_MODE: z
+      .enum([
+        "thread",
+        "temp",
+        "temp-thread",
+        "thread-temp",
+        "stateless",
+        "stateles",
+        "stateless-temp",
+        "stateles-temp",
+      ])
+      .default("thread"),
     PLAYWRIGHT_HEADLESS: z.string().default("true"),
     PLAYWRIGHT_BROWSER: z
       .enum(["chromium", "chrome", "edge"])
@@ -102,7 +113,7 @@ const envSchema = z
     RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
-    MAX_TOOL_CALLS_PER_TURN: z.string().default("24"),
+    MAX_TOOL_CALLS_PER_TURN: z.string().default("6"),
     QWEN_REPEATED_TOOL_CALL_WARN: z.string().default("2"),
     ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("2"),
     ACCOUNT_BUSY_WAIT_MS: z.string().default("30000"),
@@ -157,12 +168,14 @@ const envSchema = z
     QWEN_BROWSER_ONLY_FETCH: z.string().default("true"),
     QWEN_MAP_OPENAI_MODELS: z.string().default("true"),
     QWEN_MAX_PROMPT_BYTES: z.string().default("0"),
-    QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("200000"),
+    QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("500000"),
     CONTEXT_METER_ENABLED: z.string().default("true"),
     CONTEXT_METER_WINDOW_TOKENS: z.string().default("0"),
     CONTEXT_METER_REPORT_USAGE: z.string().default("true"),
     DELETE_ALL_CHATS_ON_SHUTDOWN: z.string().default("false"),
-    // Keep idle account pages alive (subtlePageActivity + occasional reload).
+    AUTO_CLEAN_CHATS_ON_STARTUP: z.string().default("true"),
+    AUTO_CLEAN_ORPHAN_CHATS: z.string().default("true"),
+    AUTO_CLEAN_CHAT_MAX_AGE_HOURS: z.string().default("168"),
     // The Baxia WAF scores live page behavior (pointer/scroll events, open
     // session) — an account whose page sits frozen for minutes returns a low
     // trust score and gets TMD-challenged on the next request. On by default;
@@ -361,14 +374,19 @@ export const config = {
     /** When true, all requests (personalization, models, media, chat) route exclusively through the browser page (no direct Node fetch). */
     browserOnlyFetch: env.QWEN_BROWSER_ONLY_FETCH !== "false",
     mapOpenAiModels: env.QWEN_MAP_OPENAI_MODELS !== "false",
-    chatMode: env.QWEN_CHAT_MODE,
+    chatMode: normalizeChatMode(env.QWEN_CHAT_MODE),
     maxPromptBytes: Math.max(0, parseInt(env.QWEN_MAX_PROMPT_BYTES)),
     maxPersonalizationBytes: Math.max(
       0,
       parseInt(env.QWEN_MAX_PERSONALIZATION_BYTES),
     ),
     deleteAllChatsOnShutdown: env.DELETE_ALL_CHATS_ON_SHUTDOWN === "true",
-    /** Send the captured bx-ua/bx-umidtoken headers (real client does NOT). */
+    autoCleanChatsOnStartup: env.AUTO_CLEAN_CHATS_ON_STARTUP !== "false",
+    autoCleanOrphanChats: env.AUTO_CLEAN_ORPHAN_CHATS !== "false",
+    autoCleanChatMaxAgeHours: Math.max(
+      1,
+      parseInt(env.AUTO_CLEAN_CHAT_MAX_AGE_HOURS) || 168,
+    ),
     sendBxUa: env.QWEN_SEND_BX_UA === "true",
     /** Deployed web bundle version sent as the `version` API header. */
     webVersion: env.QWEN_WEB_VERSION,
@@ -382,5 +400,85 @@ export const config = {
 
 export type Config = typeof config;
 
-/** Conversation mode: thread-native reuse vs ephemeral temp chat per request vs temp-thread (ephemeral continuous session). */
-export type ChatMode = "thread" | "temp" | "temp-thread";
+/**
+ * Conversation modes:
+ * - "thread": thread-native delta (~1KB), saved in Qwen account sidebar (default)
+ * - "thread-temp" (alias "temp-thread"): thread-native delta (~1KB), ephemeral local chat (not saved)
+ * - "stateless": full history re-sent every turn (OpenAI standard), saved in Qwen account sidebar
+ * - "stateless-temp" (alias "temp"): full history re-sent every turn (OpenAI standard), ephemeral local chat (not saved)
+ */
+export type ChatMode =
+  | "thread"
+  | "thread-temp"
+  | "temp-thread"
+  | "stateless"
+  | "stateles"
+  | "stateless-temp"
+  | "stateles-temp"
+  | "temp";
+
+export function isStatelessChatMode(mode?: string | null): boolean {
+  if (!mode) return false;
+  const m = mode.trim().toLowerCase().replace(/_/g, "-");
+  return (
+    m === "stateless" ||
+    m === "stateles" ||
+    m === "stateless-temp" ||
+    m === "stateles-temp" ||
+    m === "temp"
+  );
+}
+
+export function isLocalChatMode(mode?: string | null): boolean {
+  if (!mode) return false;
+  const m = mode.trim().toLowerCase().replace(/_/g, "-");
+  return (
+    m === "stateless-temp" ||
+    m === "stateles-temp" ||
+    m === "temp" ||
+    m === "thread-temp" ||
+    m === "temp-thread"
+  );
+}
+
+export function normalizeChatMode(
+  mode?: string | null,
+): "thread" | "thread-temp" | "stateless" | "stateless-temp" {
+  if (!mode) return "thread";
+  const m = mode.trim().toLowerCase().replace(/_/g, "-");
+  if (m === "stateless-temp" || m === "stateles-temp" || m === "temp") {
+    return "stateless-temp";
+  }
+  if (m === "stateless" || m === "stateles") {
+    return "stateless";
+  }
+  if (m === "thread-temp" || m === "temp-thread") {
+    return "thread-temp";
+  }
+  return "thread";
+}
+
+export function setRuntimeChatMode(
+  mode?: string | null,
+): "thread" | "thread-temp" | "stateless" | "stateless-temp" {
+  const normalized = normalizeChatMode(mode);
+  (config.qwen as { chatMode: "thread" | "thread-temp" | "stateless" | "stateless-temp" }).chatMode = normalized;
+  return normalized;
+}
+
+export function getRuntimeChatMode(): "thread" | "thread-temp" | "stateless" | "stateless-temp" {
+  return config.qwen.chatMode as "thread" | "thread-temp" | "stateless" | "stateless-temp";
+}
+
+export function cycleNextChatMode(): "thread" | "thread-temp" | "stateless" | "stateless-temp" {
+  const current = getRuntimeChatMode();
+  const order: Array<"thread" | "thread-temp" | "stateless-temp" | "stateless"> = [
+    "thread",
+    "thread-temp",
+    "stateless-temp",
+    "stateless",
+  ];
+  const idx = order.indexOf(current);
+  const next = order[(idx + 1) % order.length];
+  return setRuntimeChatMode(next);
+}

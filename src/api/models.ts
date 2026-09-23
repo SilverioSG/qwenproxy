@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { Hono } from "hono";
-import { fetchQwenModels } from "../services/qwen.js";
+import { fetchQwenModels, getAnyCachedQwenModels } from "../services/qwen.js";
+import { DEFAULT_FALLBACK_MODELS } from "../core/model-alias.ts";
 import { loadAccounts } from "../core/accounts.ts";
 import { getAccountCooldownInfo } from "../core/account-manager.ts";
 import { getAccountsByPriority } from "../core/account-priority.ts";
@@ -141,7 +142,22 @@ async function loadModelsWithVariants(): Promise<{
   accountId?: string;
 }> {
   const accountId = getPreferredModelsAccountId();
-  const models = (await fetchQwenModels(accountId)) as unknown as PublicModel[];
+  let models: PublicModel[] = [];
+  try {
+    models = (await fetchQwenModels(accountId)) as unknown as PublicModel[];
+  } catch {
+    const cached = getAnyCachedQwenModels();
+    if (cached && cached.length > 0) {
+      models = cached as unknown as PublicModel[];
+    } else {
+      models = DEFAULT_FALLBACK_MODELS.map((id) => ({
+        id,
+        object: "model",
+        created: MEDIA_MODELS_CREATED_AT,
+        owned_by: "qwen",
+      }));
+    }
+  }
   const expanded = expandModelVariants(models, accountId);
 
   // Advertise media generation models so clients can discover them via

@@ -12,7 +12,7 @@ import {
 } from "../core/errors.ts";
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
-import { config, type ChatMode } from "../core/config.ts";
+import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
 import { logger } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
 import type {
@@ -27,7 +27,7 @@ import {
   syncModelMetadata,
 } from "../core/model-registry.ts";
 import { type Page, type BrowserContext } from "patchright";
-import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, onPlaywrightAccountDeath, closePlaywrightForAccount, getPlaywrightAccountPresence } from "./playwright.ts";
+import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, onPlaywrightAccountDeath, closePlaywrightForAccount, getPlaywrightAccountPresence, isPlaywrightInitializing } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import {
@@ -61,6 +61,8 @@ export {
   updateSessionParent,
   invalidateLogicalThreadParent,
   clearAllSessionsForAccount,
+  removeSessionByChatId,
+  isChatSessionActive,
   getSessionParent,
 } from "./qwen-thread-state.ts";
 export type { LogicalThreadEntry } from "./qwen-thread-state.ts";
@@ -82,6 +84,8 @@ import {
 } from "./qwen-errors.ts";
 import {
   clearAllSessionsForAccount,
+  removeSessionByChatId,
+  isChatSessionActive,
   getSessionParent,
   updateSessionParent,
 } from "./qwen-thread-state.ts";
@@ -333,7 +337,10 @@ export function computeDynamicIdleTimeout(opts: {
 }): number {
   const payloadMB = opts.payloadSize / (1024 * 1024);
   const dynamic = opts.baseTimeoutMs + Math.ceil(payloadMB * 30_000);
-  if (opts.parallelEscape && !opts.enableThinking) {
+  // The tight 15s cap is ONLY for small auxiliary requests (e.g. title generation).
+  // Larger parallel requests (such as Zed/OMP context compaction with big history)
+  // need the full dynamic timeout so they do not time out at 15s.
+  if (opts.parallelEscape && !opts.enableThinking && opts.payloadSize < 16_384) {
     return Math.min(15_000, dynamic);
   }
   return dynamic;
@@ -505,6 +512,14 @@ const modelsCache = new Map<
   { models: PublicQwenModel[]; fetchedAt: number }
 >();
 
+export function getAnyCachedQwenModels(): PublicQwenModel[] | undefined {
+  for (const entry of modelsCache.values()) {
+    if (entry.models && entry.models.length > 0) {
+      return entry.models;
+    }
+  }
+  return undefined;
+}
 const nativeToolsDisabled = new Set<string>();
 const disablingNativeToolsInProgress = new Set<string>();
 const lastSyncedPersonalizationHashes = new Map<string, string>();
@@ -555,6 +570,25 @@ function setPersonalizationHashInDb(accountId: string, hash: string): void {
       `[Qwen] Failed to persist personalization hash for ${accountId}:`,
       (err as Error).message,
     );
+  }
+}
+export function clearPersonalizationDbCache(accountId?: string): number {
+  try {
+    const db = getDatabase();
+    if (accountId) {
+      const info = db
+        .prepare("DELETE FROM personalization_cache WHERE account_id = ?")
+        .run(accountId);
+      lastSyncedPersonalizationHashes.delete(accountId);
+      activePersonalizationByAccount.delete(accountId);
+      return info.changes;
+    }
+    const info = db.prepare("DELETE FROM personalization_cache").run();
+    lastSyncedPersonalizationHashes.clear();
+    activePersonalizationByAccount.clear();
+    return info.changes;
+  } catch {
+    return 0;
   }
 }
 
@@ -731,22 +765,13 @@ export function buildQwenSettingsUpdatePayload(
   currentSettings: any,
   instruction: string,
 ): Record<string, unknown> {
-  // The real client (HAR networkv2) POSTs ONLY `{personalization: {...}}` to
-  // /api/v2/users/user/settings/update. Live probes confirmed the personalization
-  // object accepts the GET-personalization spread + enable_for_new_chat, but the
-  // FULL-settings spread this used to send (ui/memory/tools_enabled + every GET
-  // field like tts_speaker_v2, code_settings, manage_cookies) is rejected with
-  // RequestValidationError. Safe-settings are applied by disableNativeTools as
-  // their own combined partial POST (probe-accepted). NOTE: the persistent
-  // RequestValidationError that haunted the sync was NOT the payload — it was a
-  // missing Content-Type header (attemptPost received the raw getQwenHeaders
-  // map); the body was not parsed as a JSON object ("Field '': Input should be
-  // a valid dictionary...").
   const currentPersonalization =
     currentSettings?.personalization &&
     typeof currentSettings.personalization === "object"
       ? currentSettings.personalization
       : {};
+
+  const hasInstruction = instruction.trim().length > 0;
 
   return {
     personalization: {
@@ -758,7 +783,7 @@ export function buildQwenSettingsUpdatePayload(
           : currentPersonalization.description,
       style: null,
       instruction,
-      enable_for_new_chat: true,
+      enable_for_new_chat: hasInstruction,
     },
   };
 }
@@ -842,7 +867,7 @@ async function withQwenBrowserPage<T>(
       return fn(page);
     },
     operationTimeoutMs,
-    Math.min(config.timeouts.page, 5_000),
+    Math.min(config.timeouts.page, 30_000),
     recoverOnTimeout,
   );
 }
@@ -929,25 +954,33 @@ export async function requestQwenTextInBrowser(
 
   const evaluateRequest = (page: Page) =>
     page.evaluate(
-      async ({ url, method, headers, body, referrer }: {
+      async ({ url, method, headers, body, referrer, timeoutMs }: {
         url: string;
         method: "GET" | "POST" | "DELETE";
         headers: Record<string, string>;
         body?: string;
         referrer?: string;
+        timeoutMs: number;
       }): Promise<BrowserTextResponse> => {
-        const response = await fetch(url, {
-          method,
-          credentials: "include",
-          headers,
-          body,
-          ...(referrer ? { referrer } : {}),
-        });
-        return {
-          status: response.status,
-          contentType: response.headers.get("content-type") || "",
-          raw: await response.text(),
-        };
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch(url, {
+            method,
+            credentials: "include",
+            headers,
+            body,
+            signal: controller.signal,
+            ...(referrer ? { referrer } : {}),
+          });
+          return {
+            status: response.status,
+            contentType: response.headers.get("content-type") || "",
+            raw: await response.text(),
+          };
+        } finally {
+          clearTimeout(timeoutId);
+        }
       },
       {
         url,
@@ -955,6 +988,7 @@ export async function requestQwenTextInBrowser(
         headers: browserHeaders,
         body,
         referrer: options.referrer,
+        timeoutMs: options.timeoutMs ?? Math.min(config.timeouts.page, 20_000),
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
@@ -1576,7 +1610,12 @@ export async function syncQwenRequestPersonalization(
   }
 
   // 2. Check DB cache (survives restarts) (skipped on forceSync)
-  if (!bypassCache && syncHash && !cachedHash) {
+  const isEmptyInstruction = instruction.trim().length === 0;
+
+  // 2. Check DB cache (survives restarts) (skipped on forceSync)
+  // For empty instructions, do not blindly trust DB cache without verifying
+  // because external agents or web sessions might have altered personalization.
+  if (!bypassCache && syncHash && !cachedHash && !isEmptyInstruction) {
     const dbHash = getPersonalizationHashFromDb(cacheKey);
     if (dbHash === syncHash) {
       lastSyncedPersonalizationHashes.set(cacheKey, syncHash);
@@ -1585,7 +1624,6 @@ export async function syncQwenRequestPersonalization(
       return true;
     }
   }
-
   let existing = { chars: null, bytes: null, hash: null } as ReturnType<
     typeof textSize
   >;
@@ -1601,7 +1639,9 @@ export async function syncQwenRequestPersonalization(
         );
       currentSettings = existingJson?.data ?? null;
       payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
-      existing = textSize(existingJson?.data?.personalization?.instruction);
+      const existingInstruction = existingJson?.data?.personalization?.instruction;
+      const existingEnabled = existingJson?.data?.personalization?.enable_for_new_chat === true;
+      existing = textSize(existingInstruction);
       const existingSafeSettingsApplied =
         existingJson?.data?.ui?.largeTextAsFile === false &&
         existingJson?.data?.ui?.splitLargeChunks === false &&
@@ -1611,8 +1651,12 @@ export async function syncQwenRequestPersonalization(
         existingJson?.data?.memory?.enable_history_memory === false &&
         existingJson?.data?.tools_enabled?.web_search === false &&
         existingJson?.data?.tools_enabled?.code_interpreter === false;
-      if (existing.hash === sent.hash && existingSafeSettingsApplied) {
-        lastSyncedPersonalizationHashes.set(cacheKey, syncHash);
+      const isEmptyAndCleared =
+        isEmptyInstruction &&
+        (!existingInstruction || existingInstruction.trim().length === 0) &&
+        !existingEnabled;
+      const isContentMatched = existing.hash !== null && existing.hash === sent.hash;
+      if ((isContentMatched || isEmptyAndCleared) && existingSafeSettingsApplied) {
         setPersonalizationHashInDb(cacheKey, syncHash);
         rememberActivePersonalization(
           cacheKey,
@@ -1726,6 +1770,7 @@ export async function syncQwenRequestPersonalization(
     typeof textSize
   >;
 
+  let verifyData: any = null;
   if (config.qwen.personalizationVerifyGet) {
     const { json: verifyJson } =
       await requestQwenPersonalizationInBrowser(
@@ -1734,11 +1779,18 @@ export async function syncQwenRequestPersonalization(
         "/api/v2/users/user/settings",
         requestHeaders,
       );
-    stored = textSize(verifyJson?.data?.personalization?.instruction);
+    verifyData = verifyJson?.data?.personalization;
+    stored = textSize(verifyData?.instruction);
   }
 
-  const matchReturned = returned.hash !== null && returned.hash === sent.hash;
-  const matchStored = stored.hash === null ? null : stored.hash === sent.hash;
+  const matchReturned =
+    (isEmptyInstruction && (!returnedInstruction || returned.chars === 0)) ||
+    (returned.hash !== null && returned.hash === sent.hash);
+  const matchStored =
+    stored.hash === null
+      ? null
+      : (isEmptyInstruction && (!verifyData?.instruction || stored.chars === 0)) ||
+        stored.hash === sent.hash;
   const applied = matchReturned || matchStored === true;
   if (syncHash && applied) {
     lastSyncedPersonalizationHashes.set(cacheKey, syncHash);
@@ -1788,6 +1840,14 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
   ) {
     return;
   }
+  // Defer if the account's Playwright browser is still initializing: the
+  // settings POST requires the page mutex, and init legitimately holds it for
+  // 20-30s (navigation + bx SDK + header capture). Attempting to acquire the
+  // mutex now would time out (5s default in withQwenBrowserPage) and log a
+  // spurious WARN. The startup flow calls us again after init finishes.
+  if (accountId && isPlaywrightInitializing(accountId)) {
+    return;
+  }
   disablingNativeToolsInProgress.add(cacheKey);
 
   try {
@@ -1806,8 +1866,9 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
         const result = await withAccountPage(
           accountId,
           async (page) => {
+            const requestId = crypto.randomUUID();
             const response = await page.evaluate(
-              async ({ payload, timeoutMs }: { payload: any; timeoutMs: number }) => {
+              async ({ payload, timeoutMs, requestId }: { payload: any; timeoutMs: number; requestId: string }) => {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
                 try {
@@ -1818,7 +1879,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
                       headers: {
                         accept: "application/json, text/plain, */*",
                         "content-type": "application/json",
-                        "x-request-id": crypto.randomUUID(),
+                        "x-request-id": requestId,
                         timezone: new Date().toString().split(" (")[0],
                         source: "web",
                       },
@@ -1831,7 +1892,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
                   clearTimeout(timeoutId);
                 }
               },
-              { payload, timeoutMs: config.timeouts.http },
+              { payload, timeoutMs: config.timeouts.http, requestId },
             );
             return response;
           },
@@ -2038,6 +2099,112 @@ export async function deleteAllQwenChats(accountId?: string): Promise<boolean> {
   return true;
 }
 
+export interface RemoteQwenChat {
+  id: string;
+  title: string;
+  updated_at: number | string;
+  created_at: number | string;
+}
+
+/**
+ * Deletes a single chat session by ID on Qwen Web.
+ */
+export async function deleteSingleQwenChat(
+  accountId: string | undefined,
+  chatId: string,
+): Promise<boolean> {
+  if (!chatId) return false;
+
+  if (isAuthMockEnabled()) {
+    const url = qwenUrl(`/api/v2/chats/${encodeURIComponent(chatId)}`);
+    const response = await fetch(url, {
+      method: "DELETE",
+    });
+    removeSessionByChatId(chatId);
+    return response.ok;
+  }
+
+  const requestHeaders: Record<string, string> = {
+    source: "web",
+    version: "0.2.89",
+    timezone: new Date().toString().split(" (")[0],
+    "x-request-id": crypto.randomUUID(),
+    Referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
+  };
+
+  try {
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "DELETE",
+      `/api/v2/chats/${encodeURIComponent(chatId)}`,
+      requestHeaders,
+      undefined,
+      { referrer: qwenUrl(`/c/${encodeURIComponent(chatId)}`), noMutexRecovery: true },
+    );
+
+    const { json: parsed } = await readJsonTextResponse(response, {
+      strict: false,
+    });
+
+    const success = response.ok && parsed?.success === true && parsed?.data?.status === true;
+    if (success) {
+      removeSessionByChatId(chatId);
+    }
+    return success;
+  } catch (error) {
+    logger.debug("[Qwen] deleteSingleQwenChat failed", {
+      accountId,
+      chatId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+/**
+ * Fetch remote chat list from Qwen Web.
+ */
+export async function fetchRemoteQwenChats(
+  accountId?: string,
+): Promise<RemoteQwenChat[]> {
+  if (isAuthMockEnabled()) {
+    try {
+      const response = await fetch(qwenUrl("/api/v2/chats/?page=1&exclude_project=true"));
+      const json: any = await response.json().catch(() => null);
+      if (json?.success && Array.isArray(json.data)) {
+        return json.data;
+      }
+    } catch {}
+    return [];
+  }
+
+  const requestHeaders: Record<string, string> = {
+    version: "0.2.89",
+    timezone: new Date().toString().split(" (")[0],
+    "x-request-id": crypto.randomUUID(),
+    Referer: qwenUrl("/settings/chats"),
+  };
+
+  try {
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "GET",
+      "/api/v2/chats/?page=1&exclude_project=true",
+      requestHeaders,
+      undefined,
+      { referrer: qwenUrl("/settings/chats"), noMutexRecovery: true },
+    );
+    if (!response.ok) return [];
+    const json: any = await response.json().catch(() => null);
+    if (json?.success && Array.isArray(json.data)) {
+      return json.data;
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchQwenModels(
   accountId?: string,
 ): Promise<PublicQwenModel[]> {
@@ -2059,25 +2226,29 @@ export async function fetchQwenModels(
       const result = await withAccountPage(
         accountId,
         async (page) => {
-          const response = await page.evaluate(async (timeoutMs: number) => {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-            try {
-              const resp = await fetch("https://chat.qwen.ai/api/models", {
-                method: "GET",
-                headers: {
-                  accept: "application/json, text/plain, */*",
-                  "x-request-id": crypto.randomUUID(),
-                  timezone: new Date().toString().split(" (")[0],
-                  source: "web",
-                },
-                signal: controller.signal,
-              });
-              return { status: resp.status, body: await resp.text() };
-            } finally {
-              clearTimeout(timeoutId);
-            }
-          }, config.timeouts.http);
+          const requestId = crypto.randomUUID();
+          const response = await page.evaluate(
+            async ({ timeoutMs, requestId }: { timeoutMs: number; requestId: string }) => {
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+              try {
+                const resp = await fetch("https://chat.qwen.ai/api/models", {
+                  method: "GET",
+                  headers: {
+                    accept: "application/json, text/plain, */*",
+                    "x-request-id": requestId,
+                    timezone: new Date().toString().split(" (")[0],
+                    source: "web",
+                  },
+                  signal: controller.signal,
+                });
+                return { status: resp.status, body: await resp.text() };
+              } finally {
+                clearTimeout(timeoutId);
+              }
+            },
+            { timeoutMs: config.timeouts.http, requestId },
+          );
           return response;
         },
       );
@@ -2777,10 +2948,7 @@ async function createQwenStreamInternal(
     chatId: chatSessionId || null,
     parentId: actualParentId ?? "",
     chat_id: chatSessionId || null,
-    chat_mode:
-      options?.chatMode === "temp" || options?.chatMode === "temp-thread"
-        ? "local"
-        : "normal",
+    chat_mode: isLocalChatMode(options?.chatMode) ? "local" : "normal",
     model: model,
     parent_id: actualParentId,
     messages: [
@@ -2814,7 +2982,7 @@ async function createQwenStreamInternal(
             auto_thinking: mode === "auto",
             thinking_mode: thinkingMode,
             ...(thinkingEnabled ? { thinking_format: "summary" } : {}),
-            auto_search: true,
+            auto_search: false,
           };
         })(),
         extra: {
@@ -3046,19 +3214,6 @@ async function createQwenStreamInternal(
         const preview = await readResponsePreview(response);
         const htmlBody = isHtmlResponseBody(preview);
         const antiBotChallenge = isWafChallengeResponse(preview);
-        logger.warn(
-          htmlBody || isHtmlResponseContentType(responseContentType)
-            ? "[Qwen] Completion returned HTML instead of SSE"
-            : "[Qwen] Completion returned a non-SSE body",
-          {
-            accountId: accountId ?? "global",
-            chatId: chatSessionId ?? "new",
-            status: response.status,
-            contentType: responseContentType,
-            antiBotChallenge,
-            previewBytes: Buffer.byteLength(preview, "utf8"),
-          },
-        );
 
         if (
           antiBotChallenge &&
@@ -3079,6 +3234,19 @@ async function createQwenStreamInternal(
           continue;
         }
 
+        logger.warn(
+          htmlBody || isHtmlResponseContentType(responseContentType)
+            ? "[Qwen] Completion returned HTML instead of SSE"
+            : "[Qwen] Completion returned a non-SSE body",
+          {
+            accountId: accountId ?? "global",
+            chatId: chatSessionId ?? "new",
+            status: response.status,
+            contentType: responseContentType,
+            antiBotChallenge,
+            previewBytes: Buffer.byteLength(preview, "utf8"),
+          },
+        );
         throw withCreatedChatMetadata(
           new QwenUpstreamError(
             antiBotChallenge
@@ -3123,16 +3291,6 @@ async function createQwenStreamInternal(
         const htmlResponse = isHtmlResponseBody(errText);
         const antiBotChallenge = isWafChallengeResponse(errText);
         if (antiBotChallenge || htmlResponse) {
-          logger.warn(
-            "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.",
-            {
-              accountId: accountId ?? "global",
-              chatId: chatSessionId ?? "new",
-              antiBotChallenge,
-              previewBytes: Buffer.byteLength(errText, "utf8"),
-            },
-          );
-
           if (
             antiBotChallenge &&
             (await retryAfterCaptchaRecovery(
@@ -3152,6 +3310,15 @@ async function createQwenStreamInternal(
             continue;
           }
 
+          logger.warn(
+            "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.",
+            {
+              accountId: accountId ?? "global",
+              chatId: chatSessionId ?? "new",
+              antiBotChallenge,
+              previewBytes: Buffer.byteLength(errText, "utf8"),
+            },
+          );
           throw withCreatedChatMetadata(
             new QwenUpstreamError(
               antiBotChallenge

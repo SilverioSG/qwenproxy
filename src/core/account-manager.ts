@@ -101,7 +101,7 @@ export function clearAllAccountCooldowns(): number {
       count++;
     }
   }
-  cooldowns.delete("global");
+  cooldowns.clear();
   return count;
 }
 

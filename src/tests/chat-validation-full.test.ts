@@ -15,8 +15,11 @@ function mockContext(body: unknown): any {
   return {
     req: {
       json: async () => body,
-      header: (name: string) =>
-        name === "x-request-id" ? "req-test-1" : "test-agent",
+      header: (name: string) => {
+        if (name === "x-request-id") return "req-test-1";
+        if (name === "user-agent") return "test-agent";
+        return undefined;
+      },
     },
   };
 }
@@ -376,6 +379,24 @@ test("parseRequestBody builds tool instructions and logs forced tool_choice", as
   );
   assert.ok(parsed.shouldParseToolCalls);
   assert.ok(parsed.toolInstructions.includes("alpha"));
+});
+
+test("parseRequestBody suppresses tool instructions when tool_choice is 'none'", async () => {
+  const parsed = await parseRequestBody(
+    mockContext({
+      model: "qwen3.7-plus",
+      messages: [{ role: "user", content: "talk without tools" }],
+      tools: [
+        {
+          type: "function",
+          function: { name: "alpha", parameters: { type: "object" } },
+        },
+      ],
+      tool_choice: "none",
+    }),
+  );
+  assert.strictEqual(parsed.shouldParseToolCalls, false);
+  assert.strictEqual(parsed.toolInstructions, "");
 });
 
 // ── reasoning_effort (OpenAI chat spec: none|minimal|low|medium|high|xhigh|max)

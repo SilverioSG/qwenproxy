@@ -62,3 +62,19 @@ test("deriveSessionId: empty messages array produces valid hash", () => {
   const id = deriveSessionId([], "");
   assert.match(id, /^sess_[a-f0-9]{16}$/);
 });
+
+test("deriveSessionId: implicit-thread with different system prompts produces different IDs", () => {
+  // Cross-project isolation: two projects sending the same first user message
+  // but different system prompts must not collide on the same session ID.
+  const messages: Message[] = [msg("user", "Hello")];
+  const id1 = deriveSessionId(messages, "You are a Python expert", "implicit-thread");
+  const id2 = deriveSessionId(messages, "You are a Rust expert", "implicit-thread");
+  assert.notEqual(id1, id2);
+});
+
+test("deriveSessionId: implicit-thread with same system prompt is stable", () => {
+  const messages: Message[] = [msg("user", "Hello")];
+  const id1 = deriveSessionId(messages, "system instructions", "implicit-thread");
+  const id2 = deriveSessionId(messages, "system instructions", "implicit-thread");
+  assert.equal(id1, id2);
+});

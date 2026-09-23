@@ -20,8 +20,9 @@ import {
   handleChatCompletionsError,
   type AssistantCompleteEvent,
 } from "./streaming.ts";
-import { config, type ChatMode } from "../../core/config.ts";
+import { config, type ChatMode, normalizeChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
+import { metrics } from "../../core/metrics.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
@@ -63,11 +64,20 @@ function formatTimingHeader(timings: Record<string, number>): string {
  * else silently uses the configured default.
  */
 function resolveChatMode(headerValue: string | undefined): ChatMode {
-  if (headerValue === "thread" || headerValue === "temp" || headerValue === "temp-thread") {
-    return headerValue;
-  }
-  if (headerValue === "temp_thread") {
-    return "temp-thread";
+  if (headerValue) {
+    const m = headerValue.trim().toLowerCase().replace(/_/g, "-");
+    if (
+      m === "thread" ||
+      m === "thread-temp" ||
+      m === "temp-thread" ||
+      m === "stateless" ||
+      m === "stateles" ||
+      m === "stateless-temp" ||
+      m === "stateles-temp" ||
+      m === "temp"
+    ) {
+      return normalizeChatMode(m);
+    }
   }
   return config.qwen.chatMode;
 }
@@ -337,6 +347,11 @@ export async function chatCompletions(c: Context) {
     console.log(
       `📤 [${routeLabel}] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? fullPromptForRequest.length : finalPrompt.length} chars${replayed ? " | full-replay" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
     );
+    if (replayed || !ctx.existingThread) {
+      metrics.increment("requests.full");
+    } else {
+      metrics.increment("requests.delta");
+    }
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
 

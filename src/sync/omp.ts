@@ -1,22 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ClientSyncResult, SyncOptions } from "./types.ts";
-import { createTimestampBackup, restoreFromBackup } from "./utils.ts";
+import { createTimestampBackup, restoreFromBackup, formatModelDisplayName } from "./utils.ts";
 
 function buildOmpProviderYaml(
   baseUrl: string,
   apiKey: string,
   primaryModel: string = "qwen3.8-max",
+  models?: string[],
 ): string {
-  const modelList = [primaryModel];
-  if (primaryModel !== "qwen3.7-plus") {
-    modelList.push("qwen3.7-plus");
-  }
-
+  const modelList = Array.from(
+    new Set([primaryModel, ...(models && models.length > 0 ? models : [primaryModel, "qwen3.7-plus"])].filter(Boolean)),
+  );
   const formattedModels = modelList
     .map(
       (m) => `      - id: ${m}
-        name: ${m === "qwen3.8-max" ? "Qwen3.8-Max" : m === "qwen3.7-plus" ? "Qwen3.7-Plus" : m}
+        name: ${formatModelDisplayName(m).replace(/\s+/g, "")}
         input: [text, image]
         contextWindow: 1000000
         maxTokens: 131072
@@ -41,7 +40,7 @@ ${formattedModels}
 }
 
 export function syncOmp(options: SyncOptions): ClientSyncResult {
-  const { filePath, apiKey, baseUrl, model = "qwen3.8-max" } = options;
+  const { filePath, apiKey, baseUrl, model = "qwen3.8-max", models } = options;
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
@@ -53,8 +52,7 @@ export function syncOmp(options: SyncOptions): ClientSyncResult {
       content = fs.readFileSync(filePath, "utf-8");
     }
 
-    const providerBlock = buildOmpProviderYaml(baseUrl, apiKey, model);
-
+    const providerBlock = buildOmpProviderYaml(baseUrl, apiKey, model, models);
     if (!content.trim()) {
       content = `providers:\n${providerBlock}`;
     } else {
@@ -99,13 +97,32 @@ export function syncOmp(options: SyncOptions): ClientSyncResult {
 }
 
 export function restoreOmp(filePath: string, backupPath?: string): ClientSyncResult {
-  const restored = restoreFromBackup(filePath, backupPath);
+  const restoredFromBackup = restoreFromBackup(filePath, backupPath);
+
+  let manuallyCleaned = false;
+  if (fs.existsSync(filePath)) {
+    try {
+      let content = fs.readFileSync(filePath, "utf-8");
+      if (content.includes("qwenproxy:")) {
+        const regex = /^\s*qwenproxy:\s*\r?\n(?:^[ \t].*\r?\n?)*/m;
+        content = content.replace(regex, "");
+        fs.writeFileSync(filePath, content, "utf-8");
+        manuallyCleaned = true;
+      }
+    } catch {}
+  }
+
+  const success = restoredFromBackup || manuallyCleaned;
   return {
     client: "omp",
     filePath,
     backupPath,
-    success: restored,
-    action: restored ? "restored" : "failed",
-    message: restored ? "Restored OMP models config from backup" : "Backup file not found",
+    success,
+    action: success ? "restored" : "failed",
+    message: success
+      ? restoredFromBackup
+        ? "Restored OMP models config from backup"
+        : "Removed QwenProxy configuration from OMP config"
+      : "Backup file not found",
   };
 }

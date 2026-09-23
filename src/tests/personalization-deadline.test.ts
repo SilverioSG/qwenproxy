@@ -24,14 +24,27 @@ test("Personalization Deadline: cold or undefined account gets at least 60s for 
   assert.equal(deadlineLargeNav, 90_000);
 });
 
-test("Personalization Deadline: returns standard 30s when account is warm / initialized in Playwright", () => {
+test("Personalization Deadline: returns standard 45s when account is warm and recently active", () => {
   const warmAccountId = "test-warm-acc-" + Date.now();
   try {
     registerPlaywrightAccountForTests(warmAccountId, {} as any, Date.now());
     const deadlineWarm = computePersonalizationDeadlineMs(warmAccountId, 60_000);
     assert.equal(deadlineWarm, PERSONALIZATION_SYNC_DEADLINE_MS);
-    assert.equal(deadlineWarm, 30_000);
+    assert.equal(deadlineWarm, 45_000);
   } finally {
     unregisterPlaywrightAccountForTests(warmAccountId);
+  }
+});
+
+test("Personalization Deadline: returns 60s when initialized account has been dormant (> 5min)", () => {
+  const dormantAccountId = "test-dormant-acc-" + Date.now();
+  try {
+    // Registered 10 minutes ago
+    registerPlaywrightAccountForTests(dormantAccountId, {} as any, Date.now() - 10 * 60 * 1000);
+    const deadlineDormant = computePersonalizationDeadlineMs(dormantAccountId, 60_000);
+    assert.equal(deadlineDormant, COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS);
+    assert.equal(deadlineDormant, 60_000);
+  } finally {
+    unregisterPlaywrightAccountForTests(dormantAccountId);
   }
 });

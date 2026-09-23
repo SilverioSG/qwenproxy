@@ -139,28 +139,32 @@ test("/pool/stats shape is derived from real pool state", async () => {
   }
 });
 
-test("/metrics/monitor uses real counters and marks gaps explicitly", async () => {
+test("/metrics/monitor empty ring is zero AI requests, not HTTP counters", async () => {
+  const { resetDashboardStatsForTesting } = await import(
+    "../core/dashboard-stats.ts"
+  );
+  resetDashboardStatsForTesting();
   const res = await get("/metrics/monitor");
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
     totals: Record<string, number | null>;
-    capabilities: Record<string, boolean>;
+    capabilities: Record<string, boolean | string>;
     accounts: unknown[];
     topErrors: unknown[];
+    modeComparison: { streaming: unknown; nonStreaming: unknown };
   };
-  assert.equal(typeof body.totals.totalRequests, "number");
-  assert.equal(typeof body.totals.totalErrors, "number");
-  assert.equal(
-    body.totals.totalSuccess,
-    (body.totals.totalRequests as number) -
-      (body.totals.totalErrors as number),
-  );
+  assert.equal(body.totals.totalRequests, 0);
+  assert.equal(body.totals.totalErrors, 0);
+  assert.equal(body.totals.totalSuccess, 0);
   assert.equal(body.totals.p95LatencyMs, null);
   assert.equal(body.totals.medianLatencyMs, null);
   assert.deepEqual(body.accounts, []);
   assert.deepEqual(body.topErrors, []);
-  assert.equal(body.capabilities.perAccount, false);
-  assert.equal(body.capabilities.percentiles, false);
+  assert.equal(body.modeComparison.streaming, null);
+  assert.equal(body.modeComparison.nonStreaming, null);
+  assert.equal(body.capabilities.perAccount, true);
+  assert.equal(body.capabilities.percentiles, true);
+  assert.match(String(body.capabilities.window), /Last 1000 logical AI requests/);
 });
 
 test("/metrics/model-health returns honest empty shape", async () => {
@@ -280,13 +284,19 @@ test("account add validates input and duplicates", async () => {
   );
 });
 
-test("existing /health contract is unchanged", async () => {
+test("unauthenticated /health is the public subset; metrics require auth", async () => {
   const res = await get("/health", false);
   assert.equal(res.status, 200);
   const body = (await res.json()) as Record<string, unknown>;
-  for (const key of ["status", "timestamp", "metrics"]) {
-    assert.ok(key in body, `missing ${key}`);
-  }
+  assert.equal(typeof body.status, "string");
+  assert.equal(typeof body.timestamp, "number");
+  assert.equal(body.metrics, undefined);
+
+  const authed = await get("/health");
+  assert.equal(authed.status, 200);
+  const authedBody = (await authed.json()) as Record<string, unknown>;
+  assert.equal(typeof authedBody.metrics, "object");
+  assert.ok(authedBody.metrics);
 });
 
 test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveContext", async () => {

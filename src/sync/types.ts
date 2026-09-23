@@ -1,7 +1,20 @@
+export type SyncClientName =
+  | "claude-code"
+  | "codex"
+  | "opencode"
+  | "omp"
+  | "hermes"
+  | "openclaw"
+  | "kilo"
+  | "cline"
+  | "zed"
+  | "aider";
+
 export interface ClientSyncResult {
-  client: "claude-code" | "codex" | "opencode" | "omp";
+  client: SyncClientName;
   filePath: string;
   backupPath?: string;
+  extraBackupPath?: string;
   success: boolean;
   action: "updated" | "created" | "skipped" | "restored" | "failed";
   message?: string;
@@ -13,7 +26,10 @@ export interface SyncOptions {
   apiKey: string;
   baseUrl: string;
   model?: string;
+  models?: string[];
   setActive?: boolean;
+  reasoningEffort?: "low" | "medium" | "high" | "none";
+  modelSettingsPath?: string;
 }
 
 export interface SyncAllOptions {
@@ -22,15 +38,23 @@ export interface SyncAllOptions {
   host?: string;
   setActive?: boolean;
   stateFilePath?: string;
-  targets?: ("claude-code" | "codex" | "opencode" | "omp")[];
+  targets?: SyncClientName[];
+  model?: string;
+  models?: string[];
+  syncAllModels?: boolean;
   customPaths?: {
     claudeCode?: string;
     codex?: string;
     openCode?: string;
     omp?: string;
+    hermes?: string;
+    openClaw?: string;
+    kilo?: string;
+    cline?: string;
+    zed?: string;
+    aider?: string;
   };
 }
-
 export interface SyncRecord {
   filePath: string;
   backupPath: string;
@@ -49,5 +73,11 @@ export interface SyncStateFile {
     codex?: SyncRecord;
     openCode?: SyncRecord;
     omp?: SyncRecord;
+    hermes?: SyncRecord;
+    openClaw?: SyncRecord;
+    kilo?: SyncRecord;
+    cline?: SyncRecord;
+    zed?: SyncRecord;
+    aider?: SyncRecord;
   };
 }

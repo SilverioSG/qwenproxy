@@ -113,6 +113,29 @@ export function formatThinkingSummaryContent(delta: any): string {
   return sections.join("\n\n");
 }
 
+/**
+ * Matches thinking phases verified in upstream Qwen Web HAR:
+ * - "thinking_summary": structured thinking in Qwen Max / Plus
+ * - "think": incremental thinking deltas in Qwen Omni
+ */
+export function isThinkingPhase(phase: unknown): boolean {
+  return phase === "think" || phase === "thinking_summary";
+}
+
+/**
+ * Extract thinking/reasoning text from a delta chunk, supporting both
+ * structured summaries (summary_title/summary_thought) and direct content deltas.
+ */
+export function extractThinkingContent(delta: any): string {
+  if (
+    Array.isArray(delta?.extra?.summary_title?.content) ||
+    Array.isArray(delta?.extra?.summary_thought?.content)
+  ) {
+    return formatThinkingSummaryContent(delta);
+  }
+  return typeof delta?.content === "string" ? delta.content : "";
+}
+
 export function isAbortError(err: unknown): boolean {
   if (err instanceof DOMException) {
     return err.name === "AbortError";

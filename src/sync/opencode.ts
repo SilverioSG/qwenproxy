@@ -1,27 +1,22 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ClientSyncResult, SyncOptions } from "./types.ts";
-import { createTimestampBackup, restoreFromBackup } from "./utils.ts";
+import { createTimestampBackup, restoreFromBackup, formatModelDisplayName } from "./utils.ts";
 
 function buildOpenCodeProviderObject(
   baseUrl: string,
   apiKey: string,
   primaryModel: string = "qwen3.8-max",
+  models?: string[],
 ): Record<string, any> {
   const modelsObj: Record<string, any> = {};
-  const modelList = [primaryModel];
-  if (primaryModel !== "qwen3.7-plus") {
-    modelList.push("qwen3.7-plus");
-  }
+  const modelList = Array.from(
+    new Set([primaryModel, ...(models && models.length > 0 ? models : [primaryModel, "qwen3.7-plus"])].filter(Boolean)),
+  );
 
   for (const m of modelList) {
     modelsObj[m] = {
-      name:
-        m === "qwen3.8-max"
-          ? "Qwen 3.8 Max"
-          : m === "qwen3.7-plus"
-            ? "Qwen 3.7 Plus"
-            : m,
+      name: formatModelDisplayName(m),
       limit: { context: 1048576, output: 65536 },
       modalities: { input: ["text", "image"], output: ["text"] },
       reasoning: true,
@@ -126,9 +121,34 @@ function findKeyObjectSpan(content: string, key: string): { start: number; end: 
   return null;
 }
 
+function openCodeModelId(model: string): string {
+  return `qwenproxy/${model}`;
+}
+
+function applyOpenCodeActiveModel(
+  content: string,
+  model: string,
+  setActive: boolean,
+): string {
+  if (!setActive) return content;
+  const id = openCodeModelId(model);
+  if (/"model"\s*:/.test(content)) {
+    return content.replace(/"model"\s*:\s*("[^"]*"|'[^']*')/, `"model": "${id}"`);
+  }
+  return content.replace(/\{/, `{\n  "model": "${id}",`);
+}
+
 export function syncOpenCode(options: SyncOptions): ClientSyncResult {
-  const { filePath, apiKey, baseUrl, model = "qwen3.8-max" } = options;
+  const {
+    filePath,
+    apiKey,
+    baseUrl,
+    model = "qwen3.8-max",
+    models,
+    setActive = true,
+  } = options;
   try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
     let backupPath: string | undefined;
     let content = "";
 
@@ -137,7 +157,7 @@ export function syncOpenCode(options: SyncOptions): ClientSyncResult {
       content = fs.readFileSync(filePath, "utf-8");
     }
 
-    const providerObj = buildOpenCodeProviderObject(baseUrl, apiKey, model);
+    const providerObj = buildOpenCodeProviderObject(baseUrl, apiKey, model, models);
     const providerJson = JSON.stringify(providerObj, null, 6)
       .split("\n")
       .map((line, idx) => (idx === 0 ? line : `    ${line}`))
@@ -146,11 +166,14 @@ export function syncOpenCode(options: SyncOptions): ClientSyncResult {
     const qwenEntry = `    "qwenproxy": ${providerJson}`;
 
     if (!content.trim()) {
-      const initial = {
+      const initial: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
-        provider: {
-          qwenproxy: providerObj,
-        },
+      };
+      if (setActive) {
+        initial.model = openCodeModelId(model);
+      }
+      initial.provider = {
+        qwenproxy: providerObj,
       };
       fs.writeFileSync(filePath, JSON.stringify(initial, null, 2) + "\n", "utf-8");
     } else {
@@ -183,7 +206,11 @@ export function syncOpenCode(options: SyncOptions): ClientSyncResult {
           }
         }
       }
-      fs.writeFileSync(filePath, content, "utf-8");
+      fs.writeFileSync(
+        filePath,
+        applyOpenCodeActiveModel(content, model, setActive),
+        "utf-8",
+      );
     }
 
     return {
@@ -206,13 +233,37 @@ export function syncOpenCode(options: SyncOptions): ClientSyncResult {
 }
 
 export function restoreOpenCode(filePath: string, backupPath?: string): ClientSyncResult {
-  const restored = restoreFromBackup(filePath, backupPath);
+  const restoredFromBackup = restoreFromBackup(filePath, backupPath);
+
+  let manuallyCleaned = false;
+  if (fs.existsSync(filePath)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      if (data.provider && data.provider.qwenproxy) {
+        delete data.provider.qwenproxy;
+        if (data.model && data.model.includes("qwen")) {
+          delete data.model;
+        }
+        if (Object.keys(data.provider).length === 0) {
+          delete data.provider;
+        }
+        fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+        manuallyCleaned = true;
+      }
+    } catch {}
+  }
+
+  const success = restoredFromBackup || manuallyCleaned;
   return {
     client: "opencode",
     filePath,
     backupPath,
-    success: restored,
-    action: restored ? "restored" : "failed",
-    message: restored ? "Restored OpenCode config from backup" : "Backup file not found",
+    success,
+    action: success ? "restored" : "failed",
+    message: success
+      ? restoredFromBackup
+        ? "Restored OpenCode config from backup"
+        : "Removed QwenProxy configuration from OpenCode config"
+      : "Backup file not found",
   };
 }

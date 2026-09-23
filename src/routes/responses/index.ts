@@ -65,11 +65,16 @@ app.post("/v1/responses", async (c) => {
       historyMessages = history;
     }
 
+    const responsesSessionId =
+      c.req.header("session-id") ||
+      c.req.header("x-session-id") ||
+      c.req.header("x-client-request-id") ||
+      (req as any).prompt_cache_key ||
+      (typeof (body as any)?.session_id === "string" ? (body as any).session_id : undefined);
     // Convert to Chat Completions format
     const chatRequest = responsesToChatCompletions(req, historyMessages);
 
     if (isStream) {
-      // ============ STREAMING MODE ============
       const socket =
         (c.env as any)?.incoming?.socket || (c.req.raw as any)?.socket;
       if (socket && typeof socket.setNoDelay === "function") {
@@ -136,9 +141,14 @@ app.post("/v1/responses", async (c) => {
                   "Content-Type": "application/json",
                   Authorization: `Bearer ${process.env.API_KEY || config.apiKey || ""}`,
                   "x-qwenproxy-route": "Responses",
+                  ...(c.req.header("x-qwenproxy-chat-mode")
+                    ? { "x-qwenproxy-chat-mode": c.req.header("x-qwenproxy-chat-mode")! }
+                    : {}),
+                  ...(responsesSessionId ? { "session-id": responsesSessionId, "x-session-id": responsesSessionId } : {}),
                 },
                 body: JSON.stringify({
                   ...chatRequest,
+                  ...(responsesSessionId ? { session_id: responsesSessionId } : {}),
                   stream: true,
                   stream_options: { include_usage: true },
                 }),
@@ -300,19 +310,17 @@ app.post("/v1/responses", async (c) => {
             "Content-Type": "application/json",
             Authorization: `Bearer ${process.env.API_KEY || config.apiKey || ""}`,
             "x-qwenproxy-route": "Responses",
+            ...(c.req.header("x-qwenproxy-chat-mode")
+              ? { "x-qwenproxy-chat-mode": c.req.header("x-qwenproxy-chat-mode")! }
+              : {}),
+            ...(responsesSessionId ? { "session-id": responsesSessionId, "x-session-id": responsesSessionId } : {}),
           },
-          body: JSON.stringify(chatRequest),
+          body: JSON.stringify({
+            ...chatRequest,
+            ...(responsesSessionId ? { session_id: responsesSessionId } : {}),
+          }),
         },
       );
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[Responses] Upstream error: ${response.status} ${errorText}`,
-        );
-        return responsesError(c, "api_error", "Upstream service error", 502);
-      }
-
       const chatResponse = await response.json();
       const responsesResponse = chatCompletionsToResponses(
         chatResponse,

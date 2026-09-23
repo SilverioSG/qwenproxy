@@ -97,6 +97,18 @@ app.post("/v1/messages", async (c) => {
   try {
     // 3. Translate Anthropic request to internal OpenAI format
     const openaiRequest = translateAnthropicToOpenAI(body);
+    const claudeSessionId =
+      c.req.header("x-claude-code-session-id") ||
+      (typeof body.metadata?.user_id === "string" && body.metadata.user_id.includes('"session_id":')
+        ? (() => {
+            try {
+              const parsed = JSON.parse(body.metadata.user_id as string);
+              return typeof parsed?.session_id === "string" ? parsed.session_id : undefined;
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined);
 
     const dispatchToChat = (streamMode: boolean) =>
       fetch(`http://127.0.0.1:${config.server.port}/v1/chat/completions`, {
@@ -105,9 +117,14 @@ app.post("/v1/messages", async (c) => {
           "Content-Type": "application/json",
           Authorization: `Bearer ${process.env.API_KEY || config.apiKey || ""}`,
           "x-qwenproxy-route": "Anthropic",
+          ...(c.req.header("x-qwenproxy-chat-mode")
+            ? { "x-qwenproxy-chat-mode": c.req.header("x-qwenproxy-chat-mode")! }
+            : {}),
+          ...(claudeSessionId ? { "x-session-id": claudeSessionId } : {}),
         },
         body: JSON.stringify({
           ...openaiRequest,
+          ...(claudeSessionId ? { session_id: claudeSessionId } : {}),
           stream: streamMode,
           ...(streamMode ? { stream_options: { include_usage: true } } : {}),
         }),
@@ -244,7 +261,18 @@ app.post("/v1/messages", async (c) => {
             `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
           );
         } catch (error: any) {
-          console.error("❌ [Anthropic] Stream error:", error?.message || error);
+          const isClientAbort =
+            c.req.raw.signal.aborted ||
+            error?.name === "AbortError" ||
+            error?.code === "ECONNRESET" ||
+            (typeof error?.message === "string" &&
+              (error.message.includes("prematurely closed") ||
+                error.message.includes("aborted") ||
+                error.message.includes("canceled") ||
+                error.message.includes("cancelled")));
+          if (!isClientAbort) {
+            console.error("❌ [Anthropic] Stream error:", error?.message || error);
+          }
           try {
             await write(
               `event: error\ndata: ${JSON.stringify({

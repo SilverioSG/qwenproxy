@@ -376,6 +376,43 @@ export function clearAllSessionsForAccount(accountId: string): void {
   );
 }
 
+/**
+ * Returns true if a chatSessionId is currently actively bound to any non-expired session.
+ * Prevents auto-cleanup routines from deleting conversations currently in use.
+ */
+export function isChatSessionActive(chatId: string): boolean {
+  if (!chatId) return false;
+  const now = Date.now();
+  for (const entry of logicalThreadStates.values()) {
+    if (entry.chatSessionId === chatId && now - entry.timestamp <= SESSION_TTL_MS) {
+      return true;
+    }
+  }
+  const sessionEntry = sessionStates.get(chatId);
+  if (sessionEntry && now - sessionEntry.timestamp <= SESSION_TTL_MS) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Invalidate and remove all local cached/database records for a given chatId.
+ */
+export function removeSessionByChatId(chatId: string): void {
+  if (!chatId) return;
+  sessionStates.delete(chatId);
+  for (const [key, entry] of logicalThreadStates.entries()) {
+    if (entry.chatSessionId === chatId) {
+      logicalThreadStates.delete(key);
+      logicalThreadDirty.delete(key);
+    }
+  }
+  try {
+    const db = getDatabase();
+    db.prepare("DELETE FROM logical_thread_states WHERE chat_session_id = ?").run(chatId);
+  } catch {}
+}
+
 export function getSessionParent(
   sessionId: string,
   accountId?: string,

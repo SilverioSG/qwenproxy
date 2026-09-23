@@ -11,6 +11,7 @@ import { updateLogicalThreadState } from "../services/qwen.ts";
 import { deriveSessionId } from "../utils/session-id.ts";
 import {
   clearAccountCooldown,
+  clearAllAccountCooldowns,
   getAccountCooldownInfo,
 } from "../core/account-manager.ts";
 import { config } from "../core/config.ts";
@@ -379,6 +380,7 @@ test("Chat Completions returns explicit error for non-SSE upstream JSON errors",
     );
   } finally {
     clearAccountCooldown("mock-account");
+    clearAllAccountCooldowns();
     globalThis.fetch = originalFetch;
     await Promise.resolve();
   }
@@ -433,6 +435,7 @@ test("Chat Completions returns explicit error for stream=true upstream JSON erro
     );
   } finally {
     clearAccountCooldown("mock-account");
+    clearAllAccountCooldowns();
     globalThis.fetch = originalFetch;
     await Promise.resolve();
   }
@@ -646,6 +649,20 @@ test("API Key protection", async () => {
       401,
       "Should return 401 Unauthorized with wrong API Key",
     );
+
+    const logsDenied = await app.fetch(new Request("http://localhost/logs"));
+    assert.strictEqual(logsDenied.status, 401, "logs require API key");
+    const logsOk = await app.fetch(
+      new Request("http://localhost/logs", {
+        headers: { Authorization: "Bearer test-api-key" },
+      }),
+    );
+    assert.strictEqual(logsOk.status, 200, "logs accept valid API key");
+
+    const healthPublic = await app.fetch(new Request("http://localhost/health"));
+    const healthPublicBody = await healthPublic.json();
+    assert.strictEqual(healthPublic.status, 200);
+    assert.equal(healthPublicBody.readyAccounts, undefined);
 
     // 3. Test request with correct API Key
     const originalFetch = globalThis.fetch;

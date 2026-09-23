@@ -30,12 +30,17 @@ export function looksLikeAntiBotChallengeText(text: string): boolean {
     lower.includes("nocaptcha") ||
     lower.includes("captcha") ||
     lower.includes("aliyuncaptcha") ||
+    lower.includes("aliyun_waf") ||
+    lower.includes("cf_app_waf") ||
+    lower.includes("sec.alibaba.com") ||
     lower.includes("baxia") ||
     lower.includes("access verification") ||
     lower.includes("security verification") ||
     lower.includes("verify you are human") ||
     lower.includes("human verification") ||
-    lower.includes("denyfromx5")
+    lower.includes("denyfromx5") ||
+    /^\s*<!doctype\s+html/i.test(text || "") ||
+    /^\s*<html\b/i.test(text || "")
   );
 }
 
@@ -116,7 +121,7 @@ export function logMediaDebug(message: string): void {
 }
 
 export function logMediaWarn(message: string): void {
-  console.warn(`⚠️  ${message}`);
+  console.warn(`⚠️ ${message}`);
 }
 
 export function logMediaError(message: string): void {
@@ -658,7 +663,7 @@ async function requestCompletionsWithBrowserFallback(params: {
         headers,
         referrer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
         streaming,
-        timeoutMs: Math.min(timeoutMs, IMAGE_TIMEOUT_MS),
+        timeoutMs: Math.min(timeoutMs, kind === "video" ? VIDEO_TIMEOUT_MS : IMAGE_TIMEOUT_MS),
       });
 
       if (browserResult.error) {
@@ -763,7 +768,7 @@ async function createMediaChatSession(
           },
           {
             url: qwenUrl("/api/v2/chats/new"),
-            headers: buildHeadersFromCaptured(headers),
+            headers: filterHeadersForBrowserFetch(buildHeadersFromCaptured(headers)),
             body: JSON.stringify({
               title,
               models: [chatModel],
@@ -774,15 +779,24 @@ async function createMediaChatSession(
             }),
           },
         );
+        const rawText = String(result.rawText || "");
+        if (looksLikeAntiBotChallengeText(rawText)) {
+          const error = new UpstreamError(
+            `Qwen anti-bot validation required: ${chatType} chat creation blocked by WAF (FAIL_SYS_USER_VALIDATE)`,
+          ) as UpstreamError & { upstreamCode: string; challengeBody?: string };
+          error.upstreamCode = "FAIL_SYS_USER_VALIDATE";
+          error.challengeBody = rawText;
+          throw error;
+        }
         if (!result.ok) {
           throw new UpstreamError(
-            `Failed to create ${chatType} chat session: ${result.status} ${String(result.rawText).substring(0, 200)}`,
+            `Failed to create ${chatType} chat session: ${result.status} ${rawText.substring(0, 200)}`,
           );
         }
         const chatId = result.data?.data?.id || result.data?.data?.chat_id || result.data?.id;
         if (!chatId) {
           throw new UpstreamError(
-            `Upstream created ${chatType} chat without returning a chat ID`,
+            `Upstream created ${chatType} chat without returning a chat ID: ${rawText.substring(0, 200)}`,
           );
         }
         return chatId;
@@ -803,15 +817,26 @@ async function createMediaChatSession(
     }),
     signal,
   });
-
+  const text = await response.text().catch(() => "");
+  if (looksLikeAntiBotChallengeText(text)) {
+    const error = new UpstreamError(
+      `Qwen anti-bot validation required: ${chatType} chat creation blocked by WAF (FAIL_SYS_USER_VALIDATE)`,
+    ) as UpstreamError & { upstreamCode: string; challengeBody?: string };
+    error.upstreamCode = "FAIL_SYS_USER_VALIDATE";
+    error.challengeBody = text;
+    throw error;
+  }
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
     throw new UpstreamError(
       `Failed to create ${chatType} chat session: ${response.status} ${text.substring(0, 200)}`,
     );
   }
 
-  const json = await response.json();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {}
+
   const chatId =
     json?.chat_id ||
     json?.id ||
@@ -821,7 +846,7 @@ async function createMediaChatSession(
 
   if (!chatId || typeof chatId !== "string") {
     throw new UpstreamError(
-      `Unexpected response when creating ${chatType} chat session`,
+      `Unexpected response when creating ${chatType} chat session: ${text.substring(0, 200)}`,
     );
   }
 
@@ -1248,8 +1273,12 @@ export async function generateImage(params: {
         }),
       );
 
+      const isCaptcha =
+        isAntiBotError(lastError) ||
+        looksLikeAntiBotChallengeText(lastError.message);
+
       if (
-        isAntiBotError(lastError) &&
+        isCaptcha &&
         !captchaRecoveredAccounts.has(account.id)
       ) {
         logMediaInfo(
@@ -1257,7 +1286,12 @@ export async function generateImage(params: {
             account: shortMediaId(account.id),
           }),
         );
-        const recovered = await recoverBaxiaCaptcha(account.id, "media-generation");
+        const challengeBody = (lastError as any)?.challengeBody;
+        const recovered = await recoverBaxiaCaptcha(
+          account.id,
+          "media-generation",
+          challengeBody ? { challengeBody } : {},
+        );
         if (recovered) {
           captchaRecoveredAccounts.add(account.id);
           clearAccountCooldown(account.id);
@@ -1484,8 +1518,12 @@ export async function generateVideo(params: {
         }),
       );
 
+      const isCaptcha =
+        isAntiBotError(lastError) ||
+        looksLikeAntiBotChallengeText(lastError.message);
+
       if (
-        isAntiBotError(lastError) &&
+        isCaptcha &&
         !captchaRecoveredAccounts.has(account.id)
       ) {
         logMediaInfo(
@@ -1493,9 +1531,11 @@ export async function generateVideo(params: {
             account: shortMediaId(account.id),
           }),
         );
+        const challengeBody = (lastError as any)?.challengeBody;
         const recovered = await recoverBaxiaCaptcha(
           account.id,
           "media-generation",
+          challengeBody ? { challengeBody } : {},
         );
         if (recovered) {
           captchaRecoveredAccounts.add(account.id);

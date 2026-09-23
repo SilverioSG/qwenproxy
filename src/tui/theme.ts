@@ -18,6 +18,7 @@ export const ANSI = {
   exitAltScreen: "\x1b[?1049l",
   enableMouse: "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
   disableMouse: "\x1b[?1006l\x1b[?1005l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1015l",
+  setTitle: (title: string) => `\x1b]0;${title}\x07`,
 };
 
 export const theme = {
@@ -38,6 +39,7 @@ export const theme = {
   borderInactive: (s: string) => `\x1b[38;2;53;53;61m${s}\x1b[39m`, // #35353d (Qwen Line Primary Border)
   bgSelected: (s: string) => `\x1b[48;2;45;35;85m\x1b[38;2;247;248;252m${s}\x1b[49m\x1b[39m`, // #2d2355 Deep Violet + #f7f8fc White
   bgHover: (s: string) => `\x1b[48;2;58;46;110m\x1b[38;2;247;248;252m${s}\x1b[49m\x1b[39m`, // #3a2e6e Violet Hover + #f7f8fc White
+  bgUserCard: (s: string) => `\x1b[48;2;38;40;58m${s}\x1b[49m`, // #26283a (Catppuccin Surface / Distinct Lighter User Message Card)
   bold: (s: string) => `\x1b[1m${s}\x1b[22m`,
   italic: (s: string) => `\x1b[3m${s}\x1b[23m`,
   dim: (s: string) => `\x1b[2m${s}\x1b[22m`,
@@ -47,11 +49,14 @@ export const theme = {
 
 import { execSync, spawnSync } from "node:child_process";
 
+let memoryClipboard = "";
+
 /**
  * Safely writes text to the system clipboard on Windows/macOS/Linux.
  * Also emits OSC 52 to copy inside terminal emulators supporting it.
  */
 export function setClipboardText(text: string): boolean {
+  memoryClipboard = text;
   try {
     // 1. Emit OSC 52 sequence for terminal emulators supporting it natively (only when interactive TTY)
     try {
@@ -64,8 +69,7 @@ export function setClipboardText(text: string): boolean {
     // 2. OS-level clipboard utility
     if (process.platform === "win32") {
       const p = spawnSync("clip.exe", {
-        input: text,
-        encoding: "utf-8",
+        input: Buffer.from(text, "utf16le"),
         windowsHide: true,
       });
       return p.status === 0;
@@ -90,17 +94,21 @@ export function setClipboardText(text: string): boolean {
 export function getClipboardText(): string {
   try {
     if (process.platform === "win32") {
-      return execSync("powershell -NoProfile -Command Get-Clipboard", {
-        timeout: 1000,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "ignore"],
-      })
-        .toString()
+      const res = execSync(
+        'powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard"',
+        {
+          timeout: 2000,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "ignore"],
+        },
+      )
+        .toString("utf8")
         .replace(/\r?\n/g, "")
         .trim();
+      if (res) return res;
     }
   } catch {}
-  return "";
+  return memoryClipboard;
 }
 
 export const glyphs = {
@@ -183,67 +191,81 @@ export function stripAnsi(str: string): string {
 }
 const graphemeSegmenter = new Intl.Segmenter("en", { granularity: "grapheme" });
 
+function singleGraphemeWidth(segment: string): number {
+  const code = segment.codePointAt(0) || 0;
+  // Standalone zero-width characters (variation selectors, zero-width space/joiner)
+  if (
+    segment === "\u200b" ||
+    segment === "\u200c" ||
+    segment === "\u200d" ||
+    (code >= 0xfe00 && code <= 0xfe0f && segment.length === 1)
+  ) {
+    return 0;
+  }
+  // Graphemes containing variation selector 16 (emoji presentation)
+  if (segment.includes("\ufe0f")) {
+    return 2;
+  }
+  // Specific BMP emojis and symbols that occupy 2 visual terminal cells (e.g. ⚠️, ⏱, ⚡, ✅, ❌, ✨, ☕, ⚙)
+  const isBmpEmoji =
+    code === 0x26a0 || // ⚠️ (WARNING SIGN)
+    code === 0x23f1 || // ⏱ (STOPWATCH)
+    code === 0x23f0 || // ⏰
+    code === 0x23f3 || // ⏳
+    code === 0x231a || // ⌚
+    code === 0x231b || // ⌛
+    code === 0x2705 || // ✅
+    code === 0x2728 || // ✨
+    code === 0x274c || // ❌
+    code === 0x274e || // ❎
+    code === 0x2753 || // ❓
+    code === 0x2757 || // ❗
+    code === 0x2b50 || // ⭐
+    code === 0x2b55 || // ⭕
+    code === 0x26a1 || // ⚡
+    code === 0x2615 || // ☕
+    code === 0x2699 || // ⚙
+    code === 0x2709;   // ✉
+
+  // Common emoji and CJK full-width ranges (SMP Emojis 0x1f300 - 0x1faff)
+  if (
+    isBmpEmoji ||
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff01 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f300 && code <= 0x1faff)
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
 /**
  * Computes visual display width of string, accounting for wide characters,
  * grapheme clusters, variation selectors (VS16), and terminal-wide emojis.
  */
 export function stringWidth(str: string): number {
+  if (!str) return 0;
+  // Fast path for pure ASCII strings without ANSI escapes
+  let isAscii = true;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 32 || c > 126) {
+      isAscii = false;
+      break;
+    }
+  }
+  if (isAscii) return str.length;
+
   const clean = stripAnsi(str).replace(/\t/g, "  ").replace(/\r/g, "");
   let width = 0;
   for (const { segment } of graphemeSegmenter.segment(clean)) {
-    const code = segment.codePointAt(0) || 0;
-    // Standalone zero-width characters (variation selectors, zero-width space/joiner)
-    if (
-      segment === "\u200b" ||
-      segment === "\u200c" ||
-      segment === "\u200d" ||
-      (code >= 0xfe00 && code <= 0xfe0f && segment.length === 1)
-    ) {
-      continue;
-    }
-    // Graphemes containing variation selector 16 (emoji presentation)
-    if (segment.includes("\ufe0f")) {
-      width += 2;
-      continue;
-    }
-    // Specific BMP emojis and symbols that occupy 2 visual terminal cells (e.g. ⚠️, ⏱, ⚡, ✅, ❌, ✨, ☕, ⚙)
-    const isBmpEmoji =
-      code === 0x26a0 || // ⚠️ (WARNING SIGN)
-      code === 0x23f1 || // ⏱ (STOPWATCH)
-      code === 0x23f0 || // ⏰
-      code === 0x23f3 || // ⏳
-      code === 0x231a || // ⌚
-      code === 0x231b || // ⌛
-      code === 0x2705 || // ✅
-      code === 0x2728 || // ✨
-      code === 0x274c || // ❌
-      code === 0x274e || // ❎
-      code === 0x2753 || // ❓
-      code === 0x2757 || // ❗
-      code === 0x2b50 || // ⭐
-      code === 0x2b55 || // ⭕
-      code === 0x26a1 || // ⚡
-      code === 0x2615 || // ☕
-      code === 0x2699 || // ⚙
-      code === 0x2709;   // ✉
-
-    // Common emoji and CJK full-width ranges (SMP Emojis 0x1f300 - 0x1faff)
-    if (
-      isBmpEmoji ||
-      (code >= 0x1100 && code <= 0x115f) ||
-      (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
-      (code >= 0xac00 && code <= 0xd7a3) ||
-      (code >= 0xf900 && code <= 0xfaff) ||
-      (code >= 0xfe10 && code <= 0xfe19) ||
-      (code >= 0xfe30 && code <= 0xfe6f) ||
-      (code >= 0xff01 && code <= 0xff60) ||
-      (code >= 0xffe0 && code <= 0xffe6) ||
-      (code >= 0x1f300 && code <= 0x1faff)
-    ) {
-      width += 2;
-    } else {
-      width += 1;
-    }
+    width += singleGraphemeWidth(segment);
   }
   return width;
 }
@@ -253,8 +275,26 @@ export function stringWidth(str: string): number {
  */
 export function truncate(str: string, maxWidth: number, ellipsis = "…"): string {
   if (maxWidth <= 0) return "";
+  if (!str) return "";
+
+  // Fast path for pure ASCII strings
+  let isAscii = true;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 32 || c > 126) {
+      isAscii = false;
+      break;
+    }
+  }
+  if (isAscii) {
+    if (str.length <= maxWidth) return str;
+    const targetW = Math.max(0, maxWidth - 1);
+    return str.slice(0, targetW) + ellipsis;
+  }
+
   const clean = stripAnsi(str).replace(/\t/g, "  ").replace(/\r/g, "");
-  if (stringWidth(clean) <= maxWidth) return str;
+  const cleanW = stringWidth(clean);
+  if (cleanW <= maxWidth) return str;
 
   const ellipsisW = stringWidth(ellipsis);
   const targetW = Math.max(0, maxWidth - ellipsisW);
@@ -262,7 +302,7 @@ export function truncate(str: string, maxWidth: number, ellipsis = "…"): strin
   let currentW = 0;
   let result = "";
   for (const { segment } of graphemeSegmenter.segment(clean)) {
-    const segW = stringWidth(segment);
+    const segW = singleGraphemeWidth(segment);
     if (currentW + segW > targetW) break;
     currentW += segW;
     result += segment;

@@ -4,16 +4,16 @@
  */
 
 import { config } from "../core/config.ts";
+import { localApiAuthHeaders } from "../core/local-auth.ts";
 import { startServer, stopServer } from "../api/server.ts";
 import { stripAnsi } from "./theme.ts";
-export type ServerLifecycleState = "offline" | "warming" | "online" | "error";
 
+export type ServerLifecycleState = "offline" | "warming" | "online" | "error";
 export interface ServerLogEntry {
   time: string;
   level: "INFO" | "WARN" | "ERROR";
   message: string;
 }
-
 export class ServerManager {
   private static instance: ServerManager | null = null;
 
@@ -31,6 +31,7 @@ export class ServerManager {
   private intercepted = false;
   private isTuiRendering = false;
   private startPromise: Promise<void> | null = null;
+  private remoteLogAbort: AbortController | null = null;
 
   public static getInstance(): ServerManager {
     if (!ServerManager.instance) {
@@ -112,6 +113,11 @@ export class ServerManager {
       ) {
         continue;
       }
+      // Clean redundant leading level tags (e.g. "WARN [Qwen]" -> "[Qwen]")
+      // and normalize multi-space gaps after emojis
+      line = line
+        .replace(/^(?:\[?(?:INFO|WARN|WARNING|ERROR|ERR|DEBUG)\]?\s+)+/i, "")
+        .replace(/([\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2300}-\u{23FF}]\uFE0F?)\s{2,}/gu, "$1 ");
       if (!line) continue;
 
       // Prevent identical consecutive duplicate logs in the same second
@@ -121,19 +127,18 @@ export class ServerManager {
       }
 
       this.logEntries.push({ time, level, message: line });
-      if (this.logEntries.length > 500) {
+      if (this.logEntries.length > 2000) {
         this.logEntries.shift();
       }
 
       const levelTag = level === "ERROR" ? "[ERR]" : level === "WARN" ? "[WARN]" : "";
       const formatted = `[${time}] ${levelTag ? levelTag + " " : ""}${line}`;
       this.logBuffer.push(formatted);
-      if (this.logBuffer.length > 500) {
+      if (this.logBuffer.length > 2000) {
         this.logBuffer.shift();
       }
     }
   }
-
   public interceptLogs(): void {
     if (this.intercepted) return;
     this.intercepted = true;
@@ -226,6 +231,7 @@ export class ServerManager {
       const timeout = setTimeout(() => controller.abort(), 600);
       const resp = await fetch(`http://${cleanHost}:${port}/health`, {
         signal: controller.signal,
+        headers: localApiAuthHeaders(),
       });
       clearTimeout(timeout);
       if (resp.ok) {
@@ -234,6 +240,7 @@ export class ServerManager {
           "INFO",
           `✨ [Server] Conectado à instância em execução na porta ${port}`,
         );
+        this.startRemoteLogStream(cleanHost, port);
         return;
       }
     } catch {}
@@ -269,10 +276,53 @@ export class ServerManager {
   }
 
   public async stop(): Promise<void> {
+    if (this.remoteLogAbort) {
+      this.remoteLogAbort.abort();
+      this.remoteLogAbort = null;
+    }
     this.restoreLogs();
     try {
-      await stopServer();
       this.state = "offline";
     } catch {}
+  }
+
+  public startRemoteLogStream(host: string, port: number): void {
+    if (this.remoteLogAbort) {
+      this.remoteLogAbort.abort();
+    }
+    const abort = new AbortController();
+    this.remoteLogAbort = abort;
+
+    (async () => {
+      try {
+        const resp = await fetch(`http://${host}:${port}/logs/live`, {
+          signal: abort.signal,
+          headers: { Accept: "text/event-stream", ...localApiAuthHeaders() },
+        });
+        if (!resp.ok || !resp.body) return;
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+
+        while (!abort.signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data && data.message) {
+                  this.appendLog(data.level || "INFO", data.message);
+                }
+              } catch {}
+            }
+          }
+        }
+      } catch {}
+    })();
   }
 }

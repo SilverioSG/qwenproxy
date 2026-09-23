@@ -48,11 +48,17 @@ test("temp mode: buildFinalContext never reuses a thread and always sends the fu
   );
 });
 
-test("buildChatNewBody: thread → normal, temp → local, temp-thread → local", () => {
+test("buildChatNewBody: thread → normal, stateless → normal, thread-temp → local, stateless-temp → local", () => {
   assert.equal(buildChatNewBody("qwen3.7-plus").chat_mode, "normal");
+  assert.equal(buildChatNewBody("qwen3.7-plus", "thread").chat_mode, "normal");
+  assert.equal(buildChatNewBody("qwen3.7-plus", "stateless").chat_mode, "normal");
+  assert.equal(buildChatNewBody("qwen3.7-plus", "stateless-temp").chat_mode, "local");
+  assert.equal(buildChatNewBody("qwen3.7-plus", "thread-temp").chat_mode, "local");
+  // Backwards-compatible aliases
   assert.equal(buildChatNewBody("qwen3.7-plus", "temp").chat_mode, "local");
   assert.equal(buildChatNewBody("qwen3.7-plus", "temp-thread").chat_mode, "local");
-  assert.equal(buildChatNewBody("qwen3.7-plus", "thread").chat_mode, "normal");
+  assert.equal(buildChatNewBody("qwen3.7-plus", "stateles").chat_mode, "normal");
+  assert.equal(buildChatNewBody("qwen3.7-plus", "stateles-temp").chat_mode, "local");
 });
 
 /** Intercept the completions POST (browser-relay fetch in mock mode) and return a short SSE. */
@@ -244,6 +250,169 @@ test("temp-thread mode header: completions payload uses chat_mode:local", async 
     const body = JSON.parse(mock.body());
     assert.equal(body.chat_mode, "local", "temp-thread mode must send chat_mode:local");
   } finally {
+    mock.restore();
+  }
+});
+test("stateless mode: buildFinalContext sends full history with normal chat_mode", async () => {
+  const messages = [
+    { role: "user", content: "first" },
+    { role: "assistant", content: "hi" },
+    { role: "user", content: "continue" },
+  ] as any[];
+
+  const ctx = await buildFinalContext({
+    messages,
+    systemPrompt: "",
+    toolInstructions: "",
+    prompt: "FULL_HISTORY",
+    currentPrompt: "DELTA",
+    modelId: "qwen3.7-plus",
+    enableThinking: false,
+    conversationKey: "explicit-session-id",
+    hasExplicitConversationKey: true,
+    chatMode: "stateless",
+  });
+
+  assert.equal(ctx.chatMode, "stateless");
+  assert.equal(ctx.isNewSession, true);
+  assert.equal(ctx.allowThreadReuse, false);
+  assert.equal(ctx.finalPrompt, "FULL_HISTORY", "stateless mode must send full history");
+});
+
+test("stateless mode header: completions payload uses chat_mode:normal", async () => {
+  const mock = installCompletionCapture();
+  try {
+    const res = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-qwenproxy-chat-mode": "stateless",
+        },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [{ role: "user", content: "hello stateless" }],
+          stream: true,
+        }),
+      }),
+    );
+
+    assert.strictEqual(res.status, 200);
+    await res.text();
+
+    assert.strictEqual(mock.completionCalls(), 1);
+    const body = JSON.parse(mock.body());
+    assert.equal(body.chat_mode, "normal", "stateless mode must send chat_mode:normal");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("stateless-temp mode header: completions payload uses chat_mode:local", async () => {
+  const mock = installCompletionCapture();
+  try {
+    const res = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-qwenproxy-chat-mode": "stateless-temp",
+        },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [{ role: "user", content: "hello stateless-temp" }],
+          stream: true,
+        }),
+      }),
+    );
+
+    assert.strictEqual(res.status, 200);
+    await res.text();
+
+    assert.strictEqual(mock.completionCalls(), 1);
+    const body = JSON.parse(mock.body());
+    assert.equal(body.chat_mode, "local", "stateless-temp mode must send chat_mode:local");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("thread-temp mode header: completions payload uses chat_mode:local", async () => {
+  const mock = installCompletionCapture();
+  try {
+    const res = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-qwenproxy-chat-mode": "thread-temp",
+        },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [{ role: "user", content: "hello thread-temp" }],
+          stream: true,
+        }),
+      }),
+    );
+
+    assert.strictEqual(res.status, 200);
+    await res.text();
+
+    assert.strictEqual(mock.completionCalls(), 1);
+    const body = JSON.parse(mock.body());
+    assert.equal(body.chat_mode, "local", "thread-temp mode must send chat_mode:local");
+  } finally {
+    mock.restore();
+  }
+});
+test("dynamic runtime chat mode: changing global mode changes API completions without header", async () => {
+  const { setRuntimeChatMode, getRuntimeChatMode } = await import("../core/config.ts");
+  const mock = installCompletionCapture();
+  const initialMode = getRuntimeChatMode();
+
+  try {
+    // 1. Switch global API mode to stateless-temp
+    setRuntimeChatMode("stateless-temp");
+    assert.equal(getRuntimeChatMode(), "stateless-temp");
+
+    // Send request WITHOUT x-qwenproxy-chat-mode header (like Claude Code or Cursor)
+    let res = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [{ role: "user", content: "test global mode" }],
+          stream: true,
+        }),
+      }),
+    );
+    assert.strictEqual(res.status, 200);
+    await res.text();
+    let body = JSON.parse(mock.body());
+    assert.equal(body.chat_mode, "local", "global stateless-temp must use chat_mode:local");
+
+    // 2. Switch global API mode to thread
+    setRuntimeChatMode("thread");
+    assert.equal(getRuntimeChatMode(), "thread");
+
+    res = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [{ role: "user", content: "test global mode thread" }],
+          stream: true,
+        }),
+      }),
+    );
+    assert.strictEqual(res.status, 200);
+    await res.text();
+    body = JSON.parse(mock.body());
+    assert.equal(body.chat_mode, "normal", "global thread must use chat_mode:normal");
+  } finally {
+    setRuntimeChatMode(initialMode);
     mock.restore();
   }
 });

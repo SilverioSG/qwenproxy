@@ -45,13 +45,21 @@ test("Playwright Storage State: loadStorageState validates JSON and cookies arra
 
 test("Playwright Storage State: saveStorageState bounds hung storageState call with timeout", async () => {
   const accountId = "hang-test-acc";
+  let timer: NodeJS.Timeout | undefined;
   const fakeContext: any = {
-    storageState: () => new Promise(() => {}), // never resolves
+    storageState: () =>
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ cookies: [], origins: [] }), 250);
+      }),
   };
-  const start = Date.now();
-  await saveStorageState(fakeContext, accountId);
-  const elapsed = Date.now() - start;
-  assert.ok(elapsed >= 2000 && elapsed < 8000, `must time out within ~5s, took ${elapsed}ms`);
+  try {
+    const start = Date.now();
+    await saveStorageState(fakeContext, accountId, 100);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed >= 80 && elapsed < 3000, `must time out within bounds, took ${elapsed}ms`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 });
 
 test("Playwright already-closed error detection", () => {
@@ -95,21 +103,24 @@ test("isPageLoggedIn detects authenticated session via API/DOM and rejects unaut
   assert.equal(await isPageLoggedIn(closedPage), false);
 });
 test("isPageLoggedIn bounds a hanging in-page probe instead of waiting forever", async () => {
-  // page.evaluate ignores Playwright's default timeouts: on a WAF-blocked page
-  // the in-page fetch can stay pending indefinitely. The probe must time out.
+  let timer: NodeJS.Timeout | undefined;
   const hangingPage: any = {
     isClosed: () => false,
     url: () => "https://chat.qwen.ai/",
-    evaluate: () => new Promise<boolean>(() => {}),
+    evaluate: () =>
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), 250);
+      }),
   };
 
-  const startedAt = Date.now();
-  assert.equal(await isPageLoggedIn(hangingPage, 1_000), false);
-  const elapsed = Date.now() - startedAt;
-  assert.ok(
-    elapsed >= 900 && elapsed < 5_000,
-    `probe must fail at its bound, took ${elapsed}ms`,
-  );
+  try {
+    const startedAt = Date.now();
+    assert.equal(await isPageLoggedIn(hangingPage, 100), false);
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= 80 && elapsed < 3000, `probe must fail at its bound, took ${elapsed}ms`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 });
 test("cleanupOrphanProfiles removes directories not belonging to active accounts and stale dirs", () => {
   const tempBase = path.join(process.cwd(), ".tmp", "test-profiles-" + Date.now());

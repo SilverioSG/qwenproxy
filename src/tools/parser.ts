@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
-import { robustParseJSON } from "../utils/json.ts";
+import { robustParseJSON, computeMissingJsonClosingTokens } from "../utils/json.ts";
 import { logger, isToolcallDebugEnabled } from "../core/logger.js";
+import { metrics } from "../core/metrics.ts";
 import type { ParsedToolCall } from "./types";
 import type { FunctionToolDefinition } from "./types";
 import {
@@ -960,8 +961,8 @@ function repairCommonMalformedToolJson(content: string): string {
       '$1"arguments": ',
     )
     .replace(
-      /([,{]\s*)arguments"\s*:/g,
-      '$1"arguments":',
+      /([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)"\s*:/g,
+      '$1"$2":',
     )
     .replace(
       /([,{]\s*)arguments\s*:\s*(?={|\[|")/g,
@@ -1070,6 +1071,27 @@ function isJsonPayloadTruncated(content: string): boolean {
     if (!scanJsonStructureIncomplete(candidate)) return false;
   }
   return true;
+}
+
+function getTruncationNoticeForTool(toolName: string): string {
+  const name = toolName.toLowerCase();
+  if (
+    name.includes("bash") ||
+    name.includes("sh") ||
+    name.includes("command") ||
+    name.includes("exec")
+  ) {
+    return "\n\n# [ERROR: Command was truncated by model output token limit]\necho '[ERROR: Command truncated by model output token limit]' >&2 && exit 1";
+  }
+  if (
+    name.includes("write") ||
+    name.includes("edit") ||
+    name.includes("patch") ||
+    name.includes("file")
+  ) {
+    return "\n\n/* [TRUNCATED BY UPSTREAM MODEL OUTPUT LIMIT: Incomplete content, do not treat as complete] */";
+  }
+  return "\n\n[TRUNCATED BY UPSTREAM MODEL OUTPUT LIMIT: This message was cut off mid-generation by the model output limit.]";
 }
 
 /**
@@ -1480,7 +1502,7 @@ export class StreamingToolParser {
     }
 
     this.emittedCallKeys.add(key);
-
+    metrics.increment("toolcalls.total");
     const incremental = this.activeIncrementalToolCall;
     const matchesIncrementalCall =
       incremental?.name === tc.name && incremental.startEmitted;
@@ -1681,6 +1703,12 @@ export class StreamingToolParser {
       result.text += literalBlock;
     }
 
+    // Count undeclared/malformed tool calls toward the per-turn cap.
+    // Without this, the model can generate unlimited undeclared tool calls
+    // (e.g. Qwen-native WebSearch/WebFetch) that bypass the cap entirely,
+    // causing infinite generation until TOTAL_REQUEST_TIMEOUT (10 min).
+    this.emittedToolCallCount++;
+
     this.advanceMarkdownState(literalBlock);
     this.pendingLeadIn = "";
   }
@@ -1704,6 +1732,7 @@ export class StreamingToolParser {
       failureReason: options.failureReason,
       recoveryAttempts: options.recoveryAttempts,
     });
+    metrics.increment("toolcalls.malformed");
   }
 
   private extractUndeclaredNamesFromContent(text: string): string[] {
@@ -1948,12 +1977,27 @@ export class StreamingToolParser {
         // buffer reaches flush and tryRecoverToolCall would otherwise skip the
         // narrow typo repairs that processToolContent runs.
         const repairedTrimmed = repairCommonMalformedToolJson(trimmed);
-        const recovered =
+        let recovered =
           this.tryRecoverToolCall(repairedTrimmed) ||
           this.tryRecoverToolCall(trimmed) ||
           this.tryRecoverIncrementalToolCall(trimmed) ||
           this.lastChanceRecoverToolCall(trimmed);
+
+        // If standard recovery failed on a truncated tool call, but we CANNOT
+        // auto-retry because prior tool calls were already emitted to the client
+        // in this turn (allToolsFailed would be false), heal the truncated JSON
+        // instead of dropping it and causing a client-side JSON SyntaxError.
+        if (!recovered && this.emittedToolCallCount > 0) {
+          recovered = this.tryHealTruncatedToolCall(trimmed);
+          if (recovered && isToolcallDebugEnabled()) {
+            logger.debug("[parser] flush: healed truncated tool call", {
+              name: recovered.name,
+              emittedSoFar: this.emittedToolCallCount,
+            });
+          }
+        }
         if (recovered) {
+          metrics.increment("toolcalls.recovered");
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] flush: recovery successful", {
               name: recovered.name,
@@ -2005,18 +2049,23 @@ export class StreamingToolParser {
             recoveryAttempts: truncRecoveryAttempts,
           });
           logger.warn(
-            "[parser] Dropping unrecoverable unclosed tool call at end of stream",
-            {
-              toolName,
-              category: "truncated",
-              contentLength: trimmed.length,
-              content: trimmed.substring(0, 2000),
-              failureReason:
-                "stream ended before tool_call closing tag; content too incomplete to reconstruct",
-              recoveryAttempts: truncRecoveryAttempts,
-              emittedToolCallsSoFar: this.emittedToolCallCount,
-            },
+            `[parser] Dropping unrecoverable unclosed tool call (${toolName || "unknown"}) at end of stream: stream ended before closing tag (${trimmed.length} chars)`,
           );
+          if (isToolcallDebugEnabled()) {
+            logger.debug(
+              "[parser] Unclosed tool call payload details",
+              {
+                toolName,
+                category: "truncated",
+                contentLength: trimmed.length,
+                content: trimmed.substring(0, 2000),
+                failureReason:
+                  "stream ended before tool_call closing tag; content too incomplete to reconstruct",
+                recoveryAttempts: truncRecoveryAttempts,
+                emittedToolCallsSoFar: this.emittedToolCallCount,
+              },
+            );
+          }
           if (
             this.emittedToolCallCount === 0 &&
             this.pendingLeadIn.trim().length > 0
@@ -2404,18 +2453,24 @@ export class StreamingToolParser {
       recoveryAttempts,
     });
 
-    logger.warn(
-      `[parser] Dropping malformed tool call (${t.length} chars): ${t.substring(0, 80).replace(/\n/g, " ")}...`,
-      {
-        toolName: droppedToolName,
-        category: "malformed",
-        contentLength: t.length,
-        content: t.substring(0, 2000),
-        failureReason: "all recovery stages failed to produce valid JSON",
-        recoveryAttempts,
-        declaredTools: [...this.declaredToolNames].slice(0, 10),
-      },
-    );
+    if (isToolcallDebugEnabled()) {
+      logger.warn(
+        `[parser] Dropping malformed tool call (${t.length} chars): ${t.substring(0, 80).replace(/\n/g, " ")}...`,
+        {
+          toolName: droppedToolName,
+          category: "malformed",
+          contentLength: t.length,
+          content: t.substring(0, 2000),
+          failureReason: "all recovery stages failed to produce valid JSON",
+          recoveryAttempts,
+          declaredTools: [...this.declaredToolNames].slice(0, 10),
+        },
+      );
+    } else {
+      logger.warn(
+        `[parser] Dropping malformed tool call (${t.length} chars)${droppedToolName ? ` [${droppedToolName}]` : ""}: ${t.substring(0, 80).replace(/\n/g, " ")}...`,
+      );
+    }
     if (
       this.emittedToolCallCount === 0 &&
       this.pendingLeadIn.trim().length > 0
@@ -2664,6 +2719,58 @@ export class StreamingToolParser {
 
     return null;
   }
+
+  /**
+   * Last-resort healing for truncated tool calls when auto-retry cannot fire
+   * (e.g. prior calls already emitted to the client, or incremental chunks
+   * already streamed). Uses robustParseJSON to close open strings/braces and
+   * emits the missing closing tokens as a delta so the client doesn't get
+   * a SyntaxError: Unexpected end of JSON input.
+   *
+   * Injects an explicit contextual truncation warning into the payload so the
+   * agent/AI is aware that the content or command was cut off by token limits,
+   * preventing dangerous half-command execution or silent file corruption.
+   */
+  private tryHealTruncatedToolCall(block: string): ParsedToolCall | null {
+    try {
+      const parsed = robustParseJSON(block);
+      if (parsed && typeof parsed === "object") {
+        const tc = this.parseToolCall(parsed);
+        if (tc && this.isDeclaredToolName(tc.name)) {
+          const notice = getTruncationNoticeForTool(tc.name);
+          const incremental = this.activeIncrementalToolCall;
+          if (
+            incremental &&
+            incremental.name === tc.name &&
+            incremental.startEmitted
+          ) {
+            const rawArgs =
+              incremental.argumentsValueStart !== null
+                ? this.buffer.substring(incremental.argumentsValueStart)
+                : "";
+            const closingTokens = computeMissingJsonClosingTokens(rawArgs, notice);
+            if (closingTokens) {
+              this.pendingToolCallDeltas.push({
+                index: incremental.index,
+                function: {
+                  arguments: closingTokens,
+                },
+              });
+              incremental.emittedArgumentsLength += closingTokens.length;
+            }
+          }
+          if (typeof tc.arguments === "object" && tc.arguments !== null) {
+            (tc.arguments as Record<string, unknown>)._truncated = true;
+            (tc.arguments as Record<string, unknown>)._truncation_warning =
+              notice.trim();
+          }
+          return tc;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
 
   private parseToolContent(str: string): ParsedToolCall[] {
     const calls: ParsedToolCall[] = [];
@@ -2917,8 +3024,24 @@ export class StreamingToolParser {
   private parseToolCall(parsed: any): ParsedToolCall | null {
     if (!parsed || typeof parsed !== "object") return null;
 
-    const name =
+    let name =
       parsed.name || parsed.function?.name || parsed.tool_name || parsed.tool;
+    if (!name || typeof name !== "string" || name.length === 0) {
+      const candidateArgs =
+        parsed.arguments ||
+        parsed.function?.arguments ||
+        parsed.args ||
+        parsed.parameters ||
+        parsed.input ||
+        parsed;
+      const parsedCandidateArgs =
+        typeof candidateArgs === "string"
+          ? parseJsonishString(candidateArgs) ?? {}
+          : typeof candidateArgs === "object" && candidateArgs !== null
+            ? candidateArgs
+            : {};
+      name = inferToolNameFromParameters(parsedCandidateArgs, this.tools);
+    }
     if (!name || typeof name !== "string" || name.length === 0) return null;
 
     // Drop hallucinated tool calls where the model split a value vertically

@@ -171,6 +171,13 @@ export function getSyncStatePath(customDataDir?: string): string {
 }
 
 /**
+ * Path to TUI user preferences file (model, effort, last tab, etc.).
+ */
+export function getTuiSettingsPath(customDataDir?: string): string {
+  return path.join(customDataDir || getDataDir(), "tui-settings.json");
+}
+
+/**
  * Path to user configuration .env file (either local or in global data dir).
  */
 export function getEnvFilePath(customDataDir?: string): string {
@@ -182,17 +189,33 @@ export function getEnvFilePath(customDataDir?: string): string {
 }
 
 /**
+ * Path to logs directory.
+ */
+export function getLogsDir(customDataDir?: string): string {
+  return path.join(customDataDir || getDataDir(), "logs");
+}
+
+/**
+ * Path to persistent server log file.
+ */
+export function getServerLogFilePath(customDataDir?: string): string {
+  return path.join(getLogsDir(customDataDir), "server.log");
+}
+
+/**
  * Ensures all standard directories exist on disk with proper recursive creation.
  */
 export function ensureDataDirs(targetDataDir?: string): void {
   const root = targetDataDir || getDataDir();
   const dbDir = getDbDir(root);
   const profilesDir = getProfilesDir(root);
+  const logsDir = getLogsDir(root);
 
   try {
     if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
     if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
     if (!fs.existsSync(profilesDir)) fs.mkdirSync(profilesDir, { recursive: true });
+    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
   } catch (err: any) {
     console.error(`[Paths] Error ensuring data directories at ${root}:`, err?.message || String(err));
   }
