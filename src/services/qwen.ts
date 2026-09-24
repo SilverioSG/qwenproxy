@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   getQwenHeaders,
   getBasicHeaders,
@@ -29,6 +30,7 @@ import {
 import { type Page, type BrowserContext } from "patchright";
 import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, onPlaywrightAccountDeath, closePlaywrightForAccount, getPlaywrightAccountPresence, isPlaywrightInitializing } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
+import { markLatency, noteLatency } from "../core/latency-trace.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import {
   beginCaptureTrace,
@@ -159,6 +161,20 @@ export async function registerBrowserContextStreamBinding(
 onBrowserContextCreated((context) => {
   void registerBrowserContextStreamBinding(context);
 });
+
+/**
+ * Diagnostic request id for the completion currently being created on this
+ * async turn. Set only by acquireUpstreamStream; read by captcha/header marks.
+ * AsyncLocalStorage keeps concurrent requests apart. Never read by routing.
+ */
+const latencyRequestStore = new AsyncLocalStorage<string>();
+function latencyRequestId(): string | undefined {
+  return latencyRequestStore.getStore();
+}
+export function runWithLatencyRequest<T>(requestId: string | undefined, fn: () => T): T {
+  if (!requestId) return fn();
+  return latencyRequestStore.run(requestId, fn);
+}
 
 /**
  * Fail every parked browser stream owned by a dead account (renderer crash,
@@ -1472,6 +1488,7 @@ async function createQwenBrowserResponse(
         ),
         metadataTimeoutPromise,
       ]);
+      markLatency(latencyRequestId(), "T3_COMPLETION_HEADERS");
     } catch (error) {
       if (
         captchaSolvedDuringMetadata &&
@@ -2792,6 +2809,7 @@ async function createQwenStreamInternal(
   let createdNewChat = false;
   let chatSessionId: string | null | undefined;
   let leasedWarmChat = false;
+  markLatency(latencyRequestId(), "CHAT_PREP_START");
   if (options && "chatSessionId" in options) {
     if (options.chatSessionId === null || options.chatSessionId === "") {
       const acquired = await acquireNewQwenChatSession(
@@ -2821,6 +2839,7 @@ async function createQwenStreamInternal(
     }
   }
 
+  markLatency(latencyRequestId(), "CHAT_PREP_END");
   ensureNotAborted();
   phase("chat");
 
@@ -3092,9 +3111,12 @@ async function createQwenStreamInternal(
       if (captchaRecoveryAttempted || !accountId) return false;
       captchaRecoveryAttempted = true;
 
+      markLatency(latencyRequestId(), "CAPTCHA_START");
       const solved = await recoverBaxiaCaptcha(accountId, label, {
         challengeBody,
       });
+      markLatency(latencyRequestId(), "CAPTCHA_END");
+      noteLatency(latencyRequestId(), { captcha: true });
       const captureTraceId = beginCaptureTrace(accountId);
       capturePoint("recovery_returned", { solved: solved ? 1 : 0 });
       if (!solved) {
@@ -3160,6 +3182,7 @@ async function createQwenStreamInternal(
     try {
       ensureNotAborted();
       phase("fetch");
+      markLatency(latencyRequestId(), "T2_COMPLETION_START");
       response = await fetchCompletion(activeHeaders);
     } catch (error) {
       // The challenge was solved while waiting for headers, but the original

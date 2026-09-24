@@ -49,6 +49,7 @@ import {
 import { sendOpenAIError } from "../../api/error-helpers.js";
 import { classifyError } from "../../api/error-classifier.js";
 import { ClientAbortedError } from "../../core/errors.js";
+import { endLatencyTrace, markLatency, noteLatency } from "../../core/latency-trace.ts";
 import { config, type ChatMode } from "../../core/config.js";
 import { parseQwenErrorPayload } from "./errors.ts";
 import {
@@ -221,6 +222,21 @@ export interface StreamProcessingParams {
   };
   onAssistantComplete?: AssistantCompleteHandler;
   onStreamComplete?: () => void;
+  /**
+   * Observability only. Called exactly once, from the SSE lifecycle, at the
+   * logical end of the stream (after [DONE] is written, before local cleanup).
+   * Must not read or write the stream. `stoppedAt` is that [DONE] instant so
+   * later cleanup cannot inflate latencyMs.
+   */
+  onObserveStreamEnd?: (outcome: StreamObservation) => void;
+}
+
+/** Logical end of one SSE response. Not a second request. */
+export interface StreamObservation {
+  success: boolean;
+  error?: string | null;
+  errorReason?: string | null;
+  stoppedAt: number;
 }
 
 function scheduleAssistantComplete(
@@ -836,10 +852,38 @@ export async function processStreamingResponse(
     midStreamRetry,
     onAssistantComplete,
     onStreamComplete,
+    onObserveStreamEnd,
   } = params;
   const reqId = params.reqId ?? completionId.substring(0, 8);
   const streamStartedAt = Date.now();
   let firstChunkAt: number | null = null;
+  // One observation per SSE callback. Set at the logical stop (after [DONE]
+  // or the equivalent abort/error terminal), never in the cleanup that follows.
+  let streamObserved = false;
+  const observeStreamEnd = (outcome: {
+    success: boolean;
+    error?: string | null;
+    errorReason?: string | null;
+    stoppedAt?: number;
+  }) => {
+    if (streamObserved) return;
+    streamObserved = true;
+    const stoppedAt = outcome.stoppedAt ?? Date.now();
+    // Diagnostic marks only. No-op when QWEN_LATENCY_TRACE is off. T6 is the
+    // logical stop (DeepSeek records latency here); T7 is frozen before the
+    // local cleanup below so LOCAL_POST stays out of latencyMs.
+    markLatency(reqId, "T6_DONE", performance.now());
+    try {
+      onObserveStreamEnd?.({
+        success: outcome.success,
+        error: outcome.error ?? null,
+        errorReason: outcome.errorReason ?? null,
+        stoppedAt,
+      });
+    } catch {
+      // Observability must never break the stream.
+    }
+  };
   // Last model delta handed to the client. Stream done reports the gap between
   // this and the teardown (tail): a large tail means the visible response had
   // finished long before the upstream terminal event arrived (thinking-model
@@ -1138,6 +1182,10 @@ export async function processStreamingResponse(
           }
         }
         lastDeltaAt = now;
+        // Same instant as the existing first-chunk log. FIRST is first-only;
+        // LAST tracks every later real delta. No extra stream reader.
+        markLatency(reqId, "T4_FIRST_CONTENT", performance.now());
+        markLatency(reqId, "T5_LAST_CONTENT", performance.now());
         const serialized =
           `data: {${eventHead}${JSON.stringify(delta)}${eventTail}\n\n`;
         if (Array.isArray(flushBuffer)) {
@@ -1902,6 +1950,13 @@ export async function processStreamingResponse(
         });
         flushWrites();
         await streamWriter.write("data: [DONE]\n\n");
+        // Upstream error already emitted as content + [DONE]. Same stop as the
+        // success path: logical end is the [DONE] write, before finally cleanup.
+        observeStreamEnd({
+          success: false,
+          error: upstreamError.message,
+          errorReason: "upstream_error",
+        });
         return;
       }
 
@@ -2491,6 +2546,10 @@ export async function processStreamingResponse(
         await streamWriter.write(payload);
         flushBuffer = null;
         streamCompletedOk = true;
+        // Logical stream end. DeepSeek records latencyMs here: after [DONE] is
+        // enqueued and before safeClose / local cleanup. Do not move this past
+        // scheduleAssistantComplete or logTokenEstimationSample.
+        observeStreamEnd({ success: true });
 
         scheduleAssistantComplete(onAssistantComplete, {
           sessionId: logicalSessionId,
@@ -2532,6 +2591,14 @@ export async function processStreamingResponse(
             "[chat] stream: skipped [DONE] - client already disconnected",
           );
         }
+        // Client left before [DONE]. One record, success=false, same policy
+        // the handler used for a pre-response abort. Stop is this branch, not
+        // the disconnect teardown that may already be in flight.
+        observeStreamEnd({
+          success: false,
+          error: "client disconnected before stream completed",
+          errorReason: "client_abort",
+        });
       }
     } catch (err: any) {
       const streamStillRegistered = Boolean(getStream(completionId));
@@ -2553,6 +2620,14 @@ export async function processStreamingResponse(
                   errorMessage: err?.message,
                 });
               }
+              // Expected abort (client gone or stop). Record once if the success
+              // path did not already. A thrown retry below must NOT record:
+              // the outer loop still owns the request until it gives up.
+              observeStreamEnd({
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+                errorReason: "client_abort",
+              });
               return;
             }
 
@@ -2625,6 +2700,14 @@ export async function processStreamingResponse(
 
       // Release locks now that the stream is fully done
       if (onStreamComplete) onStreamComplete();
+      // Diagnostic T7, after the logical stop (T6 / [DONE]) and after the
+      // local cleanup above. latencyMs was already frozen at T6, so this is
+      // not part of it. No-op when the trace flag is off. A thrown retry
+      // leaves the span open (streamObserved is still false).
+      if (streamObserved) {
+        noteLatency(reqId, { success: streamCompletedOk });
+        endLatencyTrace(reqId);
+      }
 
       // Release account lease from transparent retry if active
       if (retryContext.releaseAccountLease) {
@@ -2699,6 +2782,14 @@ export async function processStreamingResponse(
           },
         })}\n\ndata: [DONE]\n\n`,
       );
+      // Terminal stream error: the outer retry loop already gave up (it only
+      // reaches this onError when the callback throws past the retry budget).
+      // One record, after the error [DONE], before the stream is closed.
+      observeStreamEnd({
+        success: false,
+        error: err.message,
+        errorReason: errorCode,
+      });
     } catch {
       // Stream already closed — client already disconnected or the stream
       // was cancelled. Nothing more we can do.

@@ -41,9 +41,11 @@ import {
 	refreshHeaders,
 } from "../../services/playwright.ts";
 import { enqueueOrphanChatDeletion } from "../../services/chat-cleanup.ts";
+import { markLatency, noteLatency } from "../../core/latency-trace.ts";
 import {
 	clearAllSessionsForAccount,
 	createQwenStream,
+	runWithLatencyRequest,
 	fetchQwenModels,
 	getQwenErrorCode,
 	getLogicalThreadState,
@@ -247,6 +249,8 @@ export interface AcquireParams {
 	   * yet: run on its OWN chat and hop accounts fast instead of waiting.
 	   */
 	  parallelEscape?: boolean;
+	  /** Existing 8-hex request id. Diagnostics only; unused by selection. */
+	  reqId?: string;
 	}
 
 /** Exported for unit tests — selects the first account for a request. */
@@ -406,6 +410,7 @@ export async function acquireUpstreamStream(
 		preferredAccountId,
 		excludeAccountIds,
 	} = params;
+	const latencyReqId = params.reqId;
 
 	const completionId = "chatcmpl-" + uuidv4();
 	// Sticky thread binding is independent of forceNewChat. forceNewChat only
@@ -453,7 +458,10 @@ export async function acquireUpstreamStream(
 		excludeSet.add(stickyThreadAccountId);
 	}
 
+	markLatency(latencyReqId, "ACCOUNT_SELECTION_START");
 	const resolved = resolveInitialAccount(resolvedPreferred, excludeSet);
+	markLatency(latencyReqId, "ACCOUNT_SELECTED");
+	noteLatency(latencyReqId, { sessionReused: canReuseUpstreamChat });
 
 	if (logger.isLevelEnabled("info")) {
 		// Why THIS account? The operator needs the decision, not just the
@@ -637,6 +645,7 @@ export async function acquireUpstreamStream(
 					completionId,
 					parallelEscape: params.parallelEscape,
 					chatMode,
+					reqId: params.reqId,
 				},
 				accountId,
 				accountEmail,
@@ -934,6 +943,8 @@ async function tryCreateStreamWithRetry(
 		parallelEscape?: boolean;
 		/** "thread" (reuse upstream chat) or "temp" (new ephemeral chat per request). */
 		chatMode: ChatMode;
+		/** Diagnostic id only. Never read by retry or account selection. */
+		reqId?: string;
 	},
 	accountId: string,
 	accountEmail: string,
@@ -1099,6 +1110,7 @@ async function tryCreateStreamWithRetry(
 					])
 				: AbortSignal.any([leaseAbort.signal, acquireAbort.signal]);
 
+			markLatency(params.reqId, "ACCOUNT_ACQUIRE_START");
 			if (params.parallelEscape) {
 				// Parallel request racing an unemitted stream: do NOT queue on this
 				// account's slot (the main may hold it for minutes while thinking).
@@ -1130,6 +1142,8 @@ async function tryCreateStreamWithRetry(
 					leaseAbortController: leaseAbort,
 				});
 			}
+			// Lease is held. ACCOUNT_READY is this instant, not account selection.
+			markLatency(params.reqId, "ACCOUNT_READY");
 			// Client may have disconnected (or a same-session retry superseded us)
 			// while waiting for the lease. Bail before spending time on
 			// personalization sync / captcha solve.
@@ -1283,7 +1297,7 @@ async function tryCreateStreamWithRetry(
 					acquireDeadlineTimer.unref?.();
 				});
 				result = await Promise.race([
-					createQwenStream(
+					runWithLatencyRequest(params.reqId, () => createQwenStream(
 						promptForUpstream,
 						params.isThinkingModel,
 						params.model,
@@ -1303,7 +1317,7 @@ async function tryCreateStreamWithRetry(
 								}
 							: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
 						combinedSignal,
-					),
+					)),
 					acquireDeadline,
 				]);
 				// The acquire won: stop the deadline so it cannot fire later and
@@ -1316,6 +1330,7 @@ async function tryCreateStreamWithRetry(
 					);
 				}
 
+				noteLatency(params.reqId, { createdSession: result.createdNewChat === true });
 				const contextMeter = buildContextMeterSnapshot({
 					modelId: params.contextModelId ?? params.model,
 					accountId: currentAccountId,

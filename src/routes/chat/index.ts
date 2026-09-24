@@ -19,6 +19,7 @@ import {
   processStreamingResponse,
   handleChatCompletionsError,
   type AssistantCompleteEvent,
+  type StreamObservation,
 } from "./streaming.ts";
 import { config, type ChatMode, normalizeChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
@@ -36,6 +37,12 @@ import {
 import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
 import { recordAIRequest } from "../../core/dashboard-stats.ts";
+import {
+  beginLatencyTrace,
+  endLatencyTrace,
+  markLatency,
+  noteLatency,
+} from "../../core/latency-trace.ts";
 
 /** Passive dashboard trace: counters only, never influences decisions. */
 interface DashboardTrace {
@@ -48,6 +55,52 @@ interface DashboardTrace {
   accountIds: Set<string>;
   lastAccountId: string | null;
   retries: number;
+  /**
+   * Streaming ownership. The handler must not record the request when it
+   * returns the Response: Hono runs the SSE callback later. The callback
+   * records exactly once, at logical stream end (after [DONE] is written,
+   * before local cleanup). Non-stream stays owned by the handler.
+   */
+  finalized: boolean;
+}
+
+/**
+ * One record per logical request. A second call (handler + SSE, or success
+ * path + catch) is a no-op so retries never create a second row.
+ */
+function finalizeDashboardTrace(
+  trace: DashboardTrace | null,
+  outcome: {
+    success: boolean;
+    error?: string | null;
+    errorReason?: string | null;
+    accountId?: string | null;
+    /** Wall-clock stop. Defaults to now. Streaming passes the [DONE] instant. */
+    stoppedAt?: number;
+  },
+): void {
+  if (!trace || trace.finalized) return;
+  trace.finalized = true;
+  const stoppedAt = outcome.stoppedAt ?? Date.now();
+  try {
+    recordAIRequest({
+      requestId: trace.requestId,
+      httpRequestId: trace.httpRequestId,
+      route: trace.route,
+      model: trace.model,
+      stream: trace.stream,
+      accountId:
+        outcome.accountId !== undefined ? outcome.accountId : trace.lastAccountId,
+      latencyMs: stoppedAt - trace.startMs,
+      success: outcome.success,
+      error: outcome.error ?? null,
+      errorReason: outcome.errorReason ?? null,
+      retryCount: trace.retries,
+      attemptedAccounts: trace.accountIds.size,
+    });
+  } catch {
+    // Recording must never break the request path.
+  }
 }
 
 
@@ -88,6 +141,9 @@ export async function chatCompletions(c: Context) {
   const timings: Record<string, number> = {};
   // Dashboard V2 passive trace (initialized once the request is parsed).
   let dashTrace: DashboardTrace | null = null;
+  // Declared outside try so the error paths can close the span. Assigned only
+  // after the body parses; absent means the span was never opened.
+  let reqId: string | undefined;
   const mark = (name: string, since: number) => {
     timings[name] = Date.now() - since;
   };
@@ -119,8 +175,22 @@ export async function chatCompletions(c: Context) {
 
     // Correlate arrival and dispatch: logged again on the 📤 line once the
     // upstream stream (and its queue wait) is resolved.
-    const reqId = crypto.randomUUID().substring(0, 8);
+    reqId = crypto.randomUUID().substring(0, 8);
     const reqStartedAt = Date.now();
+    // Passive latency span. Default off: beginLatencyTrace returns null and
+    // every later mark is a no-op. Independent of recordAIRequest.
+    beginLatencyTrace({
+      requestId: reqId,
+      model: typeof body.model === "string" ? body.model : "unknown",
+      stream: isStream,
+      tools: declaredTools.length > 0,
+      success: null,
+      retryCount: 0,
+      handoffCount: 0,
+      sessionReused: null,
+      captcha: false,
+      createdSession: false,
+    })?.mark("T0_REQUEST_ACCEPTED");
     const routeLabel = c.req.header("x-qwenproxy-route") || "Chat";
     console.log(
       `📥 [${routeLabel}] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
@@ -136,6 +206,7 @@ export async function chatCompletions(c: Context) {
       accountIds: new Set<string>(),
       lastAccountId: null,
       retries: 0,
+      finalized: false,
     };
 
     // Intercept image/video generation models: they bypass the text chat flow
@@ -150,37 +221,24 @@ export async function chatCompletions(c: Context) {
         kind: mediaKind,
         isStream,
       });
-      // Passive outcome record for the dashboard ring.
-      try {
-        const trace = dashTrace;
-        if (trace) {
-          recordAIRequest({
-            requestId: reqId,
-            httpRequestId: trace.httpRequestId,
-            route: trace.route,
-            model: rawModel,
-            stream: isStream,
-            accountId: null,
-            latencyMs: Date.now() - trace.startMs,
-            success:
-              mediaResponse.status >= 200 && mediaResponse.status < 300,
-            error:
-              mediaResponse.status >= 200 && mediaResponse.status < 300
-                ? null
-                : `media HTTP ${mediaResponse.status}`,
-            errorReason: "media",
-            retryCount: 0,
-            attemptedAccounts: 0,
-          });
-        }
-      } catch {
-        // Recording must never break the request path.
-      }
+      // Media bypasses the text SSE lifecycle, so the handler still owns the
+      // record. The response is complete when handleMediaChatCompletion returns
+      // (streaming media is consumed inside that helper before it resolves).
+      finalizeDashboardTrace(dashTrace, {
+        success: mediaResponse.status >= 200 && mediaResponse.status < 300,
+        error:
+          mediaResponse.status >= 200 && mediaResponse.status < 300
+            ? null
+            : `media HTTP ${mediaResponse.status}`,
+        errorReason: "media",
+        accountId: null,
+      });
       return mediaResponse;
     }
 
     stepStartedAt = Date.now();
     const chatMode = resolveChatMode(c.req.header("x-qwenproxy-chat-mode"));
+    markLatency(reqId, "CONTEXT_PREP_START");
     const ctx = await buildFinalContext({
       messages,
       systemPrompt,
@@ -194,6 +252,7 @@ export async function chatCompletions(c: Context) {
       chatMode,
     });
     mark("context", stepStartedAt);
+    markLatency(reqId, "CONTEXT_PREP_END");
 
     // Chat lock is acquired AFTER stream creation (below) to avoid holding it
     // during account selection, retries, and anti-bot recovery which can take
@@ -307,6 +366,7 @@ export async function chatCompletions(c: Context) {
       messages,
       parallelEscape,
       chatMode,
+      reqId,
     });
 
 
@@ -354,6 +414,12 @@ export async function chatCompletions(c: Context) {
     }
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
+
+    // Streaming: the handler returns the Response before [DONE] and does not
+    // record here. The old "time until the Response is available" is the HTTP
+    // network ring (server.ts middleware, from request entry until Hono returns
+    // this Response). It is not latencyMs. The SSE callback owns the single
+    // AI record and stops it at [DONE].
 
     const params = {
       c,
@@ -405,6 +471,17 @@ export async function chatCompletions(c: Context) {
         }
         streamResult.releaseAccountLease();
       },
+      onObserveStreamEnd: isStream
+        ? (outcome: StreamObservation) => {
+            finalizeDashboardTrace(dashTrace, {
+              success: outcome.success,
+              error: outcome.error,
+              errorReason: outcome.errorReason,
+              accountId: streamResult.activeAccountId,
+              stoppedAt: outcome.stoppedAt,
+            });
+          }
+        : undefined,
     };
 
     // Retry loop for mid-stream/create-stream failures (generic policy)
@@ -418,26 +495,19 @@ export async function chatCompletions(c: Context) {
             const chatResponse = isStream
               ? await processStreamingResponse(currentParams)
               : await processNonStreamingResponse(currentParams);
-            // Passive dashboard trace: terminal success for this request.
-            try {
-              const trace = dashTrace;
-              if (trace) {
-                recordAIRequest({
-                  requestId: reqId,
-                  httpRequestId: trace.httpRequestId,
-                  route: trace.route,
-                  model: trace.model,
-                  stream: trace.stream,
-                  accountId: currentStreamResult.activeAccountId,
-                  latencyMs: Date.now() - trace.startMs,
-                  success: true,
-                  retryCount: trace.retries,
-                  attemptedAccounts: trace.accountIds.size,
-                });
-              }
-            } catch {
-              // Recording must never break the request path.
+            if (!isStream) {
+              // Non-stream: the JSON body is complete when this returns.
+              // Handler keeps ownership and records exactly once.
+              noteLatency(reqId, { success: true });
+              endLatencyTrace(reqId);
+              finalizeDashboardTrace(dashTrace, {
+                success: true,
+                accountId: currentStreamResult.activeAccountId,
+              });
             }
+            // Streaming does not record here. processStreamingResponse has
+            // already returned the Response; the SSE callback records once
+            // after [DONE] (or on stream error / client abort).
             return chatResponse;
           } catch (streamErr: any) {
             const policy = classifyRetryAction(streamErr, {
@@ -698,6 +768,17 @@ export async function chatCompletions(c: Context) {
                 }
                 newStreamResult.releaseAccountLease();
               },
+              onObserveStreamEnd: isStream
+                ? (outcome: StreamObservation) => {
+                    finalizeDashboardTrace(dashTrace, {
+                      success: outcome.success,
+                      error: outcome.error,
+                      errorReason: outcome.errorReason,
+                      accountId: newStreamResult.activeAccountId,
+                      stoppedAt: outcome.stoppedAt,
+                    });
+                  }
+                : undefined,
             };
             continue;
           }
@@ -716,62 +797,36 @@ export async function chatCompletions(c: Context) {
       logger.debug("[chat] request aborted before response", {
         error: err instanceof Error ? err.message : String(err),
       });
-      // Passive dashboard trace: terminal client-abort outcome.
-      try {
-        const trace = dashTrace;
-        if (trace) {
-          recordAIRequest({
-            requestId: trace.requestId,
-            httpRequestId: trace.httpRequestId,
-            route: trace.route,
-            model: trace.model,
-            stream: trace.stream,
-            accountId: trace.lastAccountId,
-            latencyMs: Date.now() - trace.startMs,
-            success: false,
-            error: err instanceof Error ? err.message : String(err),
-            errorReason: "client_abort",
-            retryCount: trace.retries,
-            attemptedAccounts: trace.accountIds.size,
-          });
-        }
-      } catch {
-        // Recording must never break the request path.
-      }
+      // Abort before the Response exists: the SSE callback never runs, so the
+      // handler still owns the single record. Same success=false policy as before.
+      finalizeDashboardTrace(dashTrace, {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        errorReason: "client_abort",
+      });
+      noteLatency(reqId, { success: false });
+      endLatencyTrace(reqId);
       return new Response(null, { status: 499 });
     }
 
-    // Passive dashboard trace: terminal failure outcome.
+    // Error before the Response exists (or a non-stream failure). If streaming
+    // already transferred ownership, finalizeDashboardTrace is a no-op.
+    let reason: string | null = null;
     try {
-      const trace = dashTrace;
-      if (trace) {
-        let reason: string | null = null;
-        try {
-          reason =
-            classifyRetryAction(err, {
-              requestAborted: c.req.raw.signal.aborted,
-            })?.reason ?? null;
-        } catch {
-          reason = null;
-        }
-        recordAIRequest({
-          requestId: trace.requestId,
-          httpRequestId: trace.httpRequestId,
-          route: trace.route,
-          model: trace.model,
-          stream: trace.stream,
-          accountId: trace.lastAccountId,
-          latencyMs: Date.now() - trace.startMs,
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-          errorReason: reason,
-          retryCount: trace.retries,
-          attemptedAccounts: trace.accountIds.size,
-        });
-      }
+      reason =
+        classifyRetryAction(err, {
+          requestAborted: c.req.raw.signal.aborted,
+        })?.reason ?? null;
     } catch {
-      // Recording must never break the request path.
+      reason = null;
     }
+    finalizeDashboardTrace(dashTrace, {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorReason: reason,
+    });
+    noteLatency(reqId, { success: false });
+    endLatencyTrace(reqId);
     return handleChatCompletionsError(c, err);
   } finally {
     // Lock released via onStreamComplete when stream finishes
