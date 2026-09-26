@@ -18,6 +18,7 @@ import { chromium, type BrowserContext, type Page } from "patchright";
 export type ManualVerificationState =
   | "opening"
   | "waiting"
+  | "authenticated"
   | "verifying"
   | "verified"
   | "failed"
@@ -70,6 +71,29 @@ type BrowserLauncher = (
   profileDir: string,
   env: Record<string, string>,
 ) => Promise<{ context: BrowserContext; page: Page }>;
+
+type ChatResponseListener = (res: {
+  url: () => string;
+  ok: () => boolean;
+  status: () => number;
+  text: () => Promise<string>;
+  request: () => { method: () => string };
+}) => void;
+
+/**
+ * Pure success predicate for an observed chat completion response.
+ * Evidence only: returns a boolean, never stores or logs message content.
+ */
+export function isValidChatCompletion(
+  status: number,
+  bodyText: string,
+): boolean {
+  if (!(status >= 200 && status < 300)) return false;
+  if (typeof bodyText !== "string" || bodyText.length === 0) return false;
+  return bodyText.includes("[DONE]") || bodyText.includes('"choices"');
+}
+
+const CHAT_COMPLETIONS_PATH = "/api/v2/chat/completions";
 
 async function defaultBrowserLauncher(
   profileDir: string,
@@ -335,41 +359,79 @@ async function runVerification(accountId: string): Promise<void> {
       // Navigation failure surfaces as failed validation below.
     }
 
+    // Passive completion evidence: observe the user's REAL manual chat via
+    // network responses. Never abort/fulfill (unlike header capture): the
+    // user's chat must flow untouched. Listener installed before any login
+    // so no completion can slip through.
+    let chatEvidence = false;
+    const onResponse: ChatResponseListener = (res) => {
+      void (async () => {
+        try {
+          if (entry.finished || chatEvidence) return;
+          const url = typeof res.url === "function" ? res.url() : "";
+          if (!url.includes(CHAT_COMPLETIONS_PATH)) return;
+          const method =
+            typeof res.request === "function"
+              ? res.request().method?.() ?? ""
+              : "";
+          if (method !== "" && method !== "POST") return;
+          const status = typeof res.status === "function" ? res.status() : 0;
+          const ok = typeof res.ok === "function" ? res.ok() : status >= 200 && status < 300;
+          if (!ok) return;
+          const body = await res.text();
+          if (isValidChatCompletion(status, body)) {
+            chatEvidence = true;
+          }
+        } catch {
+          // A failed read is not evidence; keep waiting.
+        }
+      })();
+    };
+    const detachListener = (): void => {
+      try {
+        (page as { removeListener?: (ev: string, fn: unknown) => void }).removeListener?.(
+          "response",
+          onResponse,
+        );
+      } catch {
+        // Best effort.
+      }
+    };
+    try {
+      (page as { on?: (ev: string, fn: unknown) => void }).on?.(
+        "response",
+        onResponse,
+      );
+    } catch {
+      // If listeners are unsupported, chat evidence can never arrive and the
+      // flow ends in timeout rather than false success.
+    }
+
+    // Phase 1: wait for authoritative login. Login alone NEVER verifies and
+    // NEVER closes the window: the real challenge (slider/CAPTCHA) only
+    // appears when the user sends a chat message.
     setStatus(entry, "waiting", "Waiting for manual login in the visible window");
     const deadline = now() + VERIFY_TIMEOUT_MS;
-    let verified = false;
-    let closedEarly = false;
+    let authenticated = false;
     while (now() < deadline) {
       if (entry.cancelRequested && !entry.finalizing) {
+        detachListener();
         finish("cancelled", "Cancelled by user");
         return;
       }
-      let closed = false;
-      try {
-        closed =
-          typeof page.isClosed === "function"
-            ? page.isClosed()
-            : context === null;
-      } catch {
-        closed = true;
-      }
-      if (closed || context === null) {
+      if (isClosed(page, context)) {
         if (entry.expectedClose) {
-          // Close executed by this flow (e.g. programmatic close racing a
-          // poll tick): consume the flag and keep waiting, never conclude.
           entry.expectedClose = false;
           await deps.sleep(POLL_INTERVAL_MS);
           continue;
         }
-        // T0-authed/T1-poll-pending/T2-user-close race: the close may have
-        // landed after a real login. Never conclude CANCELLED without a final
-        // authoritative check (option B: reopen the same profile and probe).
-        closedEarly = true;
-        break;
+        detachListener();
+        finish("cancelled", "Browser closed before verification");
+        return;
       }
       try {
         if (await deps.isPageLoggedIn(page, 5000)) {
-          verified = true;
+          authenticated = true;
           break;
         }
       } catch {
@@ -377,23 +439,55 @@ async function runVerification(accountId: string): Promise<void> {
       }
       await deps.sleep(POLL_INTERVAL_MS);
     }
-    if (closedEarly && !verified) {
-      verified = await finalCheckAfterClose(entry, accountId);
-      if (entry.finished) return;
-      if (!verified) {
-        finish("cancelled", "Browser closed before verification");
-        return;
-      }
-    }
-    if (!verified) {
+    if (!authenticated) {
+      detachListener();
       finish("failed", "Verification timeout (10 min) without valid session");
       return;
     }
 
-    // Login authoritatively confirmed: from here terminal states are
-    // monotonic and every close below is expected (auto-close after success).
+    // Phase 2: session is AUTHENTICATED but not CHAT_VERIFIED. Keep the
+    // window open; the user sends a test message and solves any slider.
+    setStatus(
+      entry,
+      "authenticated",
+      "Authenticated — send a test message in Qwen",
+    );
+    while (now() < deadline) {
+      if (entry.cancelRequested && !entry.finalizing) {
+        detachListener();
+        finish("cancelled", "Cancelled by user");
+        return;
+      }
+      if (isClosed(page, context)) {
+        if (entry.expectedClose) {
+          entry.expectedClose = false;
+          await deps.sleep(POLL_INTERVAL_MS);
+          continue;
+        }
+        // Close after login but before/without chat evidence: chatEvidence
+        // decides. A just-answered chat sets the flag before its window
+        // closes (case D → verified); otherwise never verified (cases B/C).
+        break;
+      }
+      if (chatEvidence) break;
+      await deps.sleep(POLL_INTERVAL_MS);
+    }
+    detachListener();
+    if (entry.finished) return;
+    if (!chatEvidence) {
+      finish(
+        entry.cancelRequested ? "cancelled" : "failed",
+        entry.cancelRequested
+          ? "Cancelled by user"
+          : "Browser closed before chat verification",
+      );
+      return;
+    }
+
+    // Real chat completion observed: from here terminal states are
+    // monotonic and the auto-close below is expected.
     entry.finalizing = true;
-    setStatus(entry, "verifying", "Capturing session");
+    setStatus(entry, "verifying", "Chat verified, capturing session");
     await closeVisible(entry, context);
     context = null;
     if (!(await completeSuccess(entry, accountId))) return;
@@ -455,48 +549,12 @@ function finishOnEntry(
   setStatus(entry, state, detail);
 }
 
-/**
- * Option B final resolution after an early user close: reopen the SAME
- * profile and run ONE authoritative isPageLoggedIn probe. No URL, cookie,
- * or visibility heuristics count as success.
- */
-async function finalCheckAfterClose(
-  entry: ActiveVerification,
-  accountId: string,
-): Promise<boolean> {
-  if (entry.cancelRequested && !entry.finalizing) {
-    return false;
-  }
-  if (entry.finished) return false;
-  setStatus(entry, "verifying", "Final session check after browser close");
-  let checkContext: BrowserContext | null = null;
+function isClosed(page: Page, context: BrowserContext | null): boolean {
   try {
-    const profileDir = await deps.profileDir(accountId);
-    const display = resolveManualDisplay();
-    if ("error" in display) return false;
-    const launched = await deps.launchBrowser(profileDir, {
-      DISPLAY: display.display,
-      XAUTHORITY: display.xauthority,
-    });
-    checkContext = launched.context;
-    const checkPage = launched.page;
-    try {
-      await checkPage.goto("https://chat.qwen.ai/", {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      });
-    } catch {
-      // Probe below is authoritative regardless of navigation outcome.
-    }
-    try {
-      return await deps.isPageLoggedIn(checkPage, 8000);
-    } catch {
-      return false;
-    }
+    if (context === null) return true;
+    return typeof page.isClosed === "function" ? page.isClosed() : false;
   } catch {
-    return false;
-  } finally {
-    await closeVisible(entry, checkContext);
+    return true;
   }
 }
 
