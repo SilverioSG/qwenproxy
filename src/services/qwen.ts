@@ -996,7 +996,7 @@ export async function requestQwenTextInBrowser(
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
         try {
-          const response = await fetch(url, {
+          let response = await fetch(url, {
             method,
             credentials: "include",
             headers,
@@ -1004,6 +1004,38 @@ export async function requestQwenTextInBrowser(
             signal: controller.signal,
             ...(referrer ? { referrer } : {}),
           });
+
+          // If 401 Unauthorized in browser, try silent in-page token refresh before giving up
+          if (response.status === 401) {
+            try {
+              const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(3000),
+              });
+              if (refreshRes.status === 200) {
+                const refreshJson: any = await refreshRes.json().catch(() => null);
+                if (refreshJson && refreshJson.success === true && refreshJson.data?.token) {
+                  const freshTok = refreshJson.data.token;
+                  localStorage.setItem("token", freshTok);
+                  document.cookie = `token=${encodeURIComponent(freshTok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                  if (headers["authorization"] || headers["Authorization"]) {
+                    headers["authorization"] = `Bearer ${freshTok}`;
+                    headers["Authorization"] = `Bearer ${freshTok}`;
+                  }
+                  response = await fetch(url, {
+                    method,
+                    credentials: "include",
+                    headers,
+                    body,
+                    signal: controller.signal,
+                    ...(referrer ? { referrer } : {}),
+                  });
+                }
+              }
+            } catch {}
+          }
+
           return {
             status: response.status,
             contentType: response.headers.get("content-type") || "",
@@ -1147,20 +1179,7 @@ async function requestQwenPersonalizationInBrowser(
   headers: Record<string, string>,
   payload?: Record<string, unknown>,
 ): Promise<{ status: number; raw: string; json: any }> {
-  // If browser-only fetch is disabled, try direct Node fetch as fast-path
-  if (!config.qwen.browserOnlyFetch && !isAuthMockEnabled()) {
-    const direct = await requestQwenSettingsDirectFetch(
-      accountId,
-      method,
-      path,
-      headers,
-      payload,
-    );
-    if (direct) {
-      return direct;
-    }
-  }
-
+  // Always route personalization through stealth browser page (user constraint: tudo via browser stealth)
   const response = await requestQwenTextInBrowser(
     accountId,
     method,
