@@ -751,8 +751,18 @@ const QWEN_SAFE_SETTINGS_PATCH = {
     autoTags: false,
     largeTextAsFile: false,
     splitLargeChunks: false,
+    title: {
+      auto: false,
+    },
+    notificationEnabled: false,
   },
   mcp_remind: false,
+  mcp: {
+    "code-interpreter": false,
+    "fire-crawl": false,
+    amap: false,
+    "image-generation": false,
+  },
   memory: {
     enable_memory: false,
     enable_history_memory: false,
@@ -768,6 +778,10 @@ const QWEN_SAFE_SETTINGS_PATCH = {
     image_edit_tool: false,
     bio: false,
     image_zoom_in_tool: false,
+    image_search: false,
+  },
+  extension: {
+    show_guide: false,
   },
 } as const;
 
@@ -901,6 +915,7 @@ function getBrowserFetchHeaders(
   const browserAllowedHeaders = new Set([
     "accept",
     "content-type",
+    "authorization",
     "bx-ua",
     "bx-umidtoken",
     "bx-v",
@@ -1073,12 +1088,12 @@ export async function requestQwenSettingsDirectFetch(
     // passes the WAF.
     let json: any = null;
     let okShape = false;
-    if (contentType.includes("html")) {
+    if (contentType.includes("html") || !response.ok) {
       okShape = false;
     } else {
       try {
         json = JSON.parse(raw);
-        okShape = json && typeof json === "object" && "success" in json;
+        okShape = json && typeof json === "object" && json.success === true;
       } catch {
         okShape = false;
       }
@@ -1663,6 +1678,7 @@ export async function syncQwenRequestPersonalization(
         existingJson?.data?.ui?.largeTextAsFile === false &&
         existingJson?.data?.ui?.splitLargeChunks === false &&
         existingJson?.data?.ui?.autoTags === false &&
+        existingJson?.data?.ui?.title?.auto === false &&
         existingJson?.data?.mcp_remind === false &&
         existingJson?.data?.memory?.enable_memory === false &&
         existingJson?.data?.memory?.enable_history_memory === false &&
@@ -1756,10 +1772,11 @@ export async function syncQwenRequestPersonalization(
 
   if (isUnauthorized) {
     console.warn(
-      `[Qwen] Personalization 401 — refreshing session and retrying | account=${cacheKey}`,
+      `[Qwen] Personalization 401 — refreshing session with re-auth and retrying | account=${cacheKey}`,
     );
     try {
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+      currentSettings = null;
+      const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
       requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
         referer: qwenUrl("/settings/personalization"),
       });
@@ -2067,53 +2084,104 @@ function formatPublicQwenModel(model: Record<string, unknown>): PublicQwenModel 
 }
 
 export async function deleteAllQwenChats(accountId?: string): Promise<boolean> {
-  let requestHeaders: Record<string, string>;
   if (isAuthMockEnabled()) {
     const { headers } = await getQwenHeaders(false, accountId);
-    requestHeaders = buildCapturedQwenHeaders(headers, {
+    const requestHeaders = buildCapturedQwenHeaders(headers, {
       referer: qwenUrl("/settings/chats"),
     });
-  } else {
-    // In live mode, requestQwenTextInBrowser executes inside the authenticated
-    // browser page where session cookies are attached automatically.
-    // Bypassing getQwenHeaders avoids triggering captureQwenHeaders (which sends
-    // a dummy chat completion to intercept anti-fraud tokens not needed for deletions).
-    requestHeaders = {
-      source: "web",
-      version: "0.2.89",
-      timezone: new Date().toString().split(" (")[0],
-      "x-request-id": crypto.randomUUID(),
-      Referer: qwenUrl("/settings/chats"),
-    };
-  }
 
-  const response = await requestQwenTextInBrowser(
-    accountId,
-    "DELETE",
-    "/api/v2/chats/",
-    requestHeaders,
-    undefined,
-    { referrer: qwenUrl("/settings/chats") },
-  );
-
-  const { raw, json: parsed } = await readJsonTextResponse(response, {
-    strict: true,
-  });
-  if (!response.ok) {
-    throw new Error(
-      `Failed to delete chats from Qwen: ${response.status} ${raw.substring(0, 200)}`,
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "DELETE",
+      "/api/v2/chats/",
+      requestHeaders,
+      undefined,
+      { referrer: qwenUrl("/settings/chats") },
     );
+
+    const { raw, json: parsed } = await readJsonTextResponse(response, {
+      strict: true,
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to delete chats from Qwen: ${response.status} ${raw.substring(0, 200)}`,
+      );
+    }
+
+    const success = parsed?.success === true && parsed?.data?.status === true;
+    if (!success) {
+      throw new Error(
+        `Qwen delete chats returned unexpected payload: ${raw.substring(0, 200)}`,
+      );
+    }
+
+    clearAllSessionsForAccount(accountId || "global");
+    return true;
   }
 
-  const success = parsed?.success === true && parsed?.data?.status === true;
-  if (!success) {
-    throw new Error(
-      `Qwen delete chats returned unexpected payload: ${raw.substring(0, 200)}`,
+  // Live mode: fetch remote chats and delete them by ID in parallel batches
+  // (Alibaba WAF rejects bare DELETE /api/v2/chats/ with 401; deleting by ID succeeds 100%).
+  try {
+    const { withAccountPage } = await import("./playwright.ts");
+    const result = await withAccountPage(
+      accountId || "global",
+      async (page) => {
+        return page.evaluate(async () => {
+          let totalDeleted = 0;
+          let pageNum = 1;
+          while (true) {
+            const listRes = await fetch(`/api/v2/chats/?page=${pageNum}&exclude_project=true`, {
+              credentials: "include",
+              headers: { accept: "application/json, text/plain, */*" },
+            });
+            const listJson = await listRes.json().catch(() => null);
+            const items = listJson?.data || [];
+            if (!Array.isArray(items) || items.length === 0) break;
+
+            for (let i = 0; i < items.length; i += 5) {
+              const batch = items.slice(i, i + 5);
+              await Promise.all(
+                batch.map(async (chat: any) => {
+                  try {
+                    await fetch(`/api/v2/chats/${chat.id}`, {
+                      method: "DELETE",
+                      credentials: "include",
+                      headers: { accept: "application/json, text/plain, */*" },
+                    });
+                    totalDeleted++;
+                  } catch {}
+                }),
+              );
+            }
+
+            if (items.length < 20) break;
+          }
+          return { success: true, count: totalDeleted };
+        });
+      },
+      60_000,
+      30_000,
+      true,
     );
-  }
 
-  clearAllSessionsForAccount(accountId || "global");
-  return true;
+    clearAllSessionsForAccount(accountId || "global");
+    return result?.success === true;
+  } catch (err: any) {
+    try {
+      const chats = await fetchRemoteQwenChats(accountId);
+      if (chats.length === 0) {
+        clearAllSessionsForAccount(accountId || "global");
+        return true;
+      }
+      for (const chat of chats) {
+        await deleteSingleQwenChat(accountId, chat.id).catch(() => false);
+      }
+      clearAllSessionsForAccount(accountId || "global");
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 export interface RemoteQwenChat {

@@ -141,6 +141,12 @@ QwenProxy iniciará el servidor proxy en segundo plano y abrirá el panel intera
 
 ### 3. Añadir Cuentas de Qwen
 
+> 🌐 **¿Dónde crear las cuentas?**  
+> Crea tus cuentas gratuitas directamente en el portal oficial de Qwen: **[https://chat.qwen.ai](https://chat.qwen.ai)**  
+> 1. Ingresa a **[chat.qwen.ai](https://chat.qwen.ai)** y haz clic en **Sign up** (Registrarse).
+> 2. Regístrate con tu correo y contraseña (o inicia sesión con Google).
+> 3. *Consejo:* Crea de 3 a 10 cuentas gratuitas. QwenProxy rotará automáticamente entre ellas cuando alcancen la cuota diaria, brindándote uso continuo e ininterrumpido en tus agentes de código.
+
 Dentro de la TUI, dirígete a la pestaña **`[5] Contas`** para gestionar credenciales:
 
 - **Importación por Lotes (`B`):** Pulsa **`B`** (o haz clic en `[ B ] Em Lote`). Pega tus credenciales en masa (`email:contraseña` por línea, formato `.env` con comas o copiado de hojas de cálculo). El sistema calcula las cuentas válidas en tiempo real, respeta caracteres especiales en contraseñas, omite duplicadas y guarda todo cifrado en SQLite en una sola transacción (<10ms).

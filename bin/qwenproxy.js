@@ -107,14 +107,24 @@ if (firstArg === "start" || rawArgs.includes("--server")) {
   scriptArgs = ["--tui", ...rawArgs];
 }
 
-const targetPath = path.resolve(packageRoot, scriptFile);
+const distFile = scriptFile.replace(/^src[\\/]/, "dist/").replace(/\.ts$/, ".js");
+const distPath = path.resolve(packageRoot, distFile);
+let targetPath = path.resolve(packageRoot, scriptFile);
+let runWithTsx = true;
+
+if (fs.existsSync(distPath)) {
+  targetPath = distPath;
+  runWithTsx = false;
+}
 
 // Resolve tsx loader relative to the package installation rather than cwd
 let tsxLoaderArg = "tsx";
-try {
-  const tsxEntry = require.resolve("tsx");
-  tsxLoaderArg = pathToFileURL(tsxEntry).href;
-} catch {}
+if (runWithTsx) {
+  try {
+    const tsxEntry = require.resolve("tsx");
+    tsxLoaderArg = pathToFileURL(tsxEntry).href;
+  } catch {}
+}
 
 // Ensure Playwright Chromium is installed only for commands that need the browser
 const browserCommands = ["start", "tui", "login"];
@@ -183,15 +193,23 @@ if (isBrowserCommand) {
         console.log("✓ [QwenProxy] Navegador instalado com sucesso!\n");
         // Automatically prune older, unused browser builds to free up disk space
         try {
-          const { cleanPlaywrightBrowsers } = await import("../src/clean-cache.ts");
-          await cleanPlaywrightBrowsers(true);
+          const cleanModule = fs.existsSync(path.resolve(packageRoot, "dist/clean-cache.js"))
+            ? await import("../dist/clean-cache.js")
+            : await import("../src/clean-cache.ts");
+          if (cleanModule.cleanPlaywrightBrowsers) {
+            await cleanModule.cleanPlaywrightBrowsers(true);
+          }
         } catch {}
       }
     }
   } catch {}
 }
 
-const child = spawn(process.execPath, ["--import", tsxLoaderArg, targetPath, ...scriptArgs], {
+const nodeArgs = runWithTsx
+  ? ["--import", tsxLoaderArg, targetPath, ...scriptArgs]
+  : [targetPath, ...scriptArgs];
+
+const child = spawn(process.execPath, nodeArgs, {
   stdio: "inherit",
   cwd: process.cwd(),
   env: process.env,

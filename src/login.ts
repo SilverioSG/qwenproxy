@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import {
   addAccount,
   removeAccount,
@@ -76,30 +77,76 @@ async function addAccountFlow() {
   clear();
   console.log("=== Add New Account ===\n");
   const email = await askQuestion("Email: ");
-  if (!email) {
+  if (!email || !email.trim()) {
     console.log("Email is required.");
     await askQuestion("Press Enter to continue...");
     return;
   }
 
   const password = await askQuestion("Password: ");
-  if (!password) {
+  if (!password || !password.trim()) {
     console.log("Password is required.");
     await askQuestion("Press Enter to continue...");
     return;
   }
 
-  let account: QwenAccount | null = null;
-  try {
-    account = addAccount(email, password);
-    console.log(`Account added: ${maskEmail(account.email)} (${account.id})`);
-    console.log("Credentials will be validated by Playwright on server start.");
-  } catch (err: any) {
-    if (account) removeAccount(account.id);
-    console.log(`\nError: ${err.message}`);
+  const trimmedEmail = email.trim();
+  const trimmedPassword = password.trim();
+
+  const existingAccounts = listAccounts();
+  if (
+    existingAccounts.some(
+      (a) => a.email.toLowerCase() === trimmedEmail.toLowerCase(),
+    )
+  ) {
+    console.log(
+      `\n❌ Error: An account with email "${trimmedEmail}" already exists.`,
+    );
+    await askQuestion("Press Enter to continue...");
+    return;
   }
 
-  await askQuestion("Press Enter to continue...");
+  const tempId = crypto.randomUUID();
+  console.log(
+    `\n⏳ Validating credentials for ${maskEmail(trimmedEmail)} with Qwen via Playwright...`,
+  );
+
+  let account: QwenAccount | null = null;
+  try {
+    const { validateAccountLogin } = await import("./services/playwright.ts");
+    const { wipeAccountSessionFiles } = await import("./core/accounts.ts");
+    const { clearAccountCooldown } = await import("./core/account-manager.ts");
+    const { config } = await import("./core/config.ts");
+
+    const ok = await validateAccountLogin(
+      { id: tempId, email: trimmedEmail, password: trimmedPassword },
+      config.playwright.headless,
+      config.playwright.browser,
+    );
+
+    if (ok) {
+      account = addAccount(trimmedEmail, trimmedPassword, tempId);
+      console.log(
+        `\n✅ Account verified and saved: ${maskEmail(account.email)} (${account.id})`,
+      );
+    } else {
+      wipeAccountSessionFiles(tempId);
+      clearAccountCooldown(tempId);
+      console.log(
+        `\n❌ Authentication failed: Invalid credentials or unhandled login challenge.`,
+      );
+      console.log("The account was NOT saved.");
+    }
+  } catch (err: any) {
+    const { wipeAccountSessionFiles } = await import("./core/accounts.ts");
+    const { clearAccountCooldown } = await import("./core/account-manager.ts");
+    wipeAccountSessionFiles(tempId);
+    clearAccountCooldown(tempId);
+    console.log(`\n❌ Validation error: ${err?.message || String(err)}`);
+    console.log("The account was NOT saved.");
+  }
+
+  await askQuestion("\nPress Enter to continue...");
 }
 
 async function removeAccountFlow() {

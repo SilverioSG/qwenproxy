@@ -242,6 +242,8 @@ export function isQuotaLikeError(err: unknown): boolean {
   return (
     code === "quota_limit" ||
     code === "ratelimited" ||
+    code === "membership_limit" ||
+    code === "membershiplimit" ||
     message.includes("quota_limit") ||
     message.includes("quota exceeded") ||
     message.includes("allocated quota") ||
@@ -253,11 +255,16 @@ export function isQuotaLikeError(err: unknown): boolean {
     message.includes("rate increased too quickly") ||
     message.includes("upper limit for today's usage") ||
     message.includes("you've reached the upper limit") ||
+    message.includes("membership_limit") ||
+    message.includes("membership limit") ||
+    message.includes("update_member") ||
+    message.includes("update member") ||
     // Accept local rate_limit code only when message also looks like quota/rate
     (code === "rate_limit_exceeded" &&
       (message.includes("quota") ||
         message.includes("rate") ||
         message.includes("limit") ||
+        message.includes("membership") ||
         message.includes("demanda") ||
         message.includes("demand")))
   );
@@ -472,11 +479,15 @@ export function classifyRetryAction(
   // Agent instructions ride ONLY the account-level personalization. An
   // unconfirmed sync means this account cannot serve the request as-is —
   // rotate to another account (each attempt re-syncs on its own account).
+  // Park the failing account with PersonalizationFailed cooldown so it does
+  // not enter an infinite ping-pong loop when multiple accounts fail.
   if (err instanceof PersonalizationSyncError) {
     return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryAfterMs: baseDelayMs,
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "PersonalizationFailed",
     });
   }
 

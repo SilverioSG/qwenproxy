@@ -91,3 +91,15 @@ test("quota: markAccountRateLimited with no explicit duration falls back to the 
   assert.ok(info.remainingMs > 0);
   assert.ok(before <= Date.now());
 });
+
+test("quota: update_member and membership limit error rotates account and sets midnight cooldown", () => {
+  const err = Object.assign(
+    new Error("Qwen upstream membership limit reached (update_member); rotating account"),
+    { code: "membership_limit", upstreamStatus: 429 },
+  );
+  const action = classifyRetryAction(err);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.reason, "quota_or_rate_limit");
+  assert.ok(action.accountCooldownMs! > 0);
+  assert.ok(action.accountCooldownMs! <= 24 * 60 * 60 * 1000);
+});

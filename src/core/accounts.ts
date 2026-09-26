@@ -2,9 +2,10 @@ import "dotenv/config";
 import crypto from "crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { getDatabase } from "./database.ts";
+import { getDatabase, deleteAuthSession } from "./database.ts";
 import { decrypt, encrypt } from "./crypto-utils.ts";
-import { getAccountProfilePath, getProfilesDir } from "./paths.ts";
+import { getAccountProfilePath, getProfilesDir, isRunningUnderNodeTest } from "./paths.ts";
+import { updateEnvVariable } from "./local-auth.ts";
 
 export interface QwenAccount {
   id: string;
@@ -12,6 +13,29 @@ export interface QwenAccount {
   password: string;
   cooldown_until?: number;
   cooldown_reason?: string | null;
+}
+
+export function isPlaceholderAccountEmail(email: string, password?: string): boolean {
+  if (!email || typeof email !== "string") return false;
+  const clean = email.trim().toLowerCase();
+  if (
+    clean === "email1@example.com" ||
+    clean === "email2@example.com" ||
+    clean === "user@example.com" ||
+    clean === "test@example.com" ||
+    clean === "your-email@example.com" ||
+    clean.startsWith("email1@") ||
+    clean.startsWith("email2@")
+  ) {
+    return true;
+  }
+  if (
+    password &&
+    (password === "password1" || password === "password2" || password === "changeme")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function generateId(email: string): string {
@@ -59,10 +83,12 @@ function parseEnvAccounts(): QwenAccount[] {
       }
       const email = clean(trimmed.substring(0, colonIdx));
       const password = clean(trimmed.substring(colonIdx + 1));
-      if (!email || !password) {
-        console.warn(
-          `[Accounts] Invalid QWEN_ACCOUNTS entry at index ${index}: "${trimmed}"`,
-        );
+      if (!email || !password || isPlaceholderAccountEmail(email, password)) {
+        if (!email || !password) {
+          console.warn(
+            `[Accounts] Invalid QWEN_ACCOUNTS entry at index ${index}: "${trimmed}"`,
+          );
+        }
         return null;
       }
       return {
@@ -79,6 +105,17 @@ let lastSyncTime = 0;
 const SYNC_INTERVAL = 30_000;
 
 function syncEnvAccounts(): void {
+  const db = getDatabase();
+  // Automatically purge any dummy placeholder accounts that may have been seeded from .env.example
+  try {
+    db.prepare(`
+      DELETE FROM accounts
+      WHERE lower(email) IN ('email1@example.com', 'email2@example.com', 'user@example.com', 'test@example.com', 'your-email@example.com')
+         OR lower(email) LIKE 'email1@%'
+         OR lower(email) LIKE 'email2@%'
+    `).run();
+  } catch {}
+
   const envAccounts = process.env.QWEN_ACCOUNTS || "";
   const now = Date.now();
   if (envAccounts === lastSyncedEnv && now - lastSyncTime < SYNC_INTERVAL)
@@ -90,7 +127,6 @@ function syncEnvAccounts(): void {
   const accounts = parseEnvAccounts();
   if (accounts.length === 0) return;
 
-  const db = getDatabase();
   const upsert = db.prepare(`
     INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)
     ON CONFLICT(email) DO UPDATE SET password = excluded.password, updated_at = datetime('now')
@@ -124,15 +160,17 @@ function getCachedAccounts(): QwenAccount[] {
     )
     .all() as QwenAccount[];
 
-  accountsCache = rows.map((row) => {
-    let password = "";
-    try {
-      password = decrypt(row.password);
-    } catch {
-      password = "";
-    }
-    return { ...row, password };
-  });
+  accountsCache = rows
+    .filter((row) => !isPlaceholderAccountEmail(row.email))
+    .map((row) => {
+      let password = "";
+      try {
+        password = decrypt(row.password);
+      } catch {
+        password = "";
+      }
+      return { ...row, password };
+    });
   accountsCacheTime = now;
   return accountsCache;
 }
@@ -316,22 +354,86 @@ export function addAccount(
   return newAccount;
 }
 
-function wipeAccountSessionFiles(id: string): void {
+export function wipeAccountSessionFiles(id: string): void {
   const profilePath = getAccountProfilePath(id);
   try {
     fs.rmSync(profilePath, { recursive: true, force: true });
-  } catch {}
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error ?? "");
+    if (
+      message.includes("EPERM") ||
+      message.includes("EBUSY") ||
+      message.includes("Permission denied")
+    ) {
+      try {
+        const stalePath = `${profilePath}.stale-${Date.now()}`;
+        fs.renameSync(profilePath, stalePath);
+      } catch {}
+    }
+  }
   const siblingState = path.join(getProfilesDir(), `${id}_state.json`);
   try {
     fs.rmSync(siblingState, { force: true });
   } catch {}
 }
 
+export function removeAccountFromEnv(emailToRemove: string): void {
+  const target = emailToRemove.trim().toLowerCase();
+  const rawEnv = process.env.QWEN_ACCOUNTS;
+  if (!rawEnv) return;
+
+  const clean = (s: string) => s.trim().replace(/^[,;\s"'`]+|[,;\s"'`]+$/g, "").trim();
+  const lines = rawEnv.split(/[\r\n;]+/);
+  const remaining: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = clean(rawLine);
+    if (!line) continue;
+
+    if (line.includes(",") && (line.match(/@/g) || []).length > 1) {
+      for (const seg of line.split(",")) {
+        const trimmed = clean(seg);
+        if (!trimmed) continue;
+        const colonIdx = trimmed.indexOf(":");
+        const email = clean(colonIdx !== -1 ? trimmed.substring(0, colonIdx) : trimmed);
+        if (email.toLowerCase() !== target && !isPlaceholderAccountEmail(email)) {
+          remaining.push(trimmed);
+        }
+      }
+    } else {
+      const colonIdx = line.indexOf(":");
+      const email = clean(colonIdx !== -1 ? line.substring(0, colonIdx) : line);
+      if (email.toLowerCase() !== target && !isPlaceholderAccountEmail(email)) {
+        remaining.push(line);
+      }
+    }
+  }
+
+  const newEnvValue = remaining.join(",");
+  process.env.QWEN_ACCOUNTS = newEnvValue;
+  lastSyncedEnv = newEnvValue;
+  lastSyncTime = Date.now();
+
+  if (!isRunningUnderNodeTest()) {
+    try {
+      updateEnvVariable("QWEN_ACCOUNTS", newEnvValue);
+    } catch {}
+  }
+}
+
 export function removeAccount(id: string): boolean {
   const db = getDatabase();
+  const account = db
+    .prepare("SELECT email FROM accounts WHERE id = ?")
+    .get(id) as { email: string } | undefined;
   const result = db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
   if (result.changes > 0) {
     wipeAccountSessionFiles(id);
+    deleteAuthSession(id);
+    if (account?.email) {
+      removeAccountFromEnv(account.email);
+    }
   }
   invalidateAccountsCache();
   return result.changes > 0;

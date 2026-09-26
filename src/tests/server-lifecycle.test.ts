@@ -56,7 +56,7 @@ test("server startup fails without configured accounts outside mock mode", async
     invalidateAccountsCache();
 
     await assert.rejects(
-      () => startServer({ installSignalHandlers: false }),
+      () => startServer({ installSignalHandlers: false, showBanner: false }),
       /No Qwen accounts configured/,
     );
   } finally {
@@ -95,7 +95,7 @@ test("server lifecycle starts and stops in mock mode without real accounts", asy
     getDatabase().prepare("DELETE FROM accounts").run();
     invalidateAccountsCache();
 
-    const started = await startServer({ installSignalHandlers: false });
+    const started = await startServer({ installSignalHandlers: false, showBanner: false });
     assert.equal(started.port, port);
     assert.ok(started.url.includes(String(port)));
 
@@ -145,7 +145,7 @@ test("server startup fails fast with an explanatory message when the port is alr
     invalidateAccountsCache();
 
     await assert.rejects(
-      () => startServer({ installSignalHandlers: false }),
+      () => startServer({ installSignalHandlers: false, showBanner: false }),
       (err: Error) => {
         assert.match(err.message, /already in use/);
         assert.match(err.message, /PORT=3001 npm start/);

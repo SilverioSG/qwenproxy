@@ -89,6 +89,14 @@ export function buildQwenRequestHeaders(
     "sec-ch-ua-platform": opts.secChUaPlatform || '"Windows"',
   };
 
+  const tokenMatch = opts.cookie?.match(/(?:^|;\s*)token=([^;]+)/);
+  if (tokenMatch && !headers["Authorization"] && !headers["authorization"]) {
+    const bearer = decodeURIComponent(tokenMatch[1].trim());
+    if (bearer && bearer !== '""' && bearer !== "null") {
+      headers["Authorization"] = `Bearer ${bearer}`;
+    }
+  }
+
   // The real chat.qwen.ai client sends ONLY bx-v on API requests — the WAF
   // carries bx-ua/bx-umidtoken as browser cookies, not headers. Match that
   // unless QWEN_SEND_BX_UA=true restores the legacy injection.

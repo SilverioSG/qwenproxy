@@ -141,8 +141,13 @@ function runMigrations(db: Database.Database): void {
       bx_v TEXT,
       bx_ua TEXT,
       bx_umidtoken TEXT,
+      sec_ch_ua TEXT,
+      sec_ch_ua_mobile TEXT,
+      sec_ch_ua_platform TEXT,
+      version TEXT,
       user_id TEXT,
       token_expires_at INTEGER,
+      captured_at INTEGER DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -180,6 +185,22 @@ function runMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE accounts ADD COLUMN cooldown_reason TEXT;`);
   } catch (err) {
     if (!isDuplicateColumnError(err)) throw err;
+  }
+
+  // qwen_auth_sessions columns migration
+  const authSessionCols = [
+    "sec_ch_ua TEXT",
+    "sec_ch_ua_mobile TEXT",
+    "sec_ch_ua_platform TEXT",
+    "version TEXT",
+    "captured_at INTEGER DEFAULT 0",
+  ];
+  for (const col of authSessionCols) {
+    try {
+      db.exec(`ALTER TABLE qwen_auth_sessions ADD COLUMN ${col};`);
+    } catch (err) {
+      if (!isDuplicateColumnError(err)) throw err;
+    }
   }
 }
 
@@ -273,4 +294,122 @@ export function closeDatabase(): void {
     db.close();
     db = null;
   }
+}
+
+export interface PersistedAuthSession {
+  accountId: string;
+  cookie: string;
+  userAgent: string;
+  bxV: string;
+  bxUa: string;
+  bxUmidtoken: string;
+  secChUa?: string;
+  secChUaMobile?: string;
+  secChUaPlatform?: string;
+  version?: string;
+  userId?: string;
+  tokenExpiresAt?: number;
+  capturedAt: number;
+}
+
+export function saveAuthSession(
+  accountId: string,
+  session: {
+    cookie: string;
+    userAgent: string;
+    bxV?: string;
+    bxUa?: string;
+    bxUmidtoken?: string;
+    secChUa?: string;
+    secChUaMobile?: string;
+    secChUaPlatform?: string;
+    version?: string;
+    userId?: string;
+    tokenExpiresAt?: number;
+    capturedAt?: number;
+  },
+): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT OR REPLACE INTO qwen_auth_sessions (
+      account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
+      sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
+      user_id, token_expires_at, captured_at, updated_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, datetime('now')
+    )
+  `);
+  stmt.run(
+    accountId,
+    session.cookie,
+    session.userAgent,
+    session.bxV || "2.5.37",
+    session.bxUa || "",
+    session.bxUmidtoken || "",
+    session.secChUa || null,
+    session.secChUaMobile || null,
+    session.secChUaPlatform || null,
+    session.version || null,
+    session.userId || null,
+    session.tokenExpiresAt || null,
+    session.capturedAt ?? Date.now(),
+  );
+}
+
+export function getValidAuthSession(
+  accountId: string,
+  maxAgeMs = 30 * 24 * 60 * 60 * 1000,
+): PersistedAuthSession | null {
+  const database = getDatabase();
+  const row = database
+    .prepare(
+      `SELECT account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
+              sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
+              user_id, token_expires_at, captured_at
+       FROM qwen_auth_sessions WHERE account_id = ?`,
+    )
+    .get(accountId) as any;
+
+  if (!row) return null;
+
+  const capturedAt = Number(row.captured_at) || 0;
+  if (capturedAt <= 0 || Date.now() - capturedAt > maxAgeMs) {
+    return null;
+  }
+
+  if (row.token_expires_at) {
+    const tokenExpMs = Number(row.token_expires_at) * 1000;
+    // Safety margin of 5 minutes before token expires
+    if (tokenExpMs <= Date.now() + 5 * 60 * 1000) {
+      return null;
+    }
+  }
+
+  // Ensure critical fields are non-empty
+  if (!row.cookie || !row.user_agent || !row.bx_v || !row.bx_ua || !row.bx_umidtoken) {
+    return null;
+  }
+
+  return {
+    accountId: row.account_id,
+    cookie: row.cookie,
+    userAgent: row.user_agent,
+    bxV: row.bx_v,
+    bxUa: row.bx_ua,
+    bxUmidtoken: row.bx_umidtoken,
+    secChUa: row.sec_ch_ua || undefined,
+    secChUaMobile: row.sec_ch_ua_mobile || undefined,
+    secChUaPlatform: row.sec_ch_ua_platform || undefined,
+    version: row.version || undefined,
+    userId: row.user_id || undefined,
+    tokenExpiresAt: row.token_expires_at ? Number(row.token_expires_at) : undefined,
+    capturedAt,
+  };
+}
+
+export function deleteAuthSession(accountId: string): void {
+  const database = getDatabase();
+  database.prepare("DELETE FROM qwen_auth_sessions WHERE account_id = ?").run(accountId);
 }

@@ -11,6 +11,9 @@ import {
   getAccountCredentials,
   loadAccounts,
   invalidateAccountsCache,
+  removeAccount,
+  isPlaceholderAccountEmail,
+  removeAccountFromEnv,
 } from "../core/accounts.ts";
 import { closeDatabase, getDatabase } from "../core/database.ts";
 
@@ -181,4 +184,51 @@ test("addAccountsBatch: inserts multiple accounts in a single transaction, skips
   assert.equal(duplicateResult.added.length, 0);
   assert.equal(duplicateResult.skipped.length, 3);
   assert.ok(duplicateResult.skipped.includes("batch1@test.com"));
+});
+
+test("isPlaceholderAccountEmail: identifies placeholder example accounts and passwords", () => {
+  assert.equal(isPlaceholderAccountEmail("email1@example.com"), true);
+  assert.equal(isPlaceholderAccountEmail("email2@example.com"), true);
+  assert.equal(isPlaceholderAccountEmail("user@example.com"), true);
+  assert.equal(isPlaceholderAccountEmail("test@example.com"), true);
+  assert.equal(isPlaceholderAccountEmail("myuser@domain.com", "password1"), true);
+  assert.equal(isPlaceholderAccountEmail("myuser@domain.com", "realpassword123"), false);
+  assert.equal(isPlaceholderAccountEmail("realuser@gmail.com"), false);
+});
+
+test("removeAccount: removes account from both SQLite and QWEN_ACCOUNTS to prevent resurrection", () => {
+  restoreRows = snapshotAccounts();
+  process.env.QWEN_ACCOUNTS = "keep@test.com:pass1;delete-me@test.com:pass2";
+
+  // Force sync from env
+  invalidateAccountsCache();
+  const loaded = loadAccounts();
+  const toDelete = loaded.find((a) => a.email === "delete-me@test.com");
+  assert.ok(toDelete, "delete-me account must be loaded from env");
+
+  // Remove the account
+  const removed = removeAccount(toDelete.id);
+  assert.equal(removed, true, "removeAccount must return true");
+
+  // Verify it is removed from process.env.QWEN_ACCOUNTS
+  assert.ok(
+    !process.env.QWEN_ACCOUNTS.includes("delete-me@test.com"),
+    "Account must be removed from process.env.QWEN_ACCOUNTS",
+  );
+  assert.ok(
+    process.env.QWEN_ACCOUNTS.includes("keep@test.com"),
+    "Kept account must remain in process.env.QWEN_ACCOUNTS",
+  );
+
+  // Invalidate cache and reload: account must NOT resurrect
+  invalidateAccountsCache();
+  const reloaded = loadAccounts();
+  assert.ok(
+    !reloaded.some((a) => a.email === "delete-me@test.com"),
+    "Deleted account must not resurrect after cache invalidation",
+  );
+  assert.ok(
+    reloaded.some((a) => a.email === "keep@test.com"),
+    "Kept account must still exist in reloaded accounts",
+  );
 });

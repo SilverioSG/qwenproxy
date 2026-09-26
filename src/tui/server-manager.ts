@@ -247,9 +247,11 @@ export class ServerManager {
 
     // 2. Start in-process
     this.state = "warming";
+    const { getAppVersion } = await import("../core/version.ts");
+    const appVersion = getAppVersion();
     this.appendLog(
       "INFO",
-      `🚀 [Server] Iniciando servidor na porta ${port}...`,
+      `🚀 [Server] Iniciando QwenProxy ${appVersion} na porta ${port}...`,
     );
 
     this.interceptLogs();
@@ -282,8 +284,14 @@ export class ServerManager {
     }
     this.restoreLogs();
     try {
+      await stopServer();
       this.state = "offline";
     } catch {}
+  }
+
+  public async restart(): Promise<void> {
+    await this.stop();
+    await this.ensureStarted();
   }
 
   public startRemoteLogStream(host: string, port: number): void {

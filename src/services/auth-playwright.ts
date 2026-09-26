@@ -94,36 +94,13 @@ export async function getBasicHeaders(accountId?: string): Promise<{
   return getPlaywrightBasicHeaders(resolvedAccountId);
 }
 
-export function isTokenExpiringSoon(
-  cookie: string,
-  minutesBeforeExpiry = 5,
-): boolean {
-  const tokenMatch = cookie.match(/token=([^;]+)/);
-  if (!tokenMatch) return false;
-
-  try {
-    const token = decodeURIComponent(tokenMatch[1]);
-    const segments = token.split(".");
-    // Some Qwen deployments use opaque cookies. Treating those as expired
-    // forces expensive header capture on every personalization request.
-    if (segments.length !== 3 || !segments[1]) return false;
-
-    const payloadJson = Buffer.from(segments[1], "base64url").toString("utf-8");
-    const payload = JSON.parse(payloadJson);
-    const exp = payload.exp;
-    if (typeof exp !== "number" || !Number.isFinite(exp)) return false;
-
-    const nowSec = Math.floor(Date.now() / 1000);
-    const thresholdSec = minutesBeforeExpiry * 60;
-    return exp - nowSec < thresholdSec;
-  } catch {
-    return false;
-  }
-}
+import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
+export { parseJwtExpiry, isTokenExpiringSoon };
 
 export async function getQwenHeaders(
   forceNew = false,
   accountId?: string,
+  forceReauth = false,
 ): Promise<HeaderResult> {
   if (isAuthMockEnabled()) {
     const basic = await getBasicHeaders(accountId);
@@ -150,8 +127,8 @@ export async function getQwenHeaders(
 
   await ensurePlaywrightInitialized(resolvedAccountId);
 
-  if (forceNew) {
-    await refreshHeaders(resolvedAccountId);
+  if (forceNew || forceReauth) {
+    await refreshHeaders(resolvedAccountId, config.timeouts.headers, forceReauth);
   }
 
   const basic = await getPlaywrightBasicHeaders(resolvedAccountId);

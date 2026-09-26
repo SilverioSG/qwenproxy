@@ -469,26 +469,10 @@ export class LogsView implements TuiView {
     if (singleLineOnly && this.selectedLogIndex !== null && rawEntries[this.selectedLogIndex]) {
       const entry = rawEntries[this.selectedLogIndex];
       text = `[${entry.time}] [${entry.level}] ${entry.message}`;
-    } else {
-      // For full copy of "all" filter, prefer the complete persistent file from disk if available
-      if (this.filter === "all" && !isRunningUnderNodeTest()) {
-        try {
-          const logPath = getServerLogFilePath();
-          if (fs.existsSync(logPath)) {
-            const diskContent = fs.readFileSync(logPath, "utf-8");
-            if (diskContent && diskContent.trim().length > 0) {
-              text = diskContent.trim();
-            }
-          }
-        } catch {}
-      }
-
-      // Fallback to memory buffer if disk log is empty or on filtered view
-      if (!text && rawEntries.length > 0) {
-        text = rawEntries
-          .map((entry) => `[${entry.time}] [${entry.level}] ${entry.message}`)
-          .join("\n");
-      }
+    } else if (rawEntries.length > 0) {
+      text = rawEntries
+        .map((entry) => `[${entry.time}] [${entry.level}] ${entry.message}`)
+        .join("\n");
     }
 
     if (!text) return;

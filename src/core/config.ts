@@ -81,7 +81,7 @@ const envSchema = z
     CHAT_TIMEOUT: z.string().default("180000"),
     NAVIGATION_TIMEOUT: z.string().default("60000"),
     PAGE_TIMEOUT: z.string().default("60000"),
-    HEADERS_TIMEOUT: z.string().default("90000"),
+    HEADERS_TIMEOUT: z.string().default("120000"),
     TIME_TO_FIRST_BYTE: z.string().default("60000"),
     IDLE_STREAM_TIMEOUT: z.string().default("60000"),
     // Deadline for the FIRST upstream chunk on thinking models (the reasoning
@@ -161,7 +161,7 @@ const envSchema = z
 
 
     QWEN_BASE_URL: z.string().default("https://chat.qwen.ai"),
-    QWEN_CHAT_POOL_SIZE: z.string().default("1"),
+    QWEN_CHAT_POOL_SIZE: z.string().default("0"),
     QWEN_CHAT_POOL_MODELS: z.string().default("qwen3.7-plus"),
     QWEN_PERSONALIZATION_FROM_REQUEST: z.string().default("true"),
     QWEN_PERSONALIZATION_VERIFY_GET: z.string().default("true"),

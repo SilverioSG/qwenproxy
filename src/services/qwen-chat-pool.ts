@@ -9,6 +9,7 @@ import {
 import { mapClientModelToQwen } from "../core/model-alias.ts";
 import { qwenUrl } from "./qwen-url.ts";
 import { QwenUpstreamError } from "./qwen-errors.ts";
+import { looksLikeAntiBotChallengeText } from "./media-generation.ts";
 import {
   requestQwenTextInBrowser,
   buildCapturedQwenHeaders,
@@ -57,6 +58,31 @@ async function createQwenChatSession(
     json?.data?.chat?.id;
 
   if (!chatId || typeof chatId !== "string") {
+    const rawLower = raw.toLowerCase();
+    if (looksLikeAntiBotChallengeText(raw)) {
+      try {
+        const { recoverBaxiaCaptcha } = await import("./captcha-coordinator.ts");
+        const solved = await recoverBaxiaCaptcha(accountId, "createQwenChatSession", {
+          challengeBody: raw,
+        });
+        if (solved) {
+          return createQwenChatSession(headers, model, accountId, chatMode);
+        }
+      } catch {}
+    }
+
+    if (
+      json?.data?.code === "Unauthorized" ||
+      json?.code === "Unauthorized" ||
+      rawLower.includes("unauthorized") ||
+      rawLower.includes("permission to access")
+    ) {
+      throw new QwenUpstreamError(
+        `Qwen create chat unauthorized: ${raw.substring(0, 300)}`,
+        "Unauthorized",
+        401,
+      );
+    }
     throw new QwenUpstreamError(
       `Qwen create chat returned unexpected payload: ${raw.substring(0, 300)}`,
       "CreateChatInvalidResponse",

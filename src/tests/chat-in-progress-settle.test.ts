@@ -11,6 +11,7 @@ import { invalidateAccountsCache } from "../core/accounts.ts";
 import { clearAccountCooldown } from "../core/account-manager.ts";
 import { clearTemporaryBusy } from "../core/account-concurrency.ts";
 import { invalidatePriorityCache } from "../core/account-priority.ts";
+import { getAccountPriorityPath } from "../core/paths.ts";
 
 /**
  * Seed two accounts so a hypothetical chat_in_progress escalation could switch
@@ -31,10 +32,10 @@ function withEscalationAccounts(
     const originalEnv = process.env.QWEN_ACCOUNTS;
     delete process.env.QWEN_ACCOUNTS;
 
-    // account-priority.ts persists to the REAL data/ dir (not data-test); a
+    // account-priority.ts persists to the test data dir (data-test); a
     // successful attempt calls markAccountSuccessful on a seeded account,
-    // polluting the production priority file. Snapshot and restore it.
-    const priorityPath = "data/account-priority.json";
+    // polluting the priority file. Snapshot and restore it.
+    const priorityPath = getAccountPriorityPath();
     const hadPriorityFile = existsSync(priorityPath);
     const prioritySnapshot = hadPriorityFile
       ? readFileSync(priorityPath, "utf-8")

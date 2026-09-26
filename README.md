@@ -141,6 +141,12 @@ QwenProxy launches the high-performance proxy server in the background and opens
 
 ### 3. Add Qwen Accounts
 
+> 🌐 **Where to create accounts?**  
+> Create your free accounts directly on the official Qwen Web portal: **[https://chat.qwen.ai](https://chat.qwen.ai)**  
+> 1. Go to **[chat.qwen.ai](https://chat.qwen.ai)** and click **Sign up**.
+> 2. Register with your email and password (or Google login).
+> 3. *Pro Tip:* Create 3 to 10 accounts so QwenProxy can automatically rotate between them when daily quotas are reached, giving you continuous uninterrupted coding!
+
 Inside the TUI, navigate to tab **`[5] Accounts`** to manage credentials:
 
 - **Batch Import (`B`):** Press **`B`** (or click `[ B ] Em Lote`). Paste your account credentials in bulk (`email:password` per line, raw `.env` string with commas, or spreadsheet paste). The parser calculates valid accounts in real time, handles special password characters safely, skips duplicates, and commits encrypted credentials to SQLite in a single transaction (<10ms).
