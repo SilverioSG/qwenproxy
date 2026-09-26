@@ -490,3 +490,49 @@ dashboardApp.post("/v1/accounts/:id/reset-cooldown", (c) => {
   clearAccountCooldown(id);
   return c.json({ ok: true, id, onCooldown: false });
 });
+
+dashboardApp.post("/v1/accounts/:id/manual-verification/start", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { startManualVerification } = await import(
+      "../services/manual-verification.js"
+    );
+    const status = await startManualVerification(id);
+    return c.json({ ok: true, ...status });
+  } catch (err) {
+    const status =
+      typeof (err as { status?: unknown }).status === "number"
+        ? (err as { status: number }).status
+        : 500;
+    return c.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      status as 400,
+    );
+  }
+});
+
+dashboardApp.get("/v1/accounts/:id/manual-verification/status", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const { getManualVerificationStatus } = await import(
+    "../services/manual-verification.js"
+  );
+  const status = getManualVerificationStatus(id);
+  if (!status) return c.json({ ok: true, accountId: id, state: "idle" });
+  return c.json({ ok: true, ...status });
+});
+
+dashboardApp.post("/v1/accounts/:id/manual-verification/cancel", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const { cancelManualVerification } = await import(
+    "../services/manual-verification.js"
+  );
+  const status = cancelManualVerification(id);
+  if (!status) return c.json({ ok: true, accountId: id, state: "idle" });
+  return c.json({ ok: true, ...status });
+});
