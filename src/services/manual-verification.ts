@@ -35,6 +35,11 @@ export interface ManualVerificationStatus {
 interface ActiveVerification extends ManualVerificationStatus {
   cancelRequested: boolean;
   finished: boolean;
+  /** Set once login is authoritatively confirmed: terminal states become
+   *  monotonic (verified > cancelled) and programmatic closes are expected. */
+  finalizing: boolean;
+  /** Set before closes executed by this flow: never interpret as user cancel. */
+  expectedClose: boolean;
 }
 
 const activeVerifications = new Map<string, ActiveVerification>();
@@ -248,9 +253,11 @@ function singletonLockPresent(profileDir: string): boolean {
 }
 
 async function closeVisible(
+  entry: ActiveVerification,
   context: BrowserContext | null,
 ): Promise<void> {
   if (!context) return;
+  entry.expectedClose = true;
   try {
     await context.close();
   } catch {
@@ -267,8 +274,14 @@ async function runVerification(accountId: string): Promise<void> {
     state: ManualVerificationState,
     detail?: string,
   ): void => {
+    // Terminal states are monotonic: once finished (notably verified),
+    // no later event may downgrade the outcome.
+    if (entry.finished) return;
     entry.finished = true;
     setStatus(entry, state, detail);
+  };
+  const markExpectedClose = (): void => {
+    entry.expectedClose = true;
   };
 
   try {
@@ -325,8 +338,9 @@ async function runVerification(accountId: string): Promise<void> {
     setStatus(entry, "waiting", "Waiting for manual login in the visible window");
     const deadline = now() + VERIFY_TIMEOUT_MS;
     let verified = false;
+    let closedEarly = false;
     while (now() < deadline) {
-      if (entry.cancelRequested) {
+      if (entry.cancelRequested && !entry.finalizing) {
         finish("cancelled", "Cancelled by user");
         return;
       }
@@ -340,8 +354,18 @@ async function runVerification(accountId: string): Promise<void> {
         closed = true;
       }
       if (closed || context === null) {
-        finish("cancelled", "Browser closed before verification");
-        return;
+        if (entry.expectedClose) {
+          // Close executed by this flow (e.g. programmatic close racing a
+          // poll tick): consume the flag and keep waiting, never conclude.
+          entry.expectedClose = false;
+          await deps.sleep(POLL_INTERVAL_MS);
+          continue;
+        }
+        // T0-authed/T1-poll-pending/T2-user-close race: the close may have
+        // landed after a real login. Never conclude CANCELLED without a final
+        // authoritative check (option B: reopen the same profile and probe).
+        closedEarly = true;
+        break;
       }
       try {
         if (await deps.isPageLoggedIn(page, 5000)) {
@@ -353,38 +377,126 @@ async function runVerification(accountId: string): Promise<void> {
       }
       await deps.sleep(POLL_INTERVAL_MS);
     }
+    if (closedEarly && !verified) {
+      verified = await finalCheckAfterClose(entry, accountId);
+      if (entry.finished) return;
+      if (!verified) {
+        finish("cancelled", "Browser closed before verification");
+        return;
+      }
+    }
     if (!verified) {
       finish("failed", "Verification timeout (10 min) without valid session");
       return;
     }
 
+    // Login authoritatively confirmed: from here terminal states are
+    // monotonic and every close below is expected (auto-close after success).
+    entry.finalizing = true;
     setStatus(entry, "verifying", "Capturing session");
-    await closeVisible(context);
+    await closeVisible(entry, context);
     context = null;
-    await deps.initHeadless(await deps.fullAccount(accountId));
-    try {
-      await deps.capture(accountId);
-    } catch (err) {
-      finish(
-        "failed",
-        `Header capture after verification failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return;
-    }
-    await deps.clearCooldown(accountId);
-    finish("verified", "Session validated, persisted, cooldown cleared");
+    if (!(await completeSuccess(entry, accountId))) return;
   } catch (err) {
     finish(
       "failed",
       `Manual verification error: ${err instanceof Error ? err.message : String(err)}`,
     );
   } finally {
-    await closeVisible(context);
+    await closeVisible(entry, context);
     try {
       await deps.clearBusy(accountId);
     } catch {
       // Never leave the caller hanging on cleanup failure.
     }
+  }
+}
+
+/**
+ * Shared success path: headless re-init on the validated profile, canonical
+ * header capture (persists via saveAuthSession), cooldown cleared ONLY after
+ * capture succeeds. Returns true on verified.
+ */
+async function completeSuccess(
+  entry: ActiveVerification,
+  accountId: string,
+): Promise<boolean> {
+  try {
+    await deps.initHeadless(await deps.fullAccount(accountId));
+  } catch {
+    // initHeadless is best-effort; capture below revalidates anyway.
+  }
+  try {
+    await deps.capture(accountId);
+  } catch (err) {
+    finishOnEntry(
+      entry,
+      "failed",
+      `Header capture after verification failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+  await deps.clearCooldown(accountId);
+  finishOnEntry(
+    entry,
+    "verified",
+    "Session validated, persisted, cooldown cleared",
+  );
+  return true;
+}
+
+function finishOnEntry(
+  entry: ActiveVerification,
+  state: ManualVerificationState,
+  detail?: string,
+): void {
+  if (entry.finished) return;
+  entry.finished = true;
+  setStatus(entry, state, detail);
+}
+
+/**
+ * Option B final resolution after an early user close: reopen the SAME
+ * profile and run ONE authoritative isPageLoggedIn probe. No URL, cookie,
+ * or visibility heuristics count as success.
+ */
+async function finalCheckAfterClose(
+  entry: ActiveVerification,
+  accountId: string,
+): Promise<boolean> {
+  if (entry.cancelRequested && !entry.finalizing) {
+    return false;
+  }
+  if (entry.finished) return false;
+  setStatus(entry, "verifying", "Final session check after browser close");
+  let checkContext: BrowserContext | null = null;
+  try {
+    const profileDir = await deps.profileDir(accountId);
+    const display = resolveManualDisplay();
+    if ("error" in display) return false;
+    const launched = await deps.launchBrowser(profileDir, {
+      DISPLAY: display.display,
+      XAUTHORITY: display.xauthority,
+    });
+    checkContext = launched.context;
+    const checkPage = launched.page;
+    try {
+      await checkPage.goto("https://chat.qwen.ai/", {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+    } catch {
+      // Probe below is authoritative regardless of navigation outcome.
+    }
+    try {
+      return await deps.isPageLoggedIn(checkPage, 8000);
+    } catch {
+      return false;
+    }
+  } catch {
+    return false;
+  } finally {
+    await closeVisible(entry, checkContext);
   }
 }
 
@@ -423,6 +535,8 @@ export async function startManualVerification(
     updatedAt: now(),
     cancelRequested: false,
     finished: false,
+    finalizing: false,
+    expectedClose: false,
   };
   activeVerifications.set(accountId, entry);
   void runVerification(accountId).catch(() => {});

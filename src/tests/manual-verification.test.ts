@@ -60,24 +60,44 @@ function installHarness(opts: {
   closedAfter?: number;
   captureBehavior?: "ok" | "fail";
   displayError?: string;
+  /** Per-launch login results: launch #N uses results[N-1] (default: loggedIn). */
+  launchLogins?: boolean[];
   calls?: { capture: string[]; clearedCooldown: string[]; markedBusy: string[]; clearedBusy: string[]; closedHeadless: string[]; launched: Array<Record<string, string>> };
 }) {
   const calls = opts.calls ?? { capture: [], clearedCooldown: [], markedBusy: [], clearedBusy: [], closedHeadless: [], launched: [] };
-  const page = fakePage(opts.loggedIn, opts.closedAfter);
-  const fakeContext = {
-    closed: false,
-    close: async () => {
-      fakeContext.closed = true;
-    },
+  let launches = 0;
+  const contexts: Array<{ closed: boolean }> = [];
+  const mkPair = () => {
+    const myLaunch = launches++;
+    const loginForThis = opts.launchLogins ? (opts.launchLogins[myLaunch] ?? false) : opts.loggedIn;
+    // Only the first (user-facing) window can be closed early; reopened
+    // validation windows stay open — models the reported race exactly.
+    const closeAfter = myLaunch === 0 ? (opts.closedAfter ?? Infinity) : Infinity;
+    let polls = 0;
+    const page = {
+      isClosed: () => polls >= closeAfter,
+      goto: async () => {},
+    };
+    const fakeContext = {
+      closed: false,
+      close: async () => {
+        fakeContext.closed = true;
+      },
+    };
+    contexts.push(fakeContext);
+    return { page, fakeContext, loginForThis, pollsRef: () => polls, tick: () => { polls += 1; } };
   };
+  let current: { page: { isClosed: () => boolean; goto: () => Promise<void> }; fakeContext: { closed: boolean; close: () => Promise<void> }; loginForThis: boolean; tick: () => void } | null = null;
   setManualVerificationDeps({
     launchBrowser: async (profileDir: string, env: Record<string, string>) => {
       calls.launched.push({ profileDir, DISPLAY: env.DISPLAY ?? "", XAUTHORITY: env.XAUTHORITY ?? "" });
-      return { context: fakeContext as never, page: page as never };
+      current = mkPair();
+      return { context: current.fakeContext as never, page: current.page as never };
     },
     isPageLoggedIn: async () => {
-      page.__tick();
-      return opts.loggedIn && !(page.isClosed() as boolean);
+      if (!current) return false;
+      current.tick();
+      return current.loginForThis && !(current.page.isClosed() as boolean);
     },
     sleep: async () => {},
     headedChromeExists: () => true,
@@ -106,7 +126,7 @@ function installHarness(opts: {
       calls.clearedCooldown.push(id);
     },
   });
-  return { page, fakeContext, calls };
+  return { calls, contexts };
 }
 
 beforeEach(() => {
@@ -114,8 +134,26 @@ beforeEach(() => {
   assert.ok(loadAccounts().some((a) => a.id === TEST_ID));
 });
 
-afterEach(() => {
+async function waitForTerminal(timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const st = getManualVerificationStatus(TEST_ID);
+    if (!st) return;
+    const runnerDone =
+      st.state === "verified" ||
+      st.state === "failed" ||
+      st.state === "cancelled";
+    if (runnerDone) return;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`verification did not settle (state=${st.state})`);
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+afterEach(async () => {
   cancelManualVerification(TEST_ID);
+  await waitForTerminal().catch(() => {});
   cleanupAccount();
   setManualVerificationDeps({
     launchBrowser: async () => {
@@ -174,7 +212,7 @@ test("manual verification: status carries no secrets", async () => {
 });
 
 test("manual verification: success → capture + cooldown cleared + busy released", async () => {
-  const { calls, fakeContext } = installHarness({ loggedIn: true });
+  const { calls, contexts } = installHarness({ loggedIn: true });
   await startManualVerification(TEST_ID);
   for (let i = 0; i < 200 && getManualVerificationStatus(TEST_ID)?.state !== "verified"; i++) {
     await new Promise((r) => setTimeout(r, 10));
@@ -187,7 +225,8 @@ test("manual verification: success → capture + cooldown cleared + busy release
   assert.deepEqual(calls.closedHeadless, [TEST_ID]);
   assert.ok(calls.launched.length === 1);
   assert.ok(calls.launched[0].profileDir.endsWith(TEST_ID));
-  assert.equal(fakeContext.closed, true);
+  assert.equal(calls.launched.length, 1);
+  assert.ok(contexts.length >= 1 && contexts.every((c) => c.closed));
 });
 
 test("manual verification: invalid session → failed, cooldown intact, no capture", async () => {
@@ -206,6 +245,46 @@ test("manual verification: invalid session → failed, cooldown intact, no captu
   assert.deepEqual(calls.capture, []);
   assert.deepEqual(calls.clearedCooldown, []);
   assert.deepEqual(calls.clearedBusy, [TEST_ID]);
+});
+
+test("manual verification: login then immediate user close → verified, not false cancelled", async () => {
+  // Reported prod race: session valid, user closes before next poll.
+  // First launch: page already closed; reopen (2nd launch) validates OK.
+  const { calls, contexts } = installHarness({ loggedIn: false, closedAfter: 0, launchLogins: [false, true] });
+  await startManualVerification(TEST_ID);
+  for (let i = 0; i < 200 && getManualVerificationStatus(TEST_ID)?.state !== "verified"; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(getManualVerificationStatus(TEST_ID)?.state, "verified");
+  assert.equal(calls.launched.length, 2);
+  assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+  assert.ok(contexts.every((c) => c.closed));
+});
+
+test("manual verification: late close after verified stays verified", async () => {
+  installHarness({ loggedIn: true });
+  await startManualVerification(TEST_ID);
+  for (let i = 0; i < 200 && getManualVerificationStatus(TEST_ID)?.state !== "verified"; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(getManualVerificationStatus(TEST_ID)?.state, "verified");
+  cancelManualVerification(TEST_ID);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(getManualVerificationStatus(TEST_ID)?.state, "verified");
+});
+
+test("manual verification: capture fails after login → failed, cooldown intact", async () => {
+  const { calls } = installHarness({ loggedIn: true, captureBehavior: "fail" });
+  await startManualVerification(TEST_ID);
+  for (let i = 0; i < 200 && getManualVerificationStatus(TEST_ID)?.state !== "failed"; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(getManualVerificationStatus(TEST_ID)?.state, "failed");
+  assert.deepEqual(calls.clearedCooldown, []);
+  assert.deepEqual(calls.clearedBusy, [TEST_ID]);
+  const db = getDatabase();
+  const row = db.prepare("SELECT COUNT(*) AS c FROM qwen_auth_sessions WHERE account_id = ?").get(TEST_ID) as { c: number };
+  assert.equal(row.c, 0);
 });
 
 test("resolveManualDisplay: returns usable display or explicit error", () => {
