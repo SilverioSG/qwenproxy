@@ -375,29 +375,62 @@ async function hasValidAuthCookie(context: BrowserContext, timeoutMs = 3_000): P
  * caller re-authenticates or reloads, which is strictly better than burning the
  * whole header budget waiting on a frozen page.
  */
-export async function isPageLoggedIn(
+export type PageLoginProbeReason =
+  | "no-page"
+  | "page-closed"
+  | "auth-url"
+  | "no-evaluate"
+  | "logged-out-marker"
+  | "evaluate-error"
+  | "context-destroyed"
+  | "auths-status"
+  | "auths-schema"
+  | "settings-401"
+  | "settings-403"
+  | "settings-revoked"
+  | "refresh-401"
+  | "refresh-403"
+  | "refresh-revoked"
+  | "timeout"
+  | "ok";
+
+export interface PageLoginProbe {
+  ok: boolean;
+  reason: PageLoginProbeReason;
+}
+
+/**
+ * Authoritative login probe with a sanitized classification reason (no
+ * secrets, URLs, or bodies). Powers manual-verification diagnostics;
+ * isPageLoggedIn() below preserves its exact external contract.
+ */
+export async function probePageLoggedIn(
   page: Page,
   timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
-): Promise<boolean> {
-  if (!page) return false;
-  if (typeof page.isClosed === "function" && page.isClosed()) return false;
+): Promise<PageLoginProbe> {
+  if (!page) return { ok: false, reason: "no-page" };
+  if (typeof page.isClosed === "function" && page.isClosed()) {
+    return { ok: false, reason: "page-closed" };
+  }
   try {
     const url = typeof page.url === "function" ? page.url() : "";
-    if (url.includes("/auth") || url.includes("/login")) return false;
-    if (typeof page.evaluate !== "function") return true;
+    if (url.includes("/auth") || url.includes("/login")) {
+      return { ok: false, reason: "auth-url" };
+    }
+    if (typeof page.evaluate !== "function") return { ok: true, reason: "ok" };
 
     const probe = page
-      .evaluate(async () => {
+      .evaluate(async (): Promise<PageLoginProbeReason> => {
         try {
           if (localStorage.getItem("qwen_token_logged_out_marker")) {
-            return false;
+            return "logged-out-marker";
           }
 
           const res = await fetch("/api/v1/auths/", { method: "GET" });
-          if (res.status !== 200) return false;
+          if (res.status !== 200) return "auths-status";
           const json: any = await res.json().catch(() => null);
-          if (!json) return false;
-          if (json.success === false) return false;
+          if (!json) return "auths-schema";
+          if (json.success === false) return "auths-schema";
           if (
             json.code &&
             json.code !== 200 &&
@@ -405,11 +438,13 @@ export async function isPageLoggedIn(
             json.code !== 0 &&
             json.code !== "0"
           ) {
-            return false;
+            return "auths-schema";
           }
           const user = json.data?.user || json.data || json;
-          if (!user || typeof user !== "object") return false;
-          if (user.is_guest === true || user.is_login === false) return false;
+          if (!user || typeof user !== "object") return "auths-schema";
+          if (user.is_guest === true || user.is_login === false) {
+            return "auths-schema";
+          }
           const hasIdentity = Boolean(
             user.id ||
               user.user_id ||
@@ -420,7 +455,7 @@ export async function isPageLoggedIn(
               json.token ||
               user.token,
           );
-          if (!hasIdentity) return false;
+          if (!hasIdentity) return "auths-schema";
 
           // Check if Alibaba revoked the session upstream via same-origin settings
           try {
@@ -429,8 +464,11 @@ export async function isPageLoggedIn(
               credentials: "include",
               signal: AbortSignal.timeout(3000),
             });
-            if (settingsRes.status === 401 || settingsRes.status === 403) {
-              return false;
+            if (settingsRes.status === 401) {
+              return "settings-401";
+            }
+            if (settingsRes.status === 403) {
+              return "settings-403";
             }
             const settingsJson: any = await settingsRes.json().catch(() => null);
             if (settingsJson && settingsJson.success === false) {
@@ -442,7 +480,7 @@ export async function isPageLoggedIn(
                 details.includes("revogado") ||
                 details.includes("revoked")
               ) {
-                return false;
+                return "settings-revoked";
               }
             }
           } catch {}
@@ -460,31 +498,49 @@ export async function isPageLoggedIn(
                 const code = refreshJson.data?.code || refreshJson.code;
                 const details = String(refreshJson.data?.details || "");
                 if (code === "Unauthorized" || details.includes("revogado") || details.includes("revoked")) {
-                  return false;
+                  return "refresh-revoked";
                 }
               }
-            } else if (refreshRes.status === 401 || refreshRes.status === 403) {
-              return false;
+            } else if (refreshRes.status === 401) {
+              return "refresh-401";
+            } else if (refreshRes.status === 403) {
+              return "refresh-403";
             }
           } catch {}
 
           // If an authenticated user object is confirmed with a real user identity,
           // the session is 100% valid and verified by upstream.
-          return true;
-        } catch {
-          return false;
+          return "ok";
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (
+            msg.includes("destroyed") ||
+            msg.includes("closed") ||
+            msg.includes("crashed")
+          ) {
+            return "context-destroyed";
+          }
+          return "evaluate-error";
         }
       })
-      .catch(() => false);
+      .catch((): PageLoginProbeReason => "evaluate-error");
 
-    return await withTimeout(
+    const reason = await withTimeout(
       probe,
       Math.max(1_000, timeoutMs),
       `session probe timed out after ${timeoutMs}ms`,
-    );
+    ).catch((): PageLoginProbeReason => "timeout");
+    return { ok: reason === "ok", reason };
   } catch {
-    return false;
+    return { ok: false, reason: "evaluate-error" };
   }
+}
+
+export async function isPageLoggedIn(
+  page: Page,
+  timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+): Promise<boolean> {
+  return (await probePageLoggedIn(page, timeoutMs)).ok;
 }
 
 export async function getOrLaunchSharedBrowser(

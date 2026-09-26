@@ -50,12 +50,15 @@ function installHarness(opts: {
   displayError?: string;
   /** Per-launch login results: launch #N uses results[N-1] (default: loggedIn). */
   launchLogins?: boolean[];
+  /** Reason reported when the probe is not ok. */
+  probeReason?: string;
   calls?: { capture: string[]; clearedCooldown: string[]; markedBusy: string[]; clearedBusy: string[]; closedHeadless: string[]; launched: Array<Record<string, string>> };
 }) {
   const calls = opts.calls ?? { capture: [], clearedCooldown: [], markedBusy: [], clearedBusy: [], closedHeadless: [], launched: [] };
   let launches = 0;
   const contexts: Array<{ closed: boolean }> = [];
-  const pages: Array<{ __emit: (res: { url: string; status: number; body: string; method?: string }) => Promise<void>; __listenerCount: (ev: string) => number }> = [];
+  let forceClosed = false;
+  const pages: Array<{ __emit: (res: { url: string; status: number; body: string; method?: string; textFn?: () => Promise<string> }) => Promise<void>; __listenerCount: (ev: string) => number }> = [];
   const mkPair = () => {
     const myLaunch = launches++;
     const loginForThis = opts.launchLogins ? (opts.launchLogins[myLaunch] ?? false) : opts.loggedIn;
@@ -65,7 +68,7 @@ function installHarness(opts: {
     let polls = 0;
     const listeners = new Map<string, Array<(res: never) => void>>();
     const page = {
-      isClosed: () => polls >= closeAfter,
+      isClosed: () => forceClosed || polls >= closeAfter,
       goto: async () => {},
       on: (ev: string, fn: (res: never) => void) => {
         const arr = listeners.get(ev) ?? [];
@@ -81,6 +84,8 @@ function installHarness(opts: {
         status: number;
         body: string;
         method?: string;
+        /** Deferred body read: resolve/reject manually to model pending SSE. */
+        textFn?: () => Promise<string>;
       }) => {
         const handlers = [...(listeners.get("response") ?? [])];
         for (const h of handlers) {
@@ -88,7 +93,7 @@ function installHarness(opts: {
             url: () => res.url,
             ok: () => res.status >= 200 && res.status < 300,
             status: () => res.status,
-            text: async () => res.body,
+            text: res.textFn ?? (async () => res.body),
             request: () => ({ method: () => res.method ?? "POST" }),
           } as never);
         }
@@ -112,10 +117,13 @@ function installHarness(opts: {
       current = mkPair();
       return { context: current.fakeContext as never, page: current.page as never };
     },
-    isPageLoggedIn: async () => {
-      if (!current) return false;
+    probeLogin: async () => {
+      if (!current) return { ok: false, reason: "evaluate-error" };
       current.tick();
-      return current.loginForThis && !(current.page.isClosed() as boolean);
+      const ok = current.loginForThis && !(current.page.isClosed() as boolean);
+      return ok
+        ? { ok: true, reason: "ok" }
+        : { ok: false, reason: opts.probeReason ?? "auths-status" };
     },
     // Yield a real macrotask: a zero-duration sleep must still let the event
     // loop interleave, otherwise wall-clock poll loops starve timers.
@@ -148,7 +156,28 @@ function installHarness(opts: {
       calls.clearedCooldown.push(id);
     },
   });
-  return { calls, contexts, pages };
+  return {
+    calls,
+    contexts,
+    pages,
+    closeCurrent: () => {
+      forceClosed = true;
+    },
+    emit: async (res: {
+      url: string;
+      status: number;
+      body: string;
+      method?: string;
+      textFn?: () => Promise<string>;
+    }): Promise<void> => {
+      const start = Date.now();
+      while (pages.length < 1) {
+        if (Date.now() - start > 5000) throw new Error("browser never launched");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      await pages[0].__emit(res);
+    },
+  };
 }
 
 beforeEach(() => {
@@ -250,11 +279,24 @@ async function waitForState(
   }
 }
 
+async function waitForLaunch(
+  calls: { launched: Array<unknown> },
+  timeoutMs = 5000,
+): Promise<void> {
+  const start = Date.now();
+  while (calls.launched.length < 1) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("browser was never launched");
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 test("manual verification: success → capture + cooldown cleared + busy released", async () => {
-  const { calls, contexts, pages } = installHarness({ loggedIn: true });
+  const { calls, contexts, pages, emit } = installHarness({ loggedIn: true });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("authenticated"), "authenticated");
-  await pages[0].__emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
   assert.equal(await waitForState("verified"), "verified");
   assert.deepEqual(calls.capture, [TEST_ID]);
   assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
@@ -267,7 +309,7 @@ test("manual verification: success → capture + cooldown cleared + busy release
 });
 
 test("manual verification: invalid session → failed, cooldown intact, no capture", async () => {
-  const { calls } = installHarness({ loggedIn: false, closedAfter: 1000000 });
+  const { calls, emit } = installHarness({ loggedIn: false, closedAfter: 1000000 });
   // Force immediate timeout by cancelling after start would mask failure;
   // instead drive loggedIn=false with a closed page after a few polls.
   await startManualVerification(TEST_ID);
@@ -285,7 +327,7 @@ test("manual verification: invalid session → failed, cooldown intact, no captu
 });
 
 test("manual verification: login alone never verifies and never closes window", async () => {
-  const { calls, contexts } = installHarness({ loggedIn: true });
+  const { calls, contexts, emit } = installHarness({ loggedIn: true });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("authenticated"), "authenticated");
   await new Promise((r) => setTimeout(r, 100));
@@ -298,14 +340,14 @@ test("manual verification: login alone never verifies and never closes window", 
 });
 
 test("manual verification: blocked/failed chat never verifies", async () => {
-  const { calls, pages } = installHarness({ loggedIn: true });
+  const { calls, pages, emit } = installHarness({ loggedIn: true });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("authenticated"), "authenticated");
   // Non-chat URL ignored; non-2xx ignored; empty body ignored; GET ignored.
-  await pages[0].__emit({ url: "https://chat.qwen.ai/api/v2/users/user/settings", status: 200, body: '{"success":true}' });
-  await pages[0].__emit({ url: CHAT_URL, status: 403, body: "Forbidden" });
-  await pages[0].__emit({ url: CHAT_URL, status: 200, body: "" });
-  await pages[0].__emit({ url: CHAT_URL, status: 200, body: VALID_SSE, method: "GET" });
+  await emit({ url: "https://chat.qwen.ai/api/v2/users/user/settings", status: 200, body: '{"success":true}' });
+  await emit({ url: CHAT_URL, status: 403, body: "Forbidden" });
+  await emit({ url: CHAT_URL, status: 200, body: "" });
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE, method: "GET" });
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(getManualVerificationStatus(TEST_ID)?.state, "authenticated");
   assert.deepEqual(calls.capture, []);
@@ -317,7 +359,7 @@ test("manual verification: blocked/failed chat never verifies", async () => {
 test("manual verification: login then close before chat → cancelled, never verified", async () => {
   // Supersedes the reopen-based race test: login alone is not success, so an
   // early close can only conclude cancelled (never false-verified).
-  const { calls, contexts } = installHarness({ loggedIn: true, closedAfter: 0 });
+  const { calls, contexts, emit } = installHarness({ loggedIn: true, closedAfter: 0 });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("cancelled"), "cancelled");
   assert.deepEqual(calls.capture, []);
@@ -327,10 +369,10 @@ test("manual verification: login then close before chat → cancelled, never ver
 });
 
 test("manual verification: late close after verified stays verified", async () => {
-  const { pages } = installHarness({ loggedIn: true });
+  const { pages, emit } = installHarness({ loggedIn: true });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("authenticated"), "authenticated");
-  await pages[0].__emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
   assert.equal(await waitForState("verified"), "verified");
   cancelManualVerification(TEST_ID);
   await new Promise((r) => setTimeout(r, 50));
@@ -338,10 +380,10 @@ test("manual verification: late close after verified stays verified", async () =
 });
 
 test("manual verification: capture fails after login → failed, cooldown intact", async () => {
-  const { calls, pages } = installHarness({ loggedIn: true, captureBehavior: "fail" });
+  const { calls, pages, emit } = installHarness({ loggedIn: true, captureBehavior: "fail" });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("authenticated"), "authenticated");
-  await pages[0].__emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
   assert.equal(await waitForState("failed"), "failed");
   assert.deepEqual(calls.clearedCooldown, []);
   assert.deepEqual(calls.clearedBusy, [TEST_ID]);
@@ -361,18 +403,79 @@ test("manual verification: isValidChatCompletion predicate", async () => {
 });
 
 test("manual verification: prompt/response content never surfaces in status", async () => {
-  const { pages } = installHarness({ loggedIn: true });
+  const { pages, emit } = installHarness({ loggedIn: true });
   await startManualVerification(TEST_ID);
   assert.equal(await waitForState("authenticated"), "authenticated");
   const secret = "SECRET-PROMPT-UNIQUE-XYZ";
-  await pages[0].__emit({ url: CHAT_URL, status: 200, body: `data: {"choices":[{"delta":{"content":"${secret}"}}]}\n\ndata: [DONE]\n\n` });
+  await emit({ url: CHAT_URL, status: 200, body: `data: {"choices":[{"delta":{"content":"${secret}"}}]}\n\ndata: [DONE]\n\n` });
   assert.equal(await waitForState("verified"), "verified");
   const st = getManualVerificationStatus(TEST_ID);
   assert.ok(!JSON.stringify(st).includes(secret));
   assert.ok(!JSON.stringify(st).includes("SECRET-PROMPT"));
 });
 
-test("resolveManualDisplay: returns usable display or explicit error", () => {
+test("manual verification: login probe false/timeout/destroyed + valid chat \u2192 verified", async () => {
+  for (const reason of ["auths-status", "timeout", "context-destroyed"]) {
+    const { calls, pages, emit } = installHarness({ loggedIn: false, probeReason: reason });
+    await startManualVerification(TEST_ID);
+    // Login never confirms (informative only), but a real chat completion
+    // still verifies the account.
+    await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+    assert.equal(await waitForState("verified"), "verified", `reason=${reason}`);
+    assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+  }
+});
+
+test("manual verification: pending body + close \u2192 grace; valid during grace \u2192 verified", async () => {
+  const { calls, emit, closeCurrent } = installHarness({ loggedIn: false });
+  let resolveBody: ((body: string) => void) | null = null;
+  const gate = new Promise<string>((resolve) => {
+    resolveBody = resolve;
+  });
+  await startManualVerification(TEST_ID);
+  // Emit headers now; body stays pending like an open SSE stream.
+  const emitP = emit({
+    url: CHAT_URL,
+    status: 200,
+    body: "",
+    textFn: () => gate,
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  // User closes while classification is pending: grace window, not cancel.
+  closeCurrent();
+  await new Promise((r) => setTimeout(r, 100));
+  const mid = getManualVerificationStatus(TEST_ID)?.state;
+  assert.ok(mid !== "verified", `unexpected early ${mid}`);
+  resolveBody!(VALID_SSE);
+  await emitP;
+  assert.equal(await waitForState("verified"), "verified");
+  assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+});
+
+test("manual verification: pending body + close \u2192 grace expires \u2192 cancelled", async () => {
+  const { calls, emit, closeCurrent } = installHarness({ loggedIn: false });
+  let rejectBody: ((err: unknown) => void) | null = null;
+  const gate = new Promise<string>((_, reject) => {
+    rejectBody = reject;
+  });
+  gate.catch(() => {});
+  await startManualVerification(TEST_ID);
+  const emitP = emit({
+    url: CHAT_URL,
+    status: 200,
+    body: "",
+    textFn: () => gate,
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  closeCurrent();
+  rejectBody!(new Error("context destroyed"));
+  await emitP;
+  assert.equal(await waitForState("cancelled"), "cancelled");
+  assert.deepEqual(calls.capture, []);
+  assert.deepEqual(calls.clearedCooldown, []);
+  assert.deepEqual(calls.clearedBusy, [TEST_ID]);
+});
+test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {
   const res = resolveManualDisplay() as { display?: string; xauthority?: string; error?: string };
   if ("error" in res && res.error) {
     assert.match(res.error, /XAUTHORITY/i);

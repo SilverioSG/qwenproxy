@@ -245,9 +245,9 @@ async function pollVerifyStatus(id, btn) {
     }
     var state = st && st.state;
     if (btn) {
-      if (state === 'waiting') btn.textContent = 'Waiting for login…';
+      if (state === 'waiting') btn.textContent = 'Waiting — send a test message in Qwen…';
       else if (state === 'authenticated') btn.textContent = 'Authenticated — send a test message…';
-      else if (state === 'verifying') btn.textContent = 'Verifying…';
+      else if (state === 'verifying') btn.textContent = 'Chat detected — verifying…';
       else if (state === 'opening') btn.textContent = 'Opening…';
     }
     if (state === 'verified') {

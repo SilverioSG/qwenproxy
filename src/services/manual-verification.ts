@@ -48,6 +48,7 @@ const activeVerifications = new Map<string, ActiveVerification>();
 const POLL_INTERVAL_MS = 2500;
 const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
 const PROFILE_LOCK_WAIT_MS = 15000;
+const CLOSE_GRACE_MS = 4000;
 
 const HEADED_CHROME_PATH =
   "/home/silver/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome";
@@ -118,7 +119,10 @@ interface AccountRef {
 
 const deps: {
   launchBrowser: BrowserLauncher;
-  isPageLoggedIn: (page: Page, timeoutMs: number) => Promise<boolean>;
+  probeLogin: (
+    page: Page,
+    timeoutMs: number,
+  ) => Promise<{ ok: boolean; reason: string }>;
   sleep: (ms: number) => Promise<void>;
   headedChromeExists: () => boolean;
   singletonLocked: (profileDir: string) => boolean;
@@ -135,7 +139,10 @@ const deps: {
   clearCooldown: (accountId: string) => Promise<void>;
 } = {
   launchBrowser: defaultBrowserLauncher,
-  isPageLoggedIn: async () => false,
+  probeLogin: async (page: Page, timeoutMs: number) => {
+    const { probePageLoggedIn } = await import("./playwright.ts");
+    return probePageLoggedIn(page, timeoutMs);
+  },
   sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
   headedChromeExists: () => fs.existsSync(HEADED_CHROME_PATH),
   singletonLocked: (profileDir: string) => singletonLockPresent(profileDir),
@@ -264,6 +271,22 @@ export function resolveManualDisplay():
   };
 }
 
+function logEvent(
+  entry: ActiveVerification,
+  accountId: string,
+  event: string,
+): void {
+  // Bounded operational log: state machine events only. Never prompt,
+  // response, cookies, tokens, or bodies.
+  try {
+    console.log(
+      `[ManualVerify ${accountId.slice(0, 8)}] ${event} state=${entry.state}`,
+    );
+  } catch {
+    // Logging must never break verification.
+  }
+}
+
 function singletonLockPresent(profileDir: string): boolean {
   for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
     try {
@@ -359,31 +382,57 @@ async function runVerification(accountId: string): Promise<void> {
       // Navigation failure surfaces as failed validation below.
     }
 
-    // Passive completion evidence: observe the user's REAL manual chat via
-    // network responses. Never abort/fulfill (unlike header capture): the
-    // user's chat must flow untouched. Listener installed before any login
-    // so no completion can slip through.
-    let chatEvidence = false;
+    // Passive completion evidence in two levels. Streaming (response headers
+    // on a real chat request) means "do not conclude yet"; done (valid
+    // completion body) is the only success trigger. Never abort/fulfill
+    // (unlike header capture): the user's chat must flow untouched. Listener
+    // installed before any login so no completion can slip through.
+    // Login probing below is INFORMATIONAL ONLY: it never gates verification.
+    const chat: { evidence: "none" | "streaming" | "done" } = { evidence: "none" };
+    const evidence = (): "none" | "streaming" | "done" => chat.evidence;
+    let pendingChatClassification = 0;
     const onResponse: ChatResponseListener = (res) => {
+      // Synchronous header part only: url/method/status. Never blocks.
+      let status = 0;
+      try {
+        if (entry.finished) return;
+        const url = typeof res.url === "function" ? res.url() : "";
+        if (!url.includes(CHAT_COMPLETIONS_PATH)) return;
+        const method =
+          typeof res.request === "function"
+            ? res.request().method?.() ?? ""
+            : "";
+        if (method !== "" && method !== "POST") return;
+        status = typeof res.status === "function" ? res.status() : 0;
+        const ok =
+          typeof res.ok === "function" ? res.ok() : status >= 200 && status < 300;
+        if (!ok) return;
+      } catch {
+        return;
+      }
+      if (evidence() === "none") {
+        chat.evidence = "streaming";
+        logEvent(entry, accountId, "chat=streaming");
+      }
+      // Controlled body classification: tracked so close/timeout can wait
+      // for it briefly instead of concluding on a pending read. Content is
+      // used only for the boolean predicate — never stored or logged.
+      pendingChatClassification += 1;
+      const capturedStatus = status;
       void (async () => {
         try {
-          if (entry.finished || chatEvidence) return;
-          const url = typeof res.url === "function" ? res.url() : "";
-          if (!url.includes(CHAT_COMPLETIONS_PATH)) return;
-          const method =
-            typeof res.request === "function"
-              ? res.request().method?.() ?? ""
-              : "";
-          if (method !== "" && method !== "POST") return;
-          const status = typeof res.status === "function" ? res.status() : 0;
-          const ok = typeof res.ok === "function" ? res.ok() : status >= 200 && status < 300;
-          if (!ok) return;
           const body = await res.text();
-          if (isValidChatCompletion(status, body)) {
-            chatEvidence = true;
+          if (
+            !entry.finished &&
+            isValidChatCompletion(capturedStatus, body)
+          ) {
+            chat.evidence = "done";
+            logEvent(entry, accountId, "chat=done");
           }
         } catch {
-          // A failed read is not evidence; keep waiting.
+          // A failed/interrupted read is not evidence; keep waiting.
+        } finally {
+          pendingChatClassification -= 1;
         }
       })();
     };
@@ -407,52 +456,32 @@ async function runVerification(accountId: string): Promise<void> {
       // flow ends in timeout rather than false success.
     }
 
-    // Phase 1: wait for authoritative login. Login alone NEVER verifies and
-    // NEVER closes the window: the real challenge (slider/CAPTCHA) only
-    // appears when the user sends a chat message.
-    setStatus(entry, "waiting", "Waiting for manual login in the visible window");
-    const deadline = now() + VERIFY_TIMEOUT_MS;
-    let authenticated = false;
-    while (now() < deadline) {
-      if (entry.cancelRequested && !entry.finalizing) {
-        detachListener();
-        finish("cancelled", "Cancelled by user");
-        return;
-      }
-      if (isClosed(page, context)) {
-        if (entry.expectedClose) {
-          entry.expectedClose = false;
-          await deps.sleep(POLL_INTERVAL_MS);
-          continue;
-        }
-        detachListener();
-        finish("cancelled", "Browser closed before verification");
-        return;
-      }
-      try {
-        if (await deps.isPageLoggedIn(page, 5000)) {
-          authenticated = true;
-          break;
-        }
-      } catch {
-        // Transient probe failure: keep waiting until timeout/close.
-      }
-      await deps.sleep(POLL_INTERVAL_MS);
-    }
-    if (!authenticated) {
-      detachListener();
-      finish("failed", "Verification timeout (10 min) without valid session");
-      return;
-    }
-
-    // Phase 2: session is AUTHENTICATED but not CHAT_VERIFIED. Keep the
-    // window open; the user sends a test message and solves any slider.
+    // Main wait: login is INFORMATIONAL ONLY (hint for the user, never a
+    // gate). Only a real chat completion (evidence() === "done") can
+    // trigger success. The window stays open through login, popups and
+    // slider solving; the user sends a test message by hand.
     setStatus(
       entry,
-      "authenticated",
-      "Authenticated — send a test message in Qwen",
+      "waiting",
+      "Waiting — send a test message in Qwen",
     );
+    const deadline = now() + VERIFY_TIMEOUT_MS;
+    let poll = 0;
+    let lastLoginClass = "unknown";
+    let loginHint = false;
+    let lastLogAt = 0;
+    let sawClose = false;
+    const maybeLog = (): void => {
+      if (now() - lastLogAt < 10000) return;
+      lastLogAt = now();
+      logEvent(
+        entry,
+        accountId,
+        `poll=${poll} state=${entry.state} login=${loginHint} class=${lastLoginClass} chat=${chat.evidence}`,
+      );
+    };
     while (now() < deadline) {
+      poll += 1;
       if (entry.cancelRequested && !entry.finalizing) {
         detachListener();
         finish("cancelled", "Cancelled by user");
@@ -464,33 +493,66 @@ async function runVerification(accountId: string): Promise<void> {
           await deps.sleep(POLL_INTERVAL_MS);
           continue;
         }
-        // Close after login but before/without chat evidence: chatEvidence
-        // decides. A just-answered chat sets the flag before its window
-        // closes (case D → verified); otherwise never verified (cases B/C).
+        sawClose = true;
         break;
       }
-      if (chatEvidence) break;
+      try {
+        const probe = await deps.probeLogin(page, 5000);
+        lastLoginClass = probe.reason;
+        if (probe.ok && !loginHint) {
+          loginHint = true;
+          setStatus(
+            entry,
+            "authenticated",
+            "Authenticated — send a test message in Qwen",
+          );
+        }
+      } catch {
+        lastLoginClass = "evaluate-error";
+      }
+      if (evidence() === "done") break;
+      maybeLog();
       await deps.sleep(POLL_INTERVAL_MS);
     }
     detachListener();
     if (entry.finished) return;
-    if (!chatEvidence) {
-      finish(
-        entry.cancelRequested ? "cancelled" : "failed",
-        entry.cancelRequested
-          ? "Cancelled by user"
-          : "Browser closed before chat verification",
-      );
+    if (evidence() === "done") {
+      entry.finalizing = true;
+      setStatus(entry, "verifying", "Chat verified, capturing session");
+      await closeVisible(entry, context);
+      context = null;
+      if (!(await completeSuccess(entry, accountId))) return;
       return;
     }
-
-    // Real chat completion observed: from here terminal states are
-    // monotonic and the auto-close below is expected.
-    entry.finalizing = true;
-    setStatus(entry, "verifying", "Chat verified, capturing session");
-    await closeVisible(entry, context);
-    context = null;
-    if (!(await completeSuccess(entry, accountId))) return;
+    if (sawClose) {
+      if (evidence() === "streaming") {
+        // Grace: a completion may still be classifying (e.g. SSE body read
+        // pending when the user closed). Wait briefly for done; anything
+        // else concludes cancelled — streaming alone never verifies.
+        logEvent(entry, accountId, "close-grace-start");
+        const graceEnd = now() + CLOSE_GRACE_MS;
+        while (now() < graceEnd) {
+          if (entry.finished) return;
+          if (evidence() === "done") break;
+          if (pendingChatClassification <= 0) break;
+          await deps.sleep(250);
+        }
+        if (evidence() === "done" && !entry.finished) {
+          logEvent(entry, accountId, "close-grace-success");
+          entry.finalizing = true;
+          setStatus(entry, "verifying", "Chat verified, capturing session");
+          await closeVisible(entry, context);
+          context = null;
+          if (!(await completeSuccess(entry, accountId))) return;
+          return;
+        }
+        logEvent(entry, accountId, "close-grace-expired");
+      }
+      finish("cancelled", "Browser closed before chat verification");
+      return;
+    }
+    finish("failed", "Verification timeout (10 min) without chat completion");
+    return;
   } catch (err) {
     finish(
       "failed",

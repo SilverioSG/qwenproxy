@@ -122,7 +122,7 @@ test("isPageLoggedIn: rejects guest 200 responses and validates authenticated us
     url: () => "https://chat.qwen.ai/",
     evaluate: async (fn: any) => {
       // Evaluate simulating the in-browser probe for guest
-      return false;
+      return "auths-schema";
     },
   };
   assert.equal(await isPageLoggedIn(guestPageNull), false);
@@ -132,7 +132,7 @@ test("isPageLoggedIn: rejects guest 200 responses and validates authenticated us
     isClosed: () => false,
     url: () => "https://chat.qwen.ai/",
     evaluate: async (fn: any) => {
-      return true;
+      return "ok";
     },
   };
   assert.equal(await isPageLoggedIn(authPage), true);
