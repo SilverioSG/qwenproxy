@@ -2309,11 +2309,199 @@ async function loginToQwen(
   return false;
 }
 
+/**
+ * Sanitized trace of the last loginViaApi signin attempt per account.
+ * Key names, counts, booleans and hashes only — never tokens, cookies,
+ * passwords, or bodies. Powers the single-shot login diagnostic probe.
+ */
+export interface LoginAttemptTrace {
+  accountId8: string;
+  ts: number;
+  httpStatus: number;
+  appSuccess: boolean;
+  appAuthFailure: boolean;
+  topKeys: string[];
+  dataKeys: string[];
+  tokenPathUsed: string | null;
+  installed: boolean;
+  cookieCountBefore: number;
+  cookieCountAfter: number;
+  cookieNamesChanged: boolean;
+  lsTokenPresentBefore: boolean;
+  lsTokenPresentAfter: boolean;
+  lsTokenChanged: boolean;
+  validated: boolean | null;
+}
+
+const lastLoginTraces = new Map<string, LoginAttemptTrace>();
+
+export function getLastLoginTrace(
+  accountId: string,
+): LoginAttemptTrace | null {
+  return lastLoginTraces.get(accountId) ?? null;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC: exactly ONE loginViaApi invocation on the live
+ * account page, followed by same-context models/settings/create-chat reads.
+ * No cooldown changes, no rotation, no loops, no DB writes, no second login.
+ * Sanitized results only.
+ */
+export async function probeLoginOnce(accountId: string): Promise<{
+  trace: LoginAttemptTrace | null;
+  loginOk: boolean;
+  models: { status: number; appFail: boolean };
+  settings: { status: number; appFail: boolean };
+  createChat: { status: number; appFail: boolean; created: boolean };
+}> {
+  const { getAccountCredentials } = await import("../core/accounts.ts");
+  const creds = getAccountCredentials(accountId);
+  if (!creds?.email || !creds?.password) {
+    throw new Error("No stored credentials for account");
+  }
+  const page = accountPages.get(accountId);
+  if (!page || page.isClosed()) {
+    throw new Error("No live account page (not initialized)");
+  }
+  const loginOk = await loginViaApi(page, creds.email, creds.password, accountId);
+  const trace = getLastLoginTrace(accountId);
+  const empty = {
+    status: 0,
+    appFail: false,
+  };
+  const result = {
+    trace,
+    loginOk: loginOk.success,
+    models: { ...empty },
+    settings: { ...empty },
+    createChat: { status: 0, appFail: false, created: false },
+  };
+  const runFetch = async (
+    method: string,
+    url: string,
+    body?: string,
+  ): Promise<{ status: number; appFail: boolean; created: boolean }> => {
+    try {
+      const r = await page.evaluate(
+        async (args: { method: string; url: string; body?: string }) => {
+          try {
+            const resp = await fetch(args.url, {
+              method: args.method,
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+              },
+              body: args.body,
+              signal: AbortSignal.timeout(25000),
+            });
+            const text = await resp.text().catch(() => "");
+            let appFail = false;
+            let created = false;
+            try {
+              const j: any = JSON.parse(text);
+              if (j && typeof j === "object") {
+                appFail =
+                  j.success === false &&
+                  (j.data?.code === "Unauthorized" || j.code === "Unauthorized");
+                created = Boolean(
+                  j.chat_id || j.id || j.data?.chat_id || j.data?.id,
+                );
+              }
+            } catch {
+              appFail = false;
+            }
+            return { status: resp.status, appFail, created };
+          } catch {
+            return { status: 0, appFail: false, created: false };
+          }
+        },
+        { method, url, body },
+      );
+      return r;
+    } catch {
+      return { status: 0, appFail: false, created: false };
+    }
+  };
+  const m = await runFetch("GET", qwenUrl("/api/models"));
+  result.models = { status: m.status, appFail: m.appFail };
+  const s = await runFetch("GET", qwenUrl("/api/v2/users/user/settings"));
+  result.settings = { status: s.status, appFail: s.appFail };
+  const cc = await runFetch(
+    "POST",
+    qwenUrl("/api/v2/chats/new"),
+    JSON.stringify({ chatId: "", models: ["qwen3.8-max"], project_id: "", timestamp: Date.now() }),
+  );
+  result.createChat = cc;
+  return result;
+}
+
+function topKeysOf(v: unknown): string[] {
+  if (!v || typeof v !== "object") return [];
+  return Object.keys(v as Record<string, unknown>).slice(0, 12);
+}
+
+function cookieNamesOf(
+  cookies: Array<{ name: string }>,
+): { count: number; hash: string } {
+  const names = cookies.map((c) => c.name).sort();
+  let h1 = 0x811c9dc5;
+  const joined = names.join(";");
+  for (let i = 0; i < joined.length; i++) {
+    h1 ^= joined.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
+  }
+  return { count: names.length, hash: (h1 >>> 0).toString(16) };
+}
+
+/** Which token path fired inside extractAuthToken (structure only). */
+function authTokenPathUsed(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const levels: Array<{ label: string; v: unknown }> = [
+    { label: "top", v: data },
+    { label: "result", v: (data as { result?: unknown }).result },
+    { label: "data", v: (data as { data?: unknown }).data },
+  ];
+  for (const { label, v } of levels) {
+    if (!v || typeof v !== "object") continue;
+    const rec = v as Record<string, unknown>;
+    for (const key of ["accessToken", "access_token", "token"]) {
+      const val = rec[key];
+      if (typeof val === "string" && val.length > 0) return `${label}.${key}`;
+    }
+  }
+  return null;
+}
+
 async function loginViaApi(
   page: Page,
   email: string,
   password: string,
+  accountId?: string,
 ): Promise<LoginAttemptResult> {
+  const traceId8 = (accountId || "").slice(0, 8);
+  const trace: LoginAttemptTrace = {
+    accountId8: traceId8,
+    ts: Date.now(),
+    httpStatus: 0,
+    appSuccess: false,
+    appAuthFailure: false,
+    topKeys: [],
+    dataKeys: [],
+    tokenPathUsed: null,
+    installed: false,
+    cookieCountBefore: 0,
+    cookieCountAfter: 0,
+    cookieNamesChanged: false,
+    lsTokenPresentBefore: false,
+    lsTokenPresentAfter: false,
+    lsTokenChanged: false,
+    validated: null,
+  };
+  const storeTrace = (): void => {
+    if (accountId) lastLoginTraces.set(accountId, trace);
+  };
   try {
     const hashedPassword = crypto
       .createHash("sha256")
@@ -2323,6 +2511,33 @@ async function loginViaApi(
 
     let signinSuccess = false;
     let data: any = null;
+    let signinHttpStatus = 0;
+    let preCookieHash = "";
+    let preLsToken: string | null = null;
+    try {
+      const preCookies = await page.context().cookies().catch(() => []);
+      const snap = cookieNamesOf(preCookies);
+      trace.cookieCountBefore = snap.count;
+      preCookieHash = snap.hash;
+    } catch {
+      // Best effort baseline.
+    }
+    try {
+      const t = await page
+        .evaluate((): string | null => {
+          try {
+            const v = localStorage.getItem("token");
+            return typeof v === "string" && v.length > 0 ? v : null;
+          } catch {
+            return null;
+          }
+        })
+        .catch(() => null);
+      preLsToken = typeof t === "string" ? t : null;
+      trace.lsTokenPresentBefore = preLsToken !== null;
+    } catch {
+      // Best effort baseline.
+    }
 
     if (page.request && typeof page.request.post === "function") {
       try {
@@ -2345,6 +2560,14 @@ async function loginViaApi(
         signinSuccess = Boolean(
           data && (data.success === true || extractAuthToken(data) !== null),
         );
+        try {
+          signinHttpStatus =
+            typeof response.status === "function"
+              ? response.status()
+              : Number(response.status) || 0;
+        } catch {
+          signinHttpStatus = 0;
+        }
       } catch {}
     }
 
@@ -2380,6 +2603,7 @@ async function loginViaApi(
 
       if (evalRes?.data) {
         data = evalRes.data;
+        if (typeof evalRes.status === "number") signinHttpStatus = evalRes.status;
         signinSuccess = Boolean(
           data && (data.success === true || extractAuthToken(data) !== null),
         );
@@ -2390,6 +2614,13 @@ async function loginViaApi(
       const code = data?.data?.code || data?.code;
       const details = data?.data?.details || data?.details || data?.message;
       const classified = classifyQwenAuthError(code, details);
+      trace.httpStatus = signinHttpStatus;
+      trace.appSuccess = false;
+      trace.appAuthFailure = true;
+      trace.topKeys = topKeysOf(data);
+      trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
+      trace.tokenPathUsed = authTokenPathUsed(data);
+      storeTrace();
       return {
         success: false,
         permanentFailure: classified.isPermanent,
@@ -2399,6 +2630,12 @@ async function loginViaApi(
 
     if (signinSuccess) {
       const token = extractAuthToken(data);
+      trace.httpStatus = signinHttpStatus;
+      trace.appSuccess = true;
+      trace.appAuthFailure = false;
+      trace.topKeys = topKeysOf(data);
+      trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
+      trace.tokenPathUsed = authTokenPathUsed(data);
       if (token) {
         try {
           await page.context().addCookies([
@@ -2434,10 +2671,50 @@ async function loginViaApi(
           }, token)
           .catch(() => {});
         await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        try {
+          const postCookies = await page.context().cookies().catch(() => []);
+          const snap = cookieNamesOf(postCookies);
+          trace.cookieCountAfter = snap.count;
+          trace.cookieNamesChanged = snap.hash !== preCookieHash;
+        } catch {
+          // Best effort.
+        }
+        try {
+          const t = await page
+            .evaluate((): string | null => {
+              try {
+                const v = localStorage.getItem("token");
+                return typeof v === "string" && v.length > 0 ? v : null;
+              } catch {
+                return null;
+              }
+            })
+            .catch(() => null);
+          const postLs = typeof t === "string" ? t : null;
+          trace.lsTokenPresentAfter = postLs !== null;
+          trace.lsTokenChanged =
+            (preLsToken === null) !== (postLs === null) ||
+            (preLsToken !== null && postLs !== null && preLsToken !== postLs);
+        } catch {
+          // Best effort.
+        }
+        trace.installed = true;
+        try {
+          trace.validated = await isPageLoggedIn(page, 3000);
+        } catch {
+          trace.validated = false;
+        }
+        storeTrace();
         return { success: true };
       }
     }
 
+    trace.httpStatus = signinHttpStatus;
+    trace.appSuccess = false;
+    trace.topKeys = topKeysOf(data);
+    trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
+    trace.tokenPathUsed = authTokenPathUsed(data);
+    storeTrace();
     return {
       success: false,
       reason: "API signin não confirmou sessão autenticada",
@@ -2448,11 +2725,15 @@ async function loginViaApi(
       try {
         await sleep(1500);
         if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+          trace.validated = true;
+          storeTrace();
           return { success: true };
         }
       } catch {}
     }
     console.warn(`⚠️  [Playwright] API login error: ${errMsg}`);
+    trace.validated = false;
+    storeTrace();
     return { success: false, reason: errMsg };
   }
 }

@@ -594,3 +594,31 @@ dashboardApp.post("/v1/accounts/:id/probe-refresh-structure", async (c) => {
     );
   }
 });
+
+dashboardApp.post("/v1/accounts/:id/probe-login", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: exactly ONE loginViaApi invocation plus
+  // same-context models/settings/create-chat reads. No cooldown changes,
+  // no rotation, no loops, no DB writes. Sanitized results only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeLoginOnce } = await import("../services/playwright.js");
+    const result = await probeLoginOnce(id);
+    try {
+      console.log(
+        `[LoginProbe] account=${id.slice(0, 8)} loginOk=${result.loginOk} ` +
+          `models=${result.models.status} settings=${result.settings.status} ` +
+          `create=${result.createChat.status}/${result.createChat.created}`,
+      );
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});

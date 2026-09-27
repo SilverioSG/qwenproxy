@@ -274,3 +274,32 @@ test("qwen-auth-diag: loginViaApi extracts token via SPA contract helper", async
   assert.ok(block.includes("extractAuthToken(data)"));
   assert.ok(!block.includes("data?.data?.token || data?.token"));
 });
+
+test("qwen-auth-diag: login trace + single-shot probe exports exist", async () => {
+  const mod = await import("../services/playwright.ts");
+  assert.equal(typeof mod.getLastLoginTrace, "function");
+  assert.equal(typeof mod.probeLoginOnce, "function");
+  assert.equal(mod.getLastLoginTrace("no-such-account"), null);
+});
+
+test("qwen-auth-diag: probe-login endpoint registered with verifyApiKey", () => {
+  const src = fs.readFileSync("src/api/dashboard.ts", "utf-8");
+  const idx = src.indexOf('"/v1/accounts/:id/probe-login"');
+  assert.ok(idx >= 0);
+  const noComments = src
+    .slice(idx, idx + 1500)
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("//"))
+    .join("\n");
+  assert.ok(noComments.includes("verifyApiKey"));
+  assert.ok(noComments.includes("probeLoginOnce"));
+  const allowed = new Set(["id", "result", "err"]);
+  const idents = new Set();
+  for (const m of noComments.matchAll(/\$\{([^}]+)\}/g)) {
+    const root = m[1].split(/[.?(\s]/)[0];
+    if (root) idents.add(root);
+  }
+  for (const ident of idents) {
+    assert.ok(allowed.has(ident), `unexpected interpolation: ${ident}`);
+  }
+});
