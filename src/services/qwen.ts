@@ -3070,6 +3070,20 @@ export async function syncQwenRequestPersonalization(
     console.warn(
       `[Qwen] Personalization 401 — refreshing session with re-auth and retrying | account=${cacheKey}`,
     );
+    // First-failure capture BEFORE any recovery: snapshot the live state so
+    // the transition (valid -> Unauthorized) is classifiable afterwards.
+    try {
+      const {
+        snapshotForAccount,
+        markFirstFailure,
+        traceSessionEvent,
+      } = await import("./session-tracer.ts");
+      const snap = await snapshotForAccount(accountId || "").catch(() => null);
+      traceSessionEvent(accountId, "SETTINGS_UPDATE_STATUS", "http=401-or-appFail", snap);
+      markFirstFailure(accountId, "SETTINGS_UPDATE_STATUS", snap);
+    } catch {
+      // Tracing must never break flows.
+    }
     try {
       currentSettings = null;
       const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
@@ -3163,8 +3177,9 @@ export async function syncQwenRequestPersonalization(
     matchStored,
   });
   try {
-    const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
-    noteUpstreamAuthResult(accountId, "settings-update", 200, false);
+    const { noteUpstreamAuthResult, snapshotForAccount } = await import("./session-tracer.ts");
+    const snap = await snapshotForAccount(accountId || "").catch(() => null);
+    noteUpstreamAuthResult(accountId, "settings-update", 200, false, snap);
   } catch {
     // Tracing must never break flows.
   }

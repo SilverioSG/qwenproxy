@@ -78,8 +78,9 @@ async function createQwenChatSession(
       rawLower.includes("permission to access")
     ) {
       try {
-        const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
-        noteUpstreamAuthResult(accountId, "create-chat", response.ok ? 200 : response.status, true);
+        const { noteUpstreamAuthResult, snapshotForAccount } = await import("./session-tracer.ts");
+        const snap = await snapshotForAccount(accountId || "").catch(() => null);
+        noteUpstreamAuthResult(accountId, "create-chat", response.ok ? 200 : response.status, true, snap);
       } catch {
         // Tracing must never break flows.
       }
@@ -97,8 +98,9 @@ async function createQwenChatSession(
   }
 
   try {
-    const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
-    noteUpstreamAuthResult(accountId, "create-chat", 200, false);
+    const { noteUpstreamAuthResult, snapshotForAccount } = await import("./session-tracer.ts");
+    const snap = await snapshotForAccount(accountId || "").catch(() => null);
+    noteUpstreamAuthResult(accountId, "create-chat", 200, false, snap);
   } catch {
     // Tracing must never break flows.
   }

@@ -39,6 +39,7 @@ export interface SessionSnapshot {
   pageId: string | null;
   tokenHash: string | null;
   tokenPresent: boolean;
+  tokenIat: number | null;
   tokenExp: number | null;
   cookieNameHash: string | null;
   cookieCount: number | null;
@@ -93,6 +94,23 @@ function hashValue(value: string): string {
   }
 }
 
+/** Best-effort JWT expiry + issued-at decode (metadata only, no verify). */
+function decodeJwtTimes(token: string): { iat: number | null; exp: number | null } {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return { iat: null, exp: null };
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = JSON.parse(
+      Buffer.from(b64, "base64").toString("utf-8"),
+    ) as { iat?: unknown; exp?: unknown };
+    const iat = typeof json.iat === "number" ? json.iat : null;
+    const exp = typeof json.exp === "number" ? json.exp : null;
+    return { iat, exp };
+  } catch {
+    return { iat: null, exp: null };
+  }
+}
+
 function hashNames(names: string[]): string {
   return hashValue([...names].sort().join(";"));
 }
@@ -111,6 +129,7 @@ export async function snapshotSessionState(
     pageId: handles.page ? tracePageId(handles.page as object) : null,
     tokenHash: null,
     tokenPresent: false,
+    tokenIat: null,
     tokenExp: null,
     cookieNameHash: null,
     cookieCount: null,
@@ -126,12 +145,9 @@ export async function snapshotSessionState(
       if (tok && tok.value) {
         snap.tokenPresent = true;
         snap.tokenHash = hashValue(tok.value);
-        try {
-          const { parseJwtExpiry } = await import("../utils/jwt.ts");
-          snap.tokenExp = parseJwtExpiry(tok.value);
-        } catch {
-          snap.tokenExp = null;
-        }
+        const times = decodeJwtTimes(tok.value);
+        snap.tokenIat = times.iat;
+        snap.tokenExp = times.exp;
       }
     }
   } catch {
@@ -176,13 +192,6 @@ export function traceSessionEvent(
   } catch {
     // Logging must never break flows.
   }
-  if (
-    (event === "APP_UNAUTHORIZED" || event === "SETTINGS_STATUS" || event === "SETTINGS_UPDATE_STATUS" || event === "CREATE_CHAT_STATUS") &&
-    /unauthorized|401/i.test(detail) &&
-    firstFailureTs === null
-  ) {
-    noteFirstFailure();
-  }
 }
 
 export function noteUpstreamAuthResult(
@@ -200,10 +209,168 @@ export function noteUpstreamAuthResult(
         ? "SETTINGS_UPDATE_STATUS"
         : "CREATE_CHAT_STATUS";
   traceSessionEvent(accountId, ev, `http=${httpStatus} appFail=${appFail}`, snapshot);
-  if ((httpStatus === 401 || appFail) && firstFailureTs === null) {
-    noteFirstFailure();
+  if (httpStatus === 401 || appFail) {
+    markFirstFailure(accountId, ev, snapshot);
   }
 }
+
+/** Snapshot the live handles of an account without creating anything. */
+export async function snapshotForAccount(
+  accountId: string,
+): Promise<SessionSnapshot | null> {
+  if (!isTarget(accountId)) return null;
+  try {
+    const { getAccountPageSnapshotHandles } = await import("./playwright.ts");
+    const h = getAccountPageSnapshotHandles(accountId);
+    if (!h) return null;
+    return await snapshotSessionState(accountId, {
+      context: h.context as { cookies?: () => Promise<Array<{ name: string; value: string }>> },
+      page: h.page,
+    }).catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
+export interface TransitionClassification {
+  contextChanged: boolean;
+  pageChanged: boolean;
+  tokenChanged: boolean;
+  cookieSetChanged: boolean;
+  capturedAtChanged: boolean;
+  dbStateChanged: boolean;
+  tokenExpiredAtFailure: boolean | null;
+  tokenTtlAtFailure: number | null;
+  loginBetween: boolean;
+  refreshBetween: boolean;
+  reauthBetween: boolean;
+  sessionkeeperBetween: boolean;
+  contextRecreateBetween: boolean;
+  dbWriteBetween: boolean;
+  captureBetween: boolean;
+  verdict: "A_TOKEN" | "B_CONTEXT" | "C_PERSISTED" | "D_UPSTREAM" | "UNKNOWN";
+}
+
+function snapEqual(a: string | null, b: string | null): boolean {
+  return (a ?? null) === (b ?? null);
+}
+
+/** Compare baseline vs fail snapshots + intermediate events (CASO A/B/C/D). */
+export function classifyTransition(
+  base: SessionSnapshot | null,
+  fail: SessionSnapshot | null,
+  between: SessionTraceEntry[],
+): TransitionClassification {
+  const hasEvent = (ev: SessionTraceEvent): boolean =>
+    between.some((e) => e.event === ev);
+  const contextChanged =
+    !!base?.contextId && !!fail?.contextId
+      ? !snapEqual(base.contextId, fail.contextId)
+      : false;
+  const pageChanged =
+    !!base?.pageId && !!fail?.pageId
+      ? !snapEqual(base.pageId, fail.pageId)
+      : false;
+  const tokenChanged =
+    !!base?.tokenHash && !!fail?.tokenHash
+      ? !snapEqual(base.tokenHash, fail.tokenHash)
+      : false;
+  const cookieSetChanged =
+    !!base?.cookieNameHash && !!fail?.cookieNameHash
+      ? !snapEqual(base.cookieNameHash, fail.cookieNameHash) ||
+        base.cookieCount !== fail.cookieCount
+      : false;
+  const capturedAtChanged =
+    base?.capturedAt !== null &&
+    base?.capturedAt !== undefined &&
+    fail?.capturedAt !== null &&
+    fail?.capturedAt !== undefined
+      ? base.capturedAt !== fail.capturedAt
+      : false;
+  const dbStateChanged = capturedAtChanged;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const tokenExpiredAtFailure =
+    fail?.tokenExp !== null && fail?.tokenExp !== undefined
+      ? fail.tokenExp <= nowSec
+      : null;
+  const tokenTtlAtFailure =
+    fail?.tokenExp !== null && fail?.tokenExp !== undefined
+      ? fail.tokenExp - nowSec
+      : null;
+  const loginBetween = hasEvent("LOGIN_START") || hasEvent("LOGIN_END");
+  const refreshBetween = hasEvent("REFRESH_START") || hasEvent("REFRESH_END");
+  const reauthBetween = hasEvent("REAUTH_START") || hasEvent("REAUTH_END");
+  const sessionkeeperBetween = hasEvent("SESSIONKEEPER_CLOSE");
+  const contextRecreateBetween =
+    hasEvent("CONTEXT_CREATE") || hasEvent("CONTEXT_CLOSE");
+  const dbWriteBetween = hasEvent("DB_SESSION_WRITE");
+  const captureBetween =
+    hasEvent("CAPTURE_START") || hasEvent("CAPTURE_END");
+  let verdict: TransitionClassification["verdict"] = "UNKNOWN";
+  if (tokenChanged) verdict = "A_TOKEN";
+  else if (contextChanged || pageChanged) verdict = "B_CONTEXT";
+  else if (dbStateChanged) verdict = "C_PERSISTED";
+  else if (
+    base !== null &&
+    !loginBetween &&
+    !refreshBetween &&
+    !reauthBetween &&
+    !sessionkeeperBetween &&
+    !contextRecreateBetween &&
+    !dbWriteBetween &&
+    !captureBetween
+  ) {
+    verdict = "D_UPSTREAM";
+  }
+  return {
+    contextChanged,
+    pageChanged,
+    tokenChanged,
+    cookieSetChanged,
+    capturedAtChanged,
+    dbStateChanged,
+    tokenExpiredAtFailure,
+    tokenTtlAtFailure,
+    loginBetween,
+    refreshBetween,
+    reauthBetween,
+    sessionkeeperBetween,
+    contextRecreateBetween,
+    dbWriteBetween,
+    captureBetween,
+    verdict,
+  };
+}
+
+/**
+ * Freeze the first auth failure: HTTP 401/403-auth or appUnauthorized.
+ * Never overwritten. Must run BEFORE any recovery (refresh/re-auth).
+ */
+export function markFirstFailure(
+  accountId: string | undefined,
+  event: SessionTraceEvent,
+  snapshot: SessionSnapshot | null = null,
+): void {
+  if (!isTarget(accountId)) return;
+  if (firstFailureTs !== null) return;
+  firstFailureTs = Date.now();
+  firstFailureRef = { event, snapshot };
+  if (!windowDumpScheduled) {
+    windowDumpScheduled = true;
+    setTimeout(() => {
+      try {
+        dumpFailureWindow();
+      } catch {
+        // Best effort.
+      }
+    }, 10_000).unref?.();
+  }
+}
+
+let firstFailureRef: {
+  event: SessionTraceEvent;
+  snapshot: SessionSnapshot | null;
+} | null = null;
 
 function noteFirstFailure(): void {
   firstFailureTs = Date.now();
@@ -226,14 +393,10 @@ export function getSessionTrace(): {
   target: string;
   baseline: SessionTraceEntry | null;
   firstFailureTs: number | null;
+  firstFailure: { event: SessionTraceEvent; snapshot: SessionSnapshot | null } | null;
+  classification: TransitionClassification | null;
   window: SessionTraceEntry[];
 } {
-  const failures = ring.filter(
-    (e) =>
-      e.event === "APP_UNAUTHORIZED" ||
-      /unauthorized|401/i.test(e.detail),
-  );
-  const first = failures[0] ?? null;
   const okEvents = ring.filter(
     (e) =>
       (e.event === "SETTINGS_STATUS" ||
@@ -244,11 +407,28 @@ export function getSessionTrace(): {
   const base = okEvents.length > 0 ? okEvents[0] : null;
   const from = (firstFailureTs ?? Date.now()) - 120_000;
   const to = (firstFailureTs ?? Date.now()) + 10_000;
+  const window = ring.filter((e) => e.ts >= from && e.ts <= to);
+  let classification: TransitionClassification | null = null;
+  if (firstFailureRef) {
+    const between = ring.filter(
+      (e) =>
+        e.ts >= (base?.ts ?? from) &&
+        e.ts <= (firstFailureTs ?? Date.now()) &&
+        e !== base,
+    );
+    classification = classifyTransition(
+      base?.snapshot ?? null,
+      firstFailureRef.snapshot,
+      between,
+    );
+  }
   return {
     target: TRACE_TARGET_ACCOUNT,
     baseline: base,
     firstFailureTs,
-    window: ring.filter((e) => e.ts >= from && e.ts <= to),
+    firstFailure: firstFailureRef,
+    classification,
+    window,
   };
 }
 
@@ -258,12 +438,25 @@ function dumpFailureWindow(): void {
     console.log(
       `[SessTrace ${t.target.slice(0, 8)}] FAILURE-WINDOW events=${t.window.length} firstFailureTs=${t.firstFailureTs}`,
     );
+    if (t.classification) {
+      const c = t.classification;
+      console.log(
+        `[SessTrace ${t.target.slice(0, 8)}] CLASSIFY verdict=${c.verdict} ` +
+          `ctxChanged=${c.contextChanged} pgChanged=${c.pageChanged} ` +
+          `tokChanged=${c.tokenChanged} ckChanged=${c.cookieSetChanged} ` +
+          `dbChanged=${c.dbStateChanged} tokExpired=${c.tokenExpiredAtFailure} ` +
+          `tokTtl=${c.tokenTtlAtFailure} login=${c.loginBetween} ` +
+          `refresh=${c.refreshBetween} reauth=${c.reauthBetween} ` +
+          `keeper=${c.sessionkeeperBetween} recreate=${c.contextRecreateBetween} ` +
+          `dbWrite=${c.dbWriteBetween} capture=${c.captureBetween}`,
+      );
+    }
     for (const e of t.window.slice(-40)) {
       const s = e.snapshot;
       console.log(
         `[SessTrace ${t.target.slice(0, 8)}] @${e.ts} ${e.event} ${e.detail} ` +
           (s
-            ? `ctx=${s.contextId} pg=${s.pageId} tok=${s.tokenHash} exp=${s.tokenExp} ck=${s.cookieNameHash}/${s.cookieCount} db=${s.capturedAt}`
+            ? `ctx=${s.contextId} pg=${s.pageId} tok=${s.tokenHash} iat=${s.tokenIat} exp=${s.tokenExp} ck=${s.cookieNameHash}/${s.cookieCount} db=${s.capturedAt}`
             : "nosnap"),
       );
     }

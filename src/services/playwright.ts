@@ -1205,6 +1205,19 @@ export function getCachedQwenHeaders(
   return { ...cache.headers };
 }
 
+export function getAccountPageSnapshotHandles(accountId: string): {
+  page: unknown;
+  context: unknown;
+} | null {
+  const page = accountPages.get(accountId);
+  if (!page || page.isClosed()) return null;
+  try {
+    return { page, context: page.context() };
+  } catch {
+    return null;
+  }
+}
+
 function getHeaderCache(accountId: string): AccountHeaderCache {
   let cache = headerCaches.get(accountId);
   if (!cache) {
