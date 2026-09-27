@@ -175,6 +175,16 @@ const deps: {
     },
   ) => Promise<void>;
   validateLive: (accountId: string) => Promise<{ status: number }>;
+  probeSameContext: (page: Page) => Promise<{
+    settingsStatus: number;
+    settingsAppAuthFailure: boolean;
+    createChatStatus: number;
+    createChatSuccess: boolean;
+    createChatAppAuthFailure: boolean;
+    liveTokenPresent: boolean;
+    cookieCount: number;
+    cookieNameHash: string;
+  } | null>;
   getCredentials: (
     accountId: string,
   ) => Promise<{ email: string; password: string } | null>;
@@ -374,6 +384,143 @@ const deps: {
       { referrer: qwenUrl("/settings/personalization") },
     );
     return { status: res.status };
+  },
+  probeSameContext: async (page: Page) => {
+    // Diagnostic only: same visible page/context that just proved a real
+    // chat. Cookie-only, no Authorization, no heal, single attempt each.
+    // Returns structural metadata + booleans; never bodies or secrets.
+    // NOTE: inline statements only (no nested arrows — __name constraints).
+    try {
+      const out = await page.evaluate(async (): Promise<{
+        settingsStatus: number;
+        settingsAppAuthFailure: boolean;
+        createChatStatus: number;
+        createChatSuccess: boolean;
+        createChatAppAuthFailure: boolean;
+        liveTokenPresent: boolean;
+        cookieCount: number;
+        cookieNameHash: string;
+      } | null> => {
+        try {
+          let liveTokenPresent = false;
+          try {
+            const t = localStorage.getItem("token");
+            liveTokenPresent = typeof t === "string" && t.length > 0;
+          } catch {
+            liveTokenPresent = false;
+          }
+          const baseHeaders: Record<string, string> = {
+            accept: "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "x-request-id":
+              Math.random().toString(36).slice(2) +
+              Math.random().toString(36).slice(2),
+            source: "web",
+          };
+          const settingsRes = await fetch(
+            "https://chat.qwen.ai/api/v2/users/user/settings",
+            {
+              method: "GET",
+              credentials: "include",
+              headers: baseHeaders,
+              signal: AbortSignal.timeout(20000),
+            },
+          );
+          const settingsText = await settingsRes.text().catch(() => "");
+          let settingsAppAuthFailure = false;
+          try {
+            const parsed: any = JSON.parse(settingsText);
+            settingsAppAuthFailure =
+              parsed &&
+              parsed.success === false &&
+              (parsed.data?.code === "Unauthorized" ||
+                parsed.code === "Unauthorized");
+          } catch {
+            settingsAppAuthFailure = false;
+          }
+          const newBody = JSON.stringify({
+            chatId: "",
+            models: ["qwen3.8-max"],
+            project_id: "",
+            timestamp: Date.now(),
+          });
+          const createRes = await fetch(
+            "https://chat.qwen.ai/api/v2/chats/new",
+            {
+              method: "POST",
+              credentials: "include",
+              headers: baseHeaders,
+              body: newBody,
+              signal: AbortSignal.timeout(30000),
+            },
+          );
+          const createText = await createRes.text().catch(() => "");
+          let createChatSuccess = false;
+          let createChatAppAuthFailure = false;
+          try {
+            const cparsed: any = JSON.parse(createText);
+            if (cparsed && typeof cparsed === "object") {
+              createChatSuccess = Boolean(
+                cparsed.chat_id ||
+                  cparsed.id ||
+                  cparsed.data?.chat_id ||
+                  cparsed.data?.id ||
+                  cparsed.data?.chat?.id,
+              );
+              createChatAppAuthFailure =
+                cparsed.success === false &&
+                (cparsed.data?.code === "Unauthorized" ||
+                  cparsed.code === "Unauthorized");
+            }
+          } catch {
+            createChatSuccess = false;
+            createChatAppAuthFailure = false;
+          }
+          let cookieCount = 0;
+          let cookieNameHash = "";
+          try {
+            const rawParts = document.cookie.split(";");
+            const names: string[] = [];
+            for (let i = 0; i < rawParts.length; i++) {
+              const trimmed = rawParts[i].trim();
+              if (!trimmed) continue;
+              cookieCount += 1;
+              const eq = trimmed.indexOf("=");
+              names.push(eq >= 0 ? trimmed.slice(0, eq) : trimmed);
+            }
+            names.sort();
+            let joined = "";
+            for (let i = 0; i < names.length; i++) {
+              joined += (i > 0 ? ";" : "") + names[i];
+            }
+            let h1 = 0x811c9dc5;
+            for (let i = 0; i < joined.length; i++) {
+              h1 ^= joined.charCodeAt(i);
+              h1 = Math.imul(h1, 0x01000193);
+            }
+            cookieNameHash = (h1 >>> 0).toString(16);
+          } catch {
+            cookieCount = 0;
+            cookieNameHash = "";
+          }
+          return {
+            settingsStatus: settingsRes.status,
+            settingsAppAuthFailure,
+            createChatStatus: createRes.status,
+            createChatSuccess,
+            createChatAppAuthFailure,
+            liveTokenPresent,
+            cookieCount,
+            cookieNameHash,
+          };
+        } catch {
+          return null;
+        }
+      });
+      return out;
+    } catch {
+      return null;
+    }
   },
   getCredentials: async (accountId: string) => {
     // Backend-only: values never leave this process (no frontend payload).
@@ -824,6 +971,28 @@ async function completeSuccess(
     accountId,
     `persist before capturedAt=${before.capturedAt} ageMs=${before.exists ? Date.now() - before.capturedAt : -1}`,
   );
+  // 1b. Same-context diagnostic probe (observational only — never gates):
+  // run the transport-equivalent settings + chats/new against the SAME
+  // visible page before anything is closed, snapshotted, or recreated.
+  if (visible) {
+    try {
+      const probe = await deps.probeSameContext(visible.page);
+      if (probe) {
+        logEvent(
+          entry,
+          accountId,
+          `same-context settings=${probe.settingsStatus} settingsAppFail=${probe.settingsAppAuthFailure} ` +
+            `create=${probe.createChatStatus} createOk=${probe.createChatSuccess} ` +
+            `createAppFail=${probe.createChatAppAuthFailure} liveToken=${probe.liveTokenPresent} ` +
+            `cookies=${probe.cookieCount} cookieNames=${probe.cookieNameHash}`,
+        );
+      } else {
+        logEvent(entry, accountId, "same-context probe inconclusive");
+      }
+    } catch {
+      logEvent(entry, accountId, "same-context probe error");
+    }
+  }
   // 2. Fresh snapshot from the context that proved the real chat — BEFORE
   // closing it, and BEFORE headless init can restore the old row. Grace
   // path (visible already closed): fall back to the opportunistic snapshot

@@ -62,9 +62,9 @@ function installHarness(opts: {
   /** Credential/autofill behavior for the flow. */
   creds?: "ok" | "none";
   autofillResult?: { submitted: boolean; alreadyLoggedIn: boolean; reason: string };
-  calls?: { capture: string[]; clearedCooldown: string[]; markedBusy: string[]; clearedBusy: string[]; closedHeadless: string[]; launched: Array<Record<string, string>> };
+  calls?: { capture: string[]; clearedCooldown: string[]; markedBusy: string[]; clearedBusy: string[]; closedHeadless: string[]; launched: Array<Record<string, string>>; probed: string[] };
 }) {
-  const calls = opts.calls ?? { capture: [], clearedCooldown: [], markedBusy: [], clearedBusy: [], closedHeadless: [], launched: [] };
+  const calls = opts.calls ?? { capture: [], clearedCooldown: [], markedBusy: [], clearedBusy: [], closedHeadless: [], launched: [], probed: [] };
   let launches = 0;
   const contexts: Array<{ closed: boolean }> = [];
   let forceClosed = false;
@@ -185,6 +185,19 @@ function installHarness(opts: {
       meta = { exists: true, capturedAt: Date.now() };
     },
     validateLive: async () => ({ status: opts.persist?.validateStatus ?? 200 }),
+    probeSameContext: async () => {
+      calls.probed.push("probe");
+      return {
+      settingsStatus: 200,
+      settingsAppAuthFailure: false,
+      createChatStatus: 200,
+      createChatSuccess: true,
+      createChatAppAuthFailure: false,
+      liveTokenPresent: true,
+      cookieCount: 12,
+      cookieNameHash: "deadbeef",
+      };
+    },
     getCredentials: async () =>
       opts.creds === "none"
         ? null
@@ -652,6 +665,36 @@ test("manual verification: autofill implementation never solves captcha", async 
   const body = src.slice(start, nextExport > 0 ? nextExport : start + 8000);
   assert.ok(!body.includes("solveBaxiaCaptcha"), "autofill must not auto-solve captcha");
   assert.ok(!body.includes("s3cret") && !body.includes("console.log"));
+});
+
+test("manual verification: same-context probe runs once, never gates success", async () => {
+  const { calls, emit } = installHarness({ loggedIn: false });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  assert.deepEqual(calls.probed, ["probe"]);
+  assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+  assert.equal(calls.launched.length, 1);
+});
+
+test("manual verification: same-context probe failure still verifies on chat done", async () => {
+  const { emit } = installHarness({ loggedIn: false });
+  const { setManualVerificationDeps } = await import("../services/manual-verification.ts");
+  setManualVerificationDeps({ probeSameContext: async () => null });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+});
+
+test("manual verification: same-context probe emits no secrets", async () => {
+  const { emit } = installHarness({ loggedIn: false });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  const st = getManualVerificationStatus(TEST_ID);
+  const blob = JSON.stringify(st);
+  assert.ok(!blob.includes("token="));
+  assert.ok(!blob.includes("cookie"));
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {
