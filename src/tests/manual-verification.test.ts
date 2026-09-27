@@ -660,7 +660,7 @@ test("manual verification: autofillQwenLoginForm no-form without touching passwo
   const page: unknown = {
     isClosed: () => false,
     url: () => "https://chat.qwen.ai/auth",
-    evaluate: async () => "auths-status",
+    evaluate: async () => false,
     waitForSelector: async () => {
       throw new Error("timeout");
     },
@@ -790,6 +790,38 @@ test("manual verification: non-completions api traffic never verifies and leaks 
   assert.ok(st === "waiting" || st === "authenticated", `unexpected ${st}`);
   cancelManualVerification(TEST_ID);
   assert.equal(await waitForState("cancelled"), "cancelled");
+});
+
+test("manual verification: challenge wall keeps window open for user", async () => {
+  installHarness({
+    loggedIn: false,
+    autofillResult: { submitted: false, alreadyLoggedIn: false, reason: "challenge-wall" },
+  });
+  await startManualVerification(TEST_ID);
+  await new Promise((r) => setTimeout(r, 150));
+  const st = getManualVerificationStatus(TEST_ID);
+  assert.equal(st?.state, "waiting");
+  assert.match(st?.detail ?? "", /challenge/i);
+  cancelManualVerification(TEST_ID);
+  assert.equal(await waitForState("cancelled"), "cancelled");
+});
+
+test("manual verification: autofillQwenLoginForm detects challenge wall", async () => {
+  const { autofillQwenLoginForm } = await import("../services/playwright.ts");
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/auth",
+    evaluate: async () => `<html><div class="captcha-slider">verify you are human</div></html>`,
+    waitForSelector: async () => {
+      throw new Error("timeout");
+    },
+    fill: async () => {},
+    locator: () => ({ first: () => ({}) }),
+    getByText: () => ({ first: () => ({}) }),
+    keyboard: { press: async () => {} },
+  };
+  const r = await autofillQwenLoginForm(page as never, "e@x.com", "s3cret");
+  assert.equal(r.reason, "challenge-wall");
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

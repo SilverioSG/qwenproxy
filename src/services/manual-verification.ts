@@ -748,6 +748,12 @@ async function runVerification(accountId: string): Promise<void> {
       } else if (!auto.alreadyLoggedIn && auto.reason === "no-form") {
         finish("failed", "Login form not found");
         return;
+      } else if (!auto.alreadyLoggedIn && auto.reason === "challenge-wall") {
+        setStatus(
+          entry,
+          "waiting",
+          "Verification challenge detected — solve it manually",
+        );
       }
       // already-logged-in / no-password-field / submit-failed: keep the
       // window open and let the user continue manually.
@@ -911,12 +917,17 @@ async function runVerification(accountId: string): Promise<void> {
     // Main wait: login is INFORMATIONAL ONLY (hint for the user, never a
     // gate). Only a real chat completion (evidence() === "done") can
     // trigger success. The window stays open through login, popups and
-    // slider solving; the user sends a test message by hand.
-    setStatus(
-      entry,
-      "waiting",
-      "Waiting — send a test message in Qwen",
-    );
+    // slider solving; the user sends a test message by hand. Preserve a
+    // challenge-wall detail set by autofill.
+    if (!/challenge/i.test(entry.detail ?? "")) {
+      setStatus(
+        entry,
+        "waiting",
+        "Waiting — send a test message in Qwen",
+      );
+    } else {
+      setStatus(entry, "waiting", entry.detail);
+    }
     const deadline = now() + VERIFY_TIMEOUT_MS;
     let poll = 0;
     let lastLoginClass = "unknown";

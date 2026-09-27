@@ -2464,6 +2464,7 @@ export interface AutofillResult {
     | "submitted"
     | "no-credentials"
     | "no-form"
+    | "challenge-wall"
     | "no-password-field"
     | "submit-failed";
 }
@@ -2530,14 +2531,32 @@ export async function autofillQwenLoginForm(
       'input[autocomplete="email"]',
       'input[placeholder*="Email" i]',
       'input[placeholder*="email" i]',
+      'input[placeholder*="correo" i]',
     ].join(", ");
     try {
       await page.waitForSelector(emailSelector, { timeout: 8_000 });
     } catch {
+      // No form at all: distinguish a challenge wall (user may still solve
+      // it by hand) from a truly missing form.
+      try {
+        const wall = await page.evaluate(() => {
+          const html = document.documentElement.innerHTML.slice(0, 20000).toLowerCase();
+          return (
+            html.includes("captcha") ||
+            html.includes("challenge") ||
+            html.includes("verify you are human") ||
+            html.includes("slider") ||
+            document.querySelector('iframe[src*="captcha" i],iframe[src*="challenge" i]') !== null
+          );
+        }).catch(() => false);
+        if (wall) {
+          return { submitted: false, alreadyLoggedIn: false, reason: "challenge-wall" };
+        }
+      } catch {}
       return { submitted: false, alreadyLoggedIn: false, reason: "no-form" };
     }
     try {
-      const pwdModeBtn = page.getByText(/Log in with a password/i).first();
+      const pwdModeBtn = page.getByText(/Log in with a password|Iniciar sesi\u00f3n con contrase\u00f1a/i).first();
       if (await pwdModeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
         await pwdModeBtn.click().catch(() => {});
         await sleep(500);
