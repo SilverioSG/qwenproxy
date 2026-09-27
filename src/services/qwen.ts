@@ -1410,8 +1410,15 @@ export function isUsableRefreshPayload(json: unknown): boolean {
   if (!json || typeof json !== "object") return false;
   const j = json as { success?: unknown; data?: unknown };
   if (j.success !== true) return false;
-  const d = j.data as { token?: unknown } | null | undefined;
-  return !!d && typeof d.token === "string" && d.token.length > 0;
+  const d = j.data as
+    | { token?: unknown; access_token?: unknown }
+    | null
+    | undefined;
+  if (!d) return false;
+  return (
+    (typeof d.access_token === "string" && d.access_token.length > 0) ||
+    (typeof d.token === "string" && d.token.length > 0)
+  );
 }
 
 /**
@@ -1614,27 +1621,62 @@ export async function requestQwenTextInBrowser(
           diag.firstAppAuthFailure = appUnauthorized;
 
           // Silent in-page token refresh + single retry on auth failure.
+          // Mirrors the official SPA: same endpoint/method/credentials PLUS
+          // the interceptor headers the web client always sends (Version,
+          // source, X-Request-Id, Timezone), and the SPA response contract
+          // (success + data.access_token, with data.expires_at).
           if (response.status === 401 || appUnauthorized) {
             diag.refreshAttempted = true;
             try {
+              const refreshVersion =
+                headers["version"] && headers["version"].length > 0
+                  ? headers["version"]
+                  : "0.3.11";
+              let rid = "";
+              try {
+                rid =
+                  Math.random().toString(36).slice(2) +
+                  Math.random().toString(36).slice(2);
+              } catch {
+                rid = "manual-refresh";
+              }
               const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
                 method: "GET",
                 credentials: "include",
-                signal: AbortSignal.timeout(3000),
+                headers: {
+                  accept: "application/json, text/plain, */*",
+                  Version: refreshVersion,
+                  source: "web",
+                  "X-Request-Id": rid,
+                  Timezone: new Date().toString().split(" (")[0],
+                },
+                signal: AbortSignal.timeout(10000),
               });
               diag.refreshStatus = refreshRes.status;
               if (refreshRes.status === 200) {
                 const refreshJson: any = await refreshRes.json().catch(() => null);
-                const usable =
-                  !!refreshJson &&
-                  refreshJson.success === true &&
-                  !!refreshJson.data?.token;
+                let freshTok: string | null = null;
+                try {
+                  const d = refreshJson && refreshJson.data;
+                  const cand =
+                    d && typeof d.access_token === "string" && d.access_token.length > 0
+                      ? d.access_token
+                      : d && typeof d.token === "string" && d.token.length > 0
+                        ? d.token
+                        : null;
+                  if (refreshJson && refreshJson.success === true && cand) {
+                    freshTok = cand;
+                  }
+                } catch {
+                  freshTok = null;
+                }
+                const usable = freshTok !== null;
                 diag.refreshUsable = usable;
                 if (usable) {
-                  const freshTok: string = String(refreshJson.data.token);
-                  localStorage.setItem("token", freshTok);
+                  const tok: string = freshTok as string;
+                  localStorage.setItem("token", tok);
                   diag.refreshUpdatedLs = true;
-                  document.cookie = `token=${encodeURIComponent(freshTok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                  document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
                   diag.refreshUpdatedCookie = true;
                   if (!cookieOnlyRoute) {
                     effHeaders["authorization"] = `Bearer ${freshTok}`;

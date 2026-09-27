@@ -223,12 +223,31 @@ test("qwen-auth-diag: refresh-structure endpoint registered with verifyApiKey", 
     .join("\n");
   assert.ok(noComments.includes("verifyApiKey"));
   const allowed = new Set(["id", "result", "err"]);
-  const idents = new Set();
+  const idents = new Set<string>();
   for (const m of noComments.matchAll(/\$\{([^}]+)\}/g)) {
     const root = m[1].split(/[.?(\s]/)[0];
     if (root) idents.add(root);
   }
   for (const ident of idents) {
     assert.ok(allowed.has(ident), `unexpected interpolation: ${ident}`);
+  }
+});
+
+test("qwen-auth-diag: refresh access_token shape is usable (SPA contract)", () => {
+  assert.equal(
+    isUsableRefreshPayload({ success: true, data: { access_token: "tok", expires_at: 123 } }),
+    true,
+  );
+  assert.equal(isUsableRefreshPayload({ success: true, data: { token: "tok" } }), true);
+  assert.equal(isUsableRefreshPayload({ success: true, data: {} }), false);
+});
+
+test("qwen-auth-diag: refresh call carries SPA interceptor headers", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const start = src.indexOf("auth.qwen.ai/api/v2/auths/refresh", src.indexOf("Silent in-page token refresh"));
+  assert.ok(start >= 0);
+  const block = src.slice(start, start + 1800);
+  for (const marker of ["Version:", "source:", "X-Request-Id", "Timezone:", "access_token"]) {
+    assert.ok(block.includes(marker), `refresh call missing: ${marker}`);
   }
 });
