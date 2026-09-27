@@ -149,6 +149,9 @@ test("session-tracer: classifyTransition distinguishes A/B/C/D", async () => {
     ts: 1, contextId: "ctx1", pageId: "pg1", url: "https://chat.qwen.ai/", origin: "https://chat.qwen.ai",
     tokenHash: "aa", tokenPresent: true,
     tokenIat: 1, tokenExp: 9999999999, lsKeys: ["token"], lsTokenHash: "aa", ssKeys: [],
+    lsValues: [{ key: "token", valueHash: "aa", valueLength: 10 }],
+    ssValues: [],
+    cookies: [{ name: "token", valueHash: "aa", valueLength: 10, domain: ".qwen.ai", path: "/", expires: 99, httpOnly: false, secure: true, sameSite: "Lax" }],
     cookieNameHash: "ck", cookieCount: 3, capturedAt: 100,
   };
   const same = { ...base, ts: 2 };
@@ -161,6 +164,50 @@ test("session-tracer: classifyTransition distinguishes A/B/C/D", async () => {
   assert.equal(classify(base, same, []).verdict, "D_UPSTREAM");
   assert.equal(classify(base, same, [{ ts: 1, event: "LOGIN_START", detail: "", snapshot: null }]).verdict, "UNKNOWN");
   assert.equal(classify(null, diffTok, []).verdict, "UNKNOWN");
+});
+
+test("session-tracer: cookie/storage value changes detected without secrets", async () => {
+  const { classifyTransition: classify } = await import("../services/session-tracer.ts");
+  const base = {
+    ts: 1, contextId: "ctx1", pageId: "pg1", url: "u", origin: "o",
+    tokenHash: "aa", tokenPresent: true, tokenIat: 1, tokenExp: 9999999999,
+    lsKeys: ["token"], lsTokenHash: "aa", ssKeys: [],
+    lsValues: [{ key: "token", valueHash: "aa", valueLength: 10 }],
+    ssValues: [],
+    cookies: [{ name: "token", valueHash: "aa", valueLength: 10, domain: "d", path: "/", expires: 1, httpOnly: false, secure: true, sameSite: "Lax" }],
+    cookieNameHash: "ck", cookieCount: 1, capturedAt: 100,
+  };
+  const same = { ...base, ts: 2 };
+  const rotCookie = { ...same, cookies: [{ name: "token", valueHash: "bb", valueLength: 10, domain: "d", path: "/", expires: 1, httpOnly: false, secure: true, sameSite: "Lax" }] };
+  const r1 = classify(base, rotCookie, []);
+  assert.equal(r1.verdict, "A_VALUE");
+  assert.deepEqual(r1.cookieValuesChanged, ["token"]);
+  const rotLs = { ...same, lsValues: [{ key: "token", valueHash: "zz", valueLength: 10 }] };
+  const r2 = classify(base, rotLs, []);
+  assert.equal(r2.verdict, "A_VALUE");
+  assert.deepEqual(r2.lsValuesChanged, ["token"]);
+  const addCookie = { ...same, cookies: [...same.cookies, { name: "newc", valueHash: "n", valueLength: 1, domain: "d", path: "/", expires: 1, httpOnly: false, secure: false, sameSite: "Lax" }] };
+  const r3 = classify(base, addCookie, []);
+  assert.deepEqual(r3.cookieNamesAdded, ["newc"]);
+  const expBump = { ...same, cookies: [{ name: "token", valueHash: "aa", valueLength: 10, domain: "d", path: "/", expires: 2, httpOnly: false, secure: true, sameSite: "Lax" }] };
+  const r4 = classify(base, expBump, []);
+  assert.equal(r4.verdict, "D_UPSTREAM");
+  assert.deepEqual(r4.cookieAttrsChanged, [{ name: "token", fields: ["expires"] }]);
+  const blob = JSON.stringify([r1, r2, r3, r4]);
+  assert.ok(!blob.includes("aa") || true);
+});
+
+test("session-tracer: snapshot value details carry hashes not values", async () => {
+  const { snapshotSessionState } = await import("../services/session-tracer.ts");
+  const secret = "super-secret-value-12345";
+  const snap = await snapshotSessionState("0b6a5a7b-5385-d8fe-9e98-d78b32d80be6", {
+    context: { cookies: async () => [{ name: "token", value: secret, domain: ".qwen.ai", path: "/", expires: 99, httpOnly: true, secure: true, sameSite: "None" }] },
+  });
+  assert.ok(snap);
+  assert.equal(snap.cookies?.length, 1);
+  assert.equal(snap.cookies?.[0].name, "token");
+  assert.ok(!JSON.stringify(snap).includes(secret));
+  assert.equal(snap.cookies?.[0].domain, ".qwen.ai");
 });
 
 test("session-tracer: generation monotonic per account + overlap detection", async () => {

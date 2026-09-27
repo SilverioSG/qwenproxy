@@ -33,6 +33,24 @@ export type SessionTraceEvent =
   | "CREATE_CHAT_STATUS"
   | "APP_UNAUTHORIZED";
 
+export interface CookieDetail {
+  name: string;
+  valueHash: string;
+  valueLength: number;
+  domain: string;
+  path: string;
+  expires: number;
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: string;
+}
+
+export interface StorageDetail {
+  key: string;
+  valueHash: string;
+  valueLength: number;
+}
+
 export interface SessionSnapshot {
   ts: number;
   contextId: string | null;
@@ -48,6 +66,9 @@ export interface SessionSnapshot {
   ssKeys: string[] | null;
   cookieNameHash: string | null;
   cookieCount: number | null;
+  cookies: CookieDetail[] | null;
+  lsValues: StorageDetail[] | null;
+  ssValues: StorageDetail[] | null;
   capturedAt: number | null;
 }
 
@@ -139,10 +160,21 @@ function hashNames(names: string[]): string {
   return hashValue([...names].sort().join(";"));
 }
 
+export interface ContextCookie {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: string;
+}
+
 export async function snapshotSessionState(
   accountId: string,
   handles: {
-    context?: { cookies?: () => Promise<Array<{ name: string; value: string }>> } | null;
+    context?: { cookies?: () => Promise<ContextCookie[]> } | null;
     page?: unknown;
   } = {},
 ): Promise<SessionSnapshot | null> {
@@ -160,6 +192,9 @@ export async function snapshotSessionState(
     lsKeys: null,
     lsTokenHash: null,
     ssKeys: null,
+    cookies: null,
+    lsValues: null,
+    ssValues: null,
     cookieNameHash: null,
     cookieCount: null,
     capturedAt: null,
@@ -220,6 +255,76 @@ export async function snapshotSessionState(
             snap.ssKeys = Array.isArray(dom.ss) ? dom.ss.slice(0, 40) : null;
             snap.lsTokenHash = typeof dom.th === "string" ? dom.th : null;
           }
+          try {
+            const det = (await (pg as unknown as {
+              evaluate?: (fn: () => unknown) => Promise<unknown>;
+            }).evaluate?.((): unknown => {
+              try {
+                const ls: Array<{ key: string; hash: string; len: number }> = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                  const k = localStorage.key(i);
+                  if (!k) continue;
+                  const v = localStorage.getItem(k) || "";
+                  let h1 = 0x811c9dc5;
+                  for (let j = 0; j < v.length; j++) {
+                    h1 ^= v.charCodeAt(j);
+                    h1 = Math.imul(h1, 0x01000193);
+                  }
+                  ls.push({
+                    key: k.slice(0, 80),
+                    hash: (h1 >>> 0).toString(16),
+                    len: v.length,
+                  });
+                  if (ls.length >= 40) break;
+                }
+                const ss: Array<{ key: string; hash: string; len: number }> = [];
+                for (let i = 0; i < sessionStorage.length; i++) {
+                  const k = sessionStorage.key(i);
+                  if (!k) continue;
+                  const v = sessionStorage.getItem(k) || "";
+                  let h1 = 0x811c9dc5;
+                  for (let j = 0; j < v.length; j++) {
+                    h1 ^= v.charCodeAt(j);
+                    h1 = Math.imul(h1, 0x01000193);
+                  }
+                  ss.push({
+                    key: k.slice(0, 80),
+                    hash: (h1 >>> 0).toString(16),
+                    len: v.length,
+                  });
+                  if (ss.length >= 40) break;
+                }
+                return { ls, ss };
+              } catch {
+                return null;
+              }
+            }).catch(() => null)) as {
+              ls?: Array<{ key: string; hash: string; len: number }>;
+              ss?: Array<{ key: string; hash: string; len: number }>;
+            } | null;
+            if (det) {
+              snap.lsValues = Array.isArray(det.ls)
+                ? det.ls.map(
+                    (e: { key: string; hash: string; len: number }) => ({
+                      key: e.key,
+                      valueHash: e.hash,
+                      valueLength: e.len,
+                    }),
+                  )
+                : null;
+              snap.ssValues = Array.isArray(det.ss)
+                ? det.ss.map(
+                    (e: { key: string; hash: string; len: number }) => ({
+                      key: e.key,
+                      valueHash: e.hash,
+                      valueLength: e.len,
+                    }),
+                  )
+                : null;
+            }
+          } catch {
+            // Best effort; key names above already recorded.
+          }
         }
       } catch {
         // Best effort.
@@ -234,6 +339,17 @@ export async function snapshotSessionState(
       const names = cookies.map((c) => c.name);
       snap.cookieCount = names.length;
       snap.cookieNameHash = hashNames(names);
+      snap.cookies = cookies.map((c) => ({
+        name: c.name,
+        valueHash: hashValue(String(c.value ?? "")),
+        valueLength: String(c.value ?? "").length,
+        domain: String(c.domain ?? ""),
+        path: String(c.path ?? ""),
+        expires: Number(c.expires ?? 0),
+        httpOnly: Boolean(c.httpOnly),
+        secure: Boolean(c.secure),
+        sameSite: String(c.sameSite ?? ""),
+      }));
       const tok = cookies.find((c) => c.name === "token");
       if (tok && tok.value) {
         snap.tokenPresent = true;
@@ -347,6 +463,16 @@ export interface TransitionClassification {
   pageChanged: boolean;
   tokenChanged: boolean;
   cookieSetChanged: boolean;
+  cookieNamesAdded: string[];
+  cookieNamesRemoved: string[];
+  cookieValuesChanged: string[];
+  cookieAttrsChanged: Array<{ name: string; fields: string[] }>;
+  lsKeysAdded: string[];
+  lsKeysRemoved: string[];
+  lsValuesChanged: string[];
+  ssKeysAdded: string[];
+  ssKeysRemoved: string[];
+  ssValuesChanged: string[];
   capturedAtChanged: boolean;
   dbStateChanged: boolean;
   tokenExpiredAtFailure: boolean | null;
@@ -358,7 +484,7 @@ export interface TransitionClassification {
   contextRecreateBetween: boolean;
   dbWriteBetween: boolean;
   captureBetween: boolean;
-  verdict: "A_TOKEN" | "B_CONTEXT" | "C_PERSISTED" | "D_UPSTREAM" | "UNKNOWN";
+  verdict: "A_TOKEN" | "A_VALUE" | "B_CONTEXT" | "C_PERSISTED" | "D_UPSTREAM" | "UNKNOWN";
 }
 
 function snapEqual(a: string | null, b: string | null): boolean {
@@ -390,6 +516,65 @@ export function classifyTransition(
       ? !snapEqual(base.cookieNameHash, fail.cookieNameHash) ||
         base.cookieCount !== fail.cookieCount
       : false;
+  const byName = (
+    list: CookieDetail[] | null | undefined,
+  ): Map<string, CookieDetail> => {
+    const m = new Map<string, CookieDetail>();
+    for (const c of list ?? []) m.set(c.name, c);
+    return m;
+  };
+  const baseCookies = byName(base?.cookies);
+  const failCookies = byName(fail?.cookies);
+  const cookieNamesAdded: string[] = [];
+  const cookieNamesRemoved: string[] = [];
+  const cookieValuesChanged: string[] = [];
+  const cookieAttrsChanged: Array<{ name: string; fields: string[] }> = [];
+  if (base?.cookies && fail?.cookies) {
+    for (const name of failCookies.keys()) {
+      if (!baseCookies.has(name)) cookieNamesAdded.push(name);
+    }
+    for (const name of baseCookies.keys()) {
+      if (!failCookies.has(name)) cookieNamesRemoved.push(name);
+      else {
+        const a = baseCookies.get(name)!;
+        const b = failCookies.get(name)!;
+        if (a.valueHash !== b.valueHash || a.valueLength !== b.valueLength) {
+          cookieValuesChanged.push(name);
+        }
+        const fields: string[] = [];
+        if (a.expires !== b.expires) fields.push("expires");
+        if (a.domain !== b.domain) fields.push("domain");
+        if (a.path !== b.path) fields.push("path");
+        if (a.httpOnly !== b.httpOnly) fields.push("httpOnly");
+        if (a.secure !== b.secure) fields.push("secure");
+        if (a.sameSite !== b.sameSite) fields.push("sameSite");
+        if (fields.length > 0) cookieAttrsChanged.push({ name, fields });
+      }
+    }
+  }
+  const storDiff = (
+    a: StorageDetail[] | null | undefined,
+    b: StorageDetail[] | null | undefined,
+  ): { added: string[]; removed: string[]; changed: string[] } => {
+    const added: string[] = [];
+    const removed: string[] = [];
+    const changed: string[] = [];
+    if (!a || !b) return { added, removed, changed };
+    const ma = new Map(a.map((x) => [x.key, x]));
+    const mb = new Map(b.map((x) => [x.key, x]));
+    for (const k of mb.keys()) if (!ma.has(k)) added.push(k);
+    for (const k of ma.keys()) {
+      if (!mb.has(k)) removed.push(k);
+      else {
+        const av = ma.get(k)!;
+        const bv = mb.get(k)!;
+        if (av.valueHash !== bv.valueHash || av.valueLength !== bv.valueLength) changed.push(k);
+      }
+    }
+    return { added, removed, changed };
+  };
+  const ls = storDiff(base?.lsValues, fail?.lsValues);
+  const ss = storDiff(base?.ssValues, fail?.ssValues);
   const capturedAtChanged =
     base?.capturedAt !== null &&
     base?.capturedAt !== undefined &&
@@ -417,7 +602,13 @@ export function classifyTransition(
   const captureBetween =
     hasEvent("CAPTURE_START") || hasEvent("CAPTURE_END");
   let verdict: TransitionClassification["verdict"] = "UNKNOWN";
+  const valueChanged =
+    tokenChanged ||
+    cookieValuesChanged.length > 0 ||
+    ls.changed.length > 0 ||
+    ss.changed.length > 0;
   if (tokenChanged) verdict = "A_TOKEN";
+  else if (valueChanged) verdict = "A_VALUE";
   else if (contextChanged || pageChanged) verdict = "B_CONTEXT";
   else if (dbStateChanged) verdict = "C_PERSISTED";
   else if (
@@ -437,6 +628,16 @@ export function classifyTransition(
     pageChanged,
     tokenChanged,
     cookieSetChanged,
+    cookieNamesAdded,
+    cookieNamesRemoved,
+    cookieValuesChanged,
+    cookieAttrsChanged,
+    lsKeysAdded: ls.added,
+    lsKeysRemoved: ls.removed,
+    lsValuesChanged: ls.changed,
+    ssKeysAdded: ss.added,
+    ssKeysRemoved: ss.removed,
+    ssValuesChanged: ss.changed,
     capturedAtChanged,
     dbStateChanged,
     tokenExpiredAtFailure,
@@ -561,6 +762,9 @@ function dumpFailureWindow(): void {
         `[SessTrace ${t.target.slice(0, 8)}] CLASSIFY verdict=${c.verdict} ` +
           `ctxChanged=${c.contextChanged} pgChanged=${c.pageChanged} ` +
           `tokChanged=${c.tokenChanged} ckChanged=${c.cookieSetChanged} ` +
+          `ckValChanged=[${c.cookieValuesChanged.join(",")}] ` +
+          `ckAdded=[${c.cookieNamesAdded.join(",")}] ckRemoved=[${c.cookieNamesRemoved.join(",")}] ` +
+          `lsChanged=[${c.lsValuesChanged.join(",")}] ssChanged=[${c.ssValuesChanged.join(",")}] ` +
           `dbChanged=${c.dbStateChanged} tokExpired=${c.tokenExpiredAtFailure} ` +
           `tokTtl=${c.tokenTtlAtFailure} login=${c.loginBetween} ` +
           `refresh=${c.refreshBetween} reauth=${c.reauthBetween} ` +
