@@ -206,3 +206,29 @@ test("qwen-auth-diag: probe endpoint registered with verifyApiKey", () => {
     );
   }
 });
+
+test("qwen-auth-diag: probeRefreshStructure exported with sanitized shape", async () => {
+  const mod = await import("../services/qwen.ts");
+  assert.equal(typeof mod.probeRefreshStructure, "function");
+});
+
+test("qwen-auth-diag: refresh-structure endpoint registered with verifyApiKey", () => {
+  const src = fs.readFileSync("src/api/dashboard.ts", "utf-8");
+  const idx = src.indexOf('"/v1/accounts/:id/probe-refresh-structure"');
+  assert.ok(idx >= 0);
+  const noComments = src
+    .slice(idx, idx + 1200)
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("//"))
+    .join("\n");
+  assert.ok(noComments.includes("verifyApiKey"));
+  const allowed = new Set(["id", "result", "err"]);
+  const idents = new Set();
+  for (const m of noComments.matchAll(/\$\{([^}]+)\}/g)) {
+    const root = m[1].split(/[.?(\s]/)[0];
+    if (root) idents.add(root);
+  }
+  for (const ident of idents) {
+    assert.ok(allowed.has(ident), `unexpected interpolation: ${ident}`);
+  }
+});

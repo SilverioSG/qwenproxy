@@ -1096,6 +1096,243 @@ export async function probeSettingsAuthAB(
     false,
   );
 }
+
+/** Sanitized refresh-endpoint structure. Names/lengths/booleans only. */
+export interface RefreshStructureResult {
+  httpStatus: number;
+  contentType: string;
+  topKeys: string[];
+  dataKeys: string[];
+  nestedKeys: string[];
+  appSuccess: boolean;
+  appAuthFailure: boolean;
+  tokenCandidates: Array<{
+    path: string;
+    present: boolean;
+    valueType: string;
+    valueLength: number;
+  }>;
+  cookiesChanged: boolean;
+  cookieCountBefore: number;
+  cookieCountAfter: number;
+  liveTokenPresentBefore: boolean;
+  liveTokenPresentAfter: boolean;
+  liveTokenChanged: boolean;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC, single controlled refresh execution. Calls the
+ * auth refresh endpoint ONCE in-page and reports response STRUCTURE only
+ * (key names, value types/lengths, presence booleans). NEVER logs values,
+ * tokens, cookies, or bodies. Performs NO writes (no setItem, no cookies,
+ * no retry, no login, no DB, no cooldown).
+ * Inline statements only (__name constraints).
+ */
+export async function probeRefreshStructure(
+  accountId: string,
+): Promise<RefreshStructureResult> {
+  const { withAccountPage } = await import("./playwright.ts");
+  return withAccountPage(
+    accountId,
+    async (page: Page): Promise<RefreshStructureResult> => {
+      return page.evaluate(async (): Promise<RefreshStructureResult> => {
+        const empty: RefreshStructureResult = {
+          httpStatus: 0,
+          contentType: "",
+          topKeys: [],
+          dataKeys: [],
+          nestedKeys: [],
+          appSuccess: false,
+          appAuthFailure: false,
+          tokenCandidates: [],
+          cookiesChanged: false,
+          cookieCountBefore: 0,
+          cookieCountAfter: 0,
+          liveTokenPresentBefore: false,
+          liveTokenPresentAfter: false,
+          liveTokenChanged: false,
+        };
+        try {
+          let preCookies = "";
+          try {
+            preCookies = document.cookie || "";
+          } catch {
+            preCookies = "";
+          }
+          let preCount = 0;
+          try {
+            const parts = preCookies.split(";");
+            for (let i = 0; i < parts.length; i++) {
+              if (parts[i].trim()) preCount += 1;
+            }
+          } catch {
+            preCount = 0;
+          }
+          empty.cookieCountBefore = preCount;
+          let preToken: string | null = null;
+          try {
+            const t = localStorage.getItem("token");
+            preToken = typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            preToken = null;
+          }
+          empty.liveTokenPresentBefore = preToken !== null;
+          let resStatus = 0;
+          let resContentType = "";
+          let rawText = "";
+          try {
+            const refreshRes = await fetch(
+              "https://auth.qwen.ai/api/v2/auths/refresh",
+              {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(10000),
+              },
+            );
+            resStatus = refreshRes.status;
+            try {
+              resContentType = refreshRes.headers.get("content-type") || "";
+            } catch {
+              resContentType = "";
+            }
+            try {
+              rawText = await refreshRes.text();
+            } catch {
+              rawText = "";
+            }
+          } catch {
+            empty.httpStatus = 0;
+            return empty;
+          }
+          empty.httpStatus = resStatus;
+          empty.contentType = resContentType.slice(0, 80);
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(rawText);
+          } catch {
+            parsed = null;
+          }
+          if (parsed && typeof parsed === "object") {
+            for (const k in parsed) {
+              if (Object.prototype.hasOwnProperty.call(parsed, k)) {
+                empty.topKeys.push(k);
+              }
+            }
+            if (parsed.success === true) empty.appSuccess = true;
+            const code = String(parsed.data?.code || parsed.code || "");
+            const details = String(
+              parsed.data?.details || parsed.details || parsed.message || "",
+            );
+            if (
+              parsed.success === false &&
+              (code === "Unauthorized" ||
+                code.toLowerCase().indexOf("unauthorized") >= 0 ||
+                details.toLowerCase().indexOf("unauthorized") >= 0 ||
+                details.indexOf("401") >= 0)
+            ) {
+              empty.appAuthFailure = true;
+            }
+            const data = parsed.data;
+            if (data && typeof data === "object") {
+              for (const k in data) {
+                if (Object.prototype.hasOwnProperty.call(data, k)) {
+                  empty.dataKeys.push(k);
+                }
+              }
+              for (const k in data) {
+                if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
+                const v = (data as Record<string, unknown>)[k];
+                const t = v === null ? "null" : Array.isArray(v) ? "array" : typeof v;
+                let extra = "";
+                if (typeof v === "string") extra = " len=" + v.length;
+                else if (Array.isArray(v)) extra = " len=" + v.length;
+                else if (v && typeof v === "object") {
+                  let nk = 0;
+                  for (const kk in v as Record<string, unknown>) {
+                    if (Object.prototype.hasOwnProperty.call(v, kk)) nk += 1;
+                  }
+                  extra = " keys=" + nk;
+                }
+                empty.nestedKeys.push("data." + k + ":" + t + extra);
+              }
+            }
+            const paths = [
+              "data.token",
+              "data.access_token",
+              "data.accessToken",
+              "data.id_token",
+              "data.idToken",
+              "token",
+              "access_token",
+              "accessToken",
+              "data.session",
+              "data.ticket",
+              "data.refresh_token",
+            ];
+            for (let i = 0; i < paths.length; i++) {
+              const segs = paths[i].split(".");
+              let cur: unknown = parsed;
+              let ok = true;
+              for (let s = 0; s < segs.length; s++) {
+                if (cur && typeof cur === "object" && segs[s] in (cur as Record<string, unknown>)) {
+                  cur = (cur as Record<string, unknown>)[segs[s]];
+                } else {
+                  ok = false;
+                  break;
+                }
+              }
+              empty.tokenCandidates.push({
+                path: paths[i],
+                present: ok,
+                valueType: ok ? (cur === null ? "null" : Array.isArray(cur) ? "array" : typeof cur) : "absent",
+                valueLength:
+                  ok && typeof cur === "string"
+                    ? cur.length
+                    : ok && Array.isArray(cur)
+                      ? cur.length
+                      : 0,
+              });
+            }
+          }
+          try {
+            const postCookies = document.cookie || "";
+            let postCount = 0;
+            try {
+              const parts = postCookies.split(";");
+              for (let i = 0; i < parts.length; i++) {
+                if (parts[i].trim()) postCount += 1;
+              }
+            } catch {
+              postCount = 0;
+            }
+            empty.cookieCountAfter = postCount;
+            empty.cookiesChanged = postCount !== preCount;
+          } catch {
+            empty.cookieCountAfter = preCount;
+            empty.cookiesChanged = false;
+          }
+          try {
+            const t2 = localStorage.getItem("token");
+            const now2 = typeof t2 === "string" && t2.length > 0 ? t2 : null;
+            empty.liveTokenPresentAfter = now2 !== null;
+            empty.liveTokenChanged =
+              (preToken === null) !== (now2 === null) ||
+              (preToken !== null && now2 !== null && preToken !== now2);
+          } catch {
+            empty.liveTokenPresentAfter = empty.liveTokenPresentBefore;
+            empty.liveTokenChanged = false;
+          }
+          return empty;
+        } catch {
+          return empty;
+        }
+      });
+    },
+    60_000,
+    30_000,
+    false,
+  );
+}
 /** Sanitized in-page auth diagnostics. Booleans/codes only — never tokens. */
 export interface BrowserAuthDiag {
   /** Live localStorage token readable in-page. */

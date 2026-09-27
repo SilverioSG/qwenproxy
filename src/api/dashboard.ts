@@ -565,3 +565,32 @@ dashboardApp.post("/v1/accounts/:id/probe-settings-auth", async (c) => {
     );
   }
 });
+
+dashboardApp.post("/v1/accounts/:id/probe-refresh-structure", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC, single controlled refresh execution. Reports
+  // response STRUCTURE only (key names, value types/lengths, booleans).
+  // Performs NO writes and triggers NO recovery. Never logs values.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeRefreshStructure } = await import("../services/qwen.js");
+    const result = await probeRefreshStructure(id);
+    try {
+      console.log(
+        `[RefreshStruct] account=${id.slice(0, 8)} ` +
+          `http=${result.httpStatus} success=${result.appSuccess} ` +
+          `appFail=${result.appAuthFailure} ` +
+          `top=[${result.topKeys.join(",")}]`,
+      );
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
