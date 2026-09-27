@@ -2453,6 +2453,127 @@ async function loginViaApi(
   }
 }
 
+export interface AutofillResult {
+  /** Credentials were submitted (or session already valid). */
+  submitted: boolean;
+  /** No login needed at all. */
+  alreadyLoggedIn: boolean;
+  /** Sanitized machine reason (never contains credentials or DOM text). */
+  reason:
+    | "already-logged-in"
+    | "submitted"
+    | "no-credentials"
+    | "no-form"
+    | "no-password-field"
+    | "submit-failed";
+}
+
+/**
+ * Backend-only credential autofill for manual verification windows.
+ * Fills email + password from the account store and submits. NEVER solves
+ * captchas/sliders (the user does that by hand) and NEVER logs credentials.
+ * Returns quickly; the caller keeps the window open for manual completion.
+ */
+export async function autofillQwenLoginForm(
+  page: Page,
+  email: string,
+  password: string,
+): Promise<AutofillResult> {
+  if (!email || !password) {
+    return { submitted: false, alreadyLoggedIn: false, reason: "no-credentials" };
+  }
+  try {
+    if (await isPageLoggedIn(page, 5000)) {
+      return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
+    }
+  } catch {
+    // Fall through to form fill on probe failure.
+  }
+  try {
+    const url = typeof page.url === "function" ? page.url() : "";
+    const onAuthPage = url.includes("/auth") || url.includes("/login");
+    if (!onAuthPage) {
+      // Chat home in logged-out state shows a sign-in entry point; prefer
+      // structural selectors over locale text.
+      const entrySelectors = [
+        'a[href*="/auth"]',
+        'button:has-text("Log in")',
+        'button:has-text("Sign in")',
+        ".header-right-auth-button",
+        ".auth-buttons",
+      ];
+      for (const sel of entrySelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 1200 }).catch(() => false)) {
+            await btn.click({ timeout: 3000 }).catch(() => {});
+            await sleep(1500);
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+      const nowUrl = typeof page.url === "function" ? page.url() : "";
+      if (!nowUrl.includes("/auth") && !nowUrl.includes("/login")) {
+        await page.goto(qwenUrl("/auth"), {
+          waitUntil: "domcontentloaded",
+          timeout: config.timeouts.navigation,
+        }).catch(() => {});
+        await sleep(1500);
+      }
+    }
+
+    const emailSelector = [
+      'input[type="email"]',
+      'input[name="email"]',
+      'input[autocomplete="email"]',
+      'input[placeholder*="Email" i]',
+      'input[placeholder*="email" i]',
+    ].join(", ");
+    try {
+      await page.waitForSelector(emailSelector, { timeout: 8_000 });
+    } catch {
+      return { submitted: false, alreadyLoggedIn: false, reason: "no-form" };
+    }
+    try {
+      const pwdModeBtn = page.getByText(/Log in with a password/i).first();
+      if (await pwdModeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await pwdModeBtn.click().catch(() => {});
+        await sleep(500);
+      }
+    } catch {}
+    await page.fill(emailSelector, email).catch(() => {});
+    await sleep(300);
+
+    const passwordSelector = 'input[type="password"], input[name="password"]';
+    const pwdVisible = await page
+      .waitForSelector(passwordSelector, { timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!pwdVisible) {
+      // Leave the window open: the user may continue manually (OTP etc.).
+      return { submitted: false, alreadyLoggedIn: false, reason: "no-password-field" };
+    }
+    await page.fill(passwordSelector, password).catch(() => {});
+    await sleep(500);
+    const submitSelector =
+      'button.qwenchat-auth-pc-submit-button, button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")';
+    try {
+      await page.waitForSelector('button[type="submit"]:not([disabled])', {
+        timeout: 5_000,
+      });
+      await page.locator(submitSelector).first().click().catch(() => {});
+    } catch {
+      await page.keyboard.press("Enter").catch(() => {});
+    }
+    await sleep(2000);
+    return { submitted: true, alreadyLoggedIn: false, reason: "submitted" };
+  } catch {
+    return { submitted: false, alreadyLoggedIn: false, reason: "submit-failed" };
+  }
+}
+
 async function loginViaUi(
   page: Page,
   email: string,

@@ -249,6 +249,7 @@ async function pollVerifyStatus(id, btn) {
       else if (state === 'authenticated') btn.textContent = 'Authenticated — send a test message…';
       else if (state === 'verifying') btn.textContent = 'Chat detected — verifying…';
       else if (state === 'opening') btn.textContent = 'Opening…';
+      else if (state === 'autofilling') btn.textContent = 'Autofilling credentials…';
     }
     if (state === 'verified') {
       showToast('Account verified and ready.', 'success');

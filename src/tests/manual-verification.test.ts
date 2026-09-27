@@ -59,6 +59,9 @@ function installHarness(opts: {
     dontAdvance?: boolean;
     validateStatus?: number;
   };
+  /** Credential/autofill behavior for the flow. */
+  creds?: "ok" | "none";
+  autofillResult?: { submitted: boolean; alreadyLoggedIn: boolean; reason: string };
   calls?: { capture: string[]; clearedCooldown: string[]; markedBusy: string[]; clearedBusy: string[]; closedHeadless: string[]; launched: Array<Record<string, string>> };
 }) {
   const calls = opts.calls ?? { capture: [], clearedCooldown: [], markedBusy: [], clearedBusy: [], closedHeadless: [], launched: [] };
@@ -182,6 +185,12 @@ function installHarness(opts: {
       meta = { exists: true, capturedAt: Date.now() };
     },
     validateLive: async () => ({ status: opts.persist?.validateStatus ?? 200 }),
+    getCredentials: async () =>
+      opts.creds === "none"
+        ? null
+        : { email: "t@example.com", password: "pw" },
+    autofill: async () =>
+      opts.autofillResult ?? { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" },
   });
   return {
     calls,
@@ -553,6 +562,97 @@ test("manual verification: fresh persist + settings 403 → failed, cooldown int
   assert.deepEqual(calls.clearedCooldown, []);
 });
 
+
+test("manual verification: autofill submitted → waiting for manual completion", async () => {
+  const { emit } = installHarness({
+    loggedIn: false,
+    autofillResult: { submitted: true, alreadyLoggedIn: false, reason: "submitted" },
+  });
+  await startManualVerification(TEST_ID);
+  // Submitted but no login yet and no chat: stays waiting with the window
+  // open for manual completion (never failed, never verified).
+  await new Promise((r) => setTimeout(r, 150));
+  const pre = getManualVerificationStatus(TEST_ID)?.state;
+  assert.ok(pre === "waiting" || pre === "authenticated", `unexpected ${pre}`);
+  cancelManualVerification(TEST_ID);
+  assert.equal(await waitForState("cancelled"), "cancelled");
+});
+
+test("manual verification: no stored credentials → failed, no browser action", async () => {
+  const { calls } = installHarness({ loggedIn: false, creds: "none" });
+  await startManualVerification(TEST_ID);
+  assert.equal(await waitForState("failed"), "failed");
+  assert.equal(calls.launched.length, 1);
+  assert.deepEqual(calls.clearedBusy, [TEST_ID]);
+});
+
+test("manual verification: no login form → failed", async () => {
+  installHarness({
+    loggedIn: false,
+    autofillResult: { submitted: false, alreadyLoggedIn: false, reason: "no-form" },
+  });
+  await startManualVerification(TEST_ID);
+  assert.equal(await waitForState("failed"), "failed");
+});
+
+test("manual verification: autofill never exposes credentials to status", async () => {
+  const { emit } = installHarness({
+    loggedIn: true,
+    autofillResult: { submitted: true, alreadyLoggedIn: false, reason: "submitted" },
+  });
+  await startManualVerification(TEST_ID);
+  assert.equal(await waitForState("authenticated"), "authenticated");
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  const st = getManualVerificationStatus(TEST_ID);
+  const blob = JSON.stringify(st);
+  assert.ok(!blob.includes("pw-secret-never"));
+  assert.ok(!blob.includes("password"));
+});
+
+test("manual verification: autofillQwenLoginForm already-logged-in short-circuits", async () => {
+  const { autofillQwenLoginForm } = await import("../services/playwright.ts");
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    evaluate: async () => "ok",
+  };
+  const r = await autofillQwenLoginForm(page as never, "e@x.com", "s3cret");
+  assert.deepEqual(r, { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" });
+});
+
+test("manual verification: autofillQwenLoginForm no-form without touching password", async () => {
+  const { autofillQwenLoginForm } = await import("../services/playwright.ts");
+  let filled: string[] = [];
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/auth",
+    evaluate: async () => "auths-status",
+    waitForSelector: async () => {
+      throw new Error("timeout");
+    },
+    fill: async (sel: string) => {
+      filled.push(sel);
+    },
+    locator: () => ({ first: () => ({}) }),
+    getByText: () => ({ first: () => ({}) }),
+    keyboard: { press: async () => {} },
+  };
+  const r = await autofillQwenLoginForm(page as never, "e@x.com", "s3cret");
+  assert.equal(r.reason, "no-form");
+  assert.deepEqual(filled, []);
+});
+
+test("manual verification: autofill implementation never solves captcha", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("export async function autofillQwenLoginForm");
+  assert.ok(start >= 0);
+  const nextExport = src.indexOf("\nasync function loginViaUi(", start);
+  const body = src.slice(start, nextExport > 0 ? nextExport : start + 8000);
+  assert.ok(!body.includes("solveBaxiaCaptcha"), "autofill must not auto-solve captcha");
+  assert.ok(!body.includes("s3cret") && !body.includes("console.log"));
+});
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {
   const res = resolveManualDisplay() as { display?: string; xauthority?: string; error?: string };

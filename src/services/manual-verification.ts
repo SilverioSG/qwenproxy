@@ -17,6 +17,7 @@ import { chromium, type BrowserContext, type Page } from "patchright";
 
 export type ManualVerificationState =
   | "opening"
+  | "autofilling"
   | "waiting"
   | "authenticated"
   | "verifying"
@@ -174,6 +175,18 @@ const deps: {
     },
   ) => Promise<void>;
   validateLive: (accountId: string) => Promise<{ status: number }>;
+  getCredentials: (
+    accountId: string,
+  ) => Promise<{ email: string; password: string } | null>;
+  autofill: (
+    page: Page,
+    email: string,
+    password: string,
+  ) => Promise<{
+    submitted: boolean;
+    alreadyLoggedIn: boolean;
+    reason: string;
+  }>;
 } = {
   launchBrowser: defaultBrowserLauncher,
   probeLogin: async (page: Page, timeoutMs: number) => {
@@ -362,6 +375,17 @@ const deps: {
     );
     return { status: res.status };
   },
+  getCredentials: async (accountId: string) => {
+    // Backend-only: values never leave this process (no frontend payload).
+    const { getAccountCredentials } = await import("../core/accounts.ts");
+    const creds = getAccountCredentials(accountId);
+    if (!creds?.email || !creds?.password) return null;
+    return { email: creds.email, password: creds.password };
+  },
+  autofill: async (page: Page, email: string, password: string) => {
+    const { autofillQwenLoginForm } = await import("./playwright.ts");
+    return autofillQwenLoginForm(page, email, password);
+  },
 };
 
 /** Test hook: replace browser launch / validation / sleep. */
@@ -538,6 +562,33 @@ async function runVerification(accountId: string): Promise<void> {
       });
     } catch {
       // Navigation failure surfaces as failed validation below.
+    }
+
+    // Backend-only autofill (QwenGate concept, no password to frontend):
+    // if the profile is not logged in and we hold stored credentials, fill
+    // and submit the form, then leave CAPTCHA/slider to the user by hand.
+    setStatus(entry, "autofilling", "Checking session and credentials");
+    try {
+      const creds = await deps.getCredentials(accountId);
+      if (!creds) {
+        finish("failed", "No stored credentials for account");
+        return;
+      }
+      const auto = await deps.autofill(page, creds.email, creds.password);
+      if (auto.reason === "submitted") {
+        setStatus(
+          entry,
+          "waiting",
+          "Credentials submitted — complete Qwen verification manually",
+        );
+      } else if (!auto.alreadyLoggedIn && auto.reason === "no-form") {
+        finish("failed", "Login form not found");
+        return;
+      }
+      // already-logged-in / no-password-field / submit-failed: keep the
+      // window open and let the user continue manually.
+    } catch {
+      // Autofill is best-effort; manual completion remains possible.
     }
 
     // Passive completion evidence in two levels. Streaming (response headers
