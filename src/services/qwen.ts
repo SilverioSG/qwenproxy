@@ -939,6 +939,66 @@ interface BrowserTextResponse {
   raw: string;
 }
 
+/** Sanitized in-page auth diagnostics. Booleans/codes only — never tokens. */
+export interface BrowserAuthDiag {
+  /** Live localStorage token readable in-page. */
+  liveTokenPresent: boolean;
+  /** Outgoing bearer vs live token: true/false, or null when incomparable. */
+  authMatchesLive: boolean | null;
+  refreshAttempted: boolean;
+  refreshStatus: number;
+  refreshUsable: boolean;
+  refreshUpdatedLs: boolean;
+  refreshUpdatedCookie: boolean;
+  refreshUpdatedAuth: boolean;
+  refreshErrorClass: string | null;
+  retried: boolean;
+  retryStatus: number;
+}
+
+/** Bearer token carried by request headers, if any. Value stays in memory. */
+export function extractBearerToken(
+  headers: Record<string, string>,
+): string | null {
+  const raw =
+    headers["authorization"] || headers["Authorization"] || "";
+  const m = raw.match(/^\s*Bearer\s+(\S+)\s*$/i);
+  return m ? m[1] : null;
+}
+
+/** Compare outgoing bearer with the live in-page token (equality only). */
+export function bearerMatchesLiveToken(
+  headerBearer: string | null,
+  liveToken: string | null,
+): boolean | null {
+  if (!headerBearer || !liveToken) return null;
+  if (headerBearer.length !== liveToken.length) return false;
+  let diff = 0;
+  for (let i = 0; i < headerBearer.length; i++) {
+    diff |= headerBearer.charCodeAt(i) ^ liveToken.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/** Structural usability of an auth-refresh payload (no values inspected). */
+export function isUsableRefreshPayload(json: unknown): boolean {
+  if (!json || typeof json !== "object") return false;
+  const j = json as { success?: unknown; data?: unknown };
+  if (j.success !== true) return false;
+  const d = j.data as { token?: unknown } | null | undefined;
+  return !!d && typeof d.token === "string" && d.token.length > 0;
+}
+
+/** Sanitized exception class for refresh failures (no messages/values). */
+export function sanitizeRefreshErrorClass(err: unknown): string {
+  if (err instanceof TypeError) return "TypeError";
+  if (err instanceof DOMException) {
+    return `DOMException:${err.name || "unknown"}`;
+  }
+  if (err instanceof Error) return err.name || "Error";
+  return typeof err;
+}
+
 export async function requestQwenTextInBrowser(
   accountId: string | undefined,
   method: "GET" | "POST" | "DELETE",
@@ -992,10 +1052,45 @@ export async function requestQwenTextInBrowser(
         body?: string;
         referrer?: string;
         timeoutMs: number;
-      }): Promise<BrowserTextResponse> => {
+      }): Promise<BrowserTextResponse & { diag: BrowserAuthDiag }> => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        // Read-only observation of the live in-page token (never modifies
+        // the request, never leaves the page; only booleans are reported).
+        const readLiveToken = (): string | null => {
+          try {
+            const t = localStorage.getItem("token");
+            return typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            return null;
+          }
+        };
+        const bearerOf = (h: Record<string, string>): string | null => {
+          const raw = h["authorization"] || h["Authorization"] || "";
+          const m = raw.match(/^\s*Bearer\s+(\S+)\s*$/i);
+          return m ? m[1] : null;
+        };
+        const diag: BrowserAuthDiag = {
+          liveTokenPresent: false,
+          authMatchesLive: null,
+          refreshAttempted: false,
+          refreshStatus: 0,
+          refreshUsable: false,
+          refreshUpdatedLs: false,
+          refreshUpdatedCookie: false,
+          refreshUpdatedAuth: false,
+          refreshErrorClass: null,
+          retried: false,
+          retryStatus: 0,
+        };
         try {
+          const liveBefore = readLiveToken();
+          diag.liveTokenPresent = liveBefore !== null;
+          const sentBefore = bearerOf(headers);
+          diag.authMatchesLive =
+            sentBefore && liveBefore
+              ? sentBefore === liveBefore
+              : null;
           let response = await fetch(url, {
             method,
             credentials: "include",
@@ -1007,21 +1102,31 @@ export async function requestQwenTextInBrowser(
 
           // If 401 Unauthorized in browser, try silent in-page token refresh before giving up
           if (response.status === 401) {
+            diag.refreshAttempted = true;
             try {
               const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
                 method: "GET",
                 credentials: "include",
                 signal: AbortSignal.timeout(3000),
               });
+              diag.refreshStatus = refreshRes.status;
               if (refreshRes.status === 200) {
                 const refreshJson: any = await refreshRes.json().catch(() => null);
-                if (refreshJson && refreshJson.success === true && refreshJson.data?.token) {
-                  const freshTok = refreshJson.data.token;
+                const usable =
+                  !!refreshJson &&
+                  refreshJson.success === true &&
+                  !!refreshJson.data?.token;
+                diag.refreshUsable = usable;
+                if (usable) {
+                  const freshTok: string = String(refreshJson.data.token);
                   localStorage.setItem("token", freshTok);
+                  diag.refreshUpdatedLs = true;
                   document.cookie = `token=${encodeURIComponent(freshTok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                  diag.refreshUpdatedCookie = true;
                   if (headers["authorization"] || headers["Authorization"]) {
                     headers["authorization"] = `Bearer ${freshTok}`;
                     headers["Authorization"] = `Bearer ${freshTok}`;
+                    diag.refreshUpdatedAuth = true;
                   }
                   response = await fetch(url, {
                     method,
@@ -1031,15 +1136,29 @@ export async function requestQwenTextInBrowser(
                     signal: controller.signal,
                     ...(referrer ? { referrer } : {}),
                   });
+                  diag.retried = true;
+                  diag.retryStatus = response.status;
+                  const liveAfter = readLiveToken();
+                  const sentAfter = bearerOf(headers);
+                  diag.authMatchesLive =
+                    sentAfter && liveAfter ? sentAfter === liveAfter : null;
                 }
               }
-            } catch {}
+            } catch (err) {
+              diag.refreshErrorClass =
+                err instanceof TypeError
+                  ? "TypeError"
+                  : err instanceof Error
+                    ? err.name || "Error"
+                    : typeof err;
+            }
           }
 
           return {
             status: response.status,
             contentType: response.headers.get("content-type") || "",
             raw: await response.text(),
+            diag,
           };
         } finally {
           clearTimeout(timeoutId);
@@ -1058,13 +1177,43 @@ export async function requestQwenTextInBrowser(
   // Settings and personalization requests run as same-origin in-browser fetch
   // with appropriate Referer, keeping the page on the stable chat UI without
   // expensive page.goto navigations that can time out under load.
-  const response = await withQwenBrowserPage<BrowserTextResponse>(
+  const response = await withQwenBrowserPage<
+    BrowserTextResponse & { diag?: BrowserAuthDiag }
+  >(
     accountId,
     evaluateRequest,
     undefined,
     options.timeoutMs,
     recoverOnTimeout,
   );
+
+  // Sanitized per-attempt auth diagnostics (booleans/codes only).
+  try {
+    const id8 = (accountId || "global").slice(0, 8);
+    const hasAuth =
+      Boolean(browserHeaders["authorization"]) ||
+      Boolean(browserHeaders["Authorization"]);
+    const d = response.diag;
+    console.log(
+      `[QwenAuth] account=${id8} path=${path} attempt=1 ` +
+        `authSource=header hasAuth=${hasAuth} ` +
+        `matchesLive=${d ? String(d.authMatchesLive) : "unknown"} ` +
+        `liveToken=${d ? String(d.liveTokenPresent) : "unknown"} ` +
+        `status=${response.status}`,
+    );
+    if (d?.refreshAttempted) {
+      console.log(
+        `[QwenAuth] account=${id8} path=${path} refresh attempted ` +
+          `status=${d.refreshStatus} usable=${d.refreshUsable} ` +
+          `updatedLs=${d.refreshUpdatedLs} updatedCookie=${d.refreshUpdatedCookie} ` +
+          `updatedAuth=${d.refreshUpdatedAuth} ` +
+          `retryStatus=${d.retried ? d.retryStatus : "none"}` +
+          (d.refreshErrorClass ? ` errClass=${d.refreshErrorClass}` : ""),
+      );
+    }
+  } catch {
+    // Diagnostics must never break requests.
+  }
 
   return new Response(response.raw, {
     status: response.status,
