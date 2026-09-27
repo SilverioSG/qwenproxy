@@ -138,7 +138,10 @@ const deps: {
   profileDir: (accountId: string) => Promise<string>;
   closeHeadless: (accountId: string) => Promise<void>;
   initHeadless: (account: never) => Promise<void>;
-  capture: (accountId: string) => Promise<void>;
+  capture: (
+    accountId: string,
+    opts?: { persistSession?: boolean },
+  ) => Promise<void>;
   clearCooldown: (accountId: string) => Promise<void>;
   unmarkReady: (accountId: string) => Promise<void>;
   readPersistedMeta: (
@@ -256,9 +259,9 @@ const deps: {
       skipHeaderCapture: false,
     }).catch(() => {});
   },
-  capture: async (accountId: string) => {
+  capture: async (accountId: string, opts?: { persistSession?: boolean }) => {
     const { captureQwenHeaders } = await import("./playwright.ts");
-    await captureQwenHeaders(accountId);
+    await captureQwenHeaders(accountId, undefined, undefined, undefined, opts ?? {});
   },
   clearCooldown: async (accountId: string) => {
     const { clearAccountCooldown } = await import("../core/account-manager.ts");
@@ -1064,24 +1067,30 @@ async function completeSuccess(
   } catch {
     // initHeadless is best-effort; live validation below decides.
   }
-  // 4. Live validation on the operational context (settings 200 required).
+  // 4. PRE-CAPTURE live validation on the operational context.
   let liveStatus = 0;
   try {
     liveStatus = (await deps.validateLive(accountId)).status;
   } catch {
     liveStatus = 0;
   }
-  logEvent(entry, accountId, `live settings status=${liveStatus}`);
+  logEvent(entry, accountId, `pre-capture settings status=${liveStatus}`);
   if (liveStatus !== 200) {
     finishOnEntry(
       entry,
       "failed",
-      `Post-persist live validation failed (settings ${liveStatus})`,
+      `Pre-capture live validation failed (settings ${liveStatus})`,
     );
     return false;
   }
+  // 5. Final capture refreshes RUNTIME cache only: persistSession=false, so
+  // the fresh visible row can never be overwritten here.
+  const rowBeforeCapture = await deps.readPersistedMeta(accountId).catch(() => ({
+    exists: false,
+    capturedAt: 0,
+  }));
   try {
-    await deps.capture(accountId);
+    await deps.capture(accountId, { persistSession: false });
   } catch (err) {
     finishOnEntry(
       entry,
@@ -1090,7 +1099,55 @@ async function completeSuccess(
     );
     return false;
   }
-  // 5. Cooldown cleared ONLY after validated fresh auth.
+  const rowAfterCapture = await deps.readPersistedMeta(accountId).catch(() => ({
+    exists: false,
+    capturedAt: 0,
+  }));
+  const rowUnchanged =
+    rowAfterCapture.exists &&
+    rowAfterCapture.capturedAt === rowBeforeCapture.capturedAt;
+  logEvent(
+    entry,
+    accountId,
+    `final-capture db-write=${!rowUnchanged} rowUnchanged=${rowUnchanged}`,
+  );
+  if (!rowUnchanged) {
+    // Defensive: the durable visible row must survive the final capture.
+    // Reset the headless context so the next init restores the fresh row.
+    try {
+      await deps.closeHeadless(accountId);
+    } catch {
+      // Best effort.
+    }
+    finishOnEntry(
+      entry,
+      "failed",
+      "Final capture modified the persisted session",
+    );
+    return false;
+  }
+  // 6. POST-CAPTURE live validation on the exact post-capture context.
+  let postStatus = 0;
+  try {
+    postStatus = (await deps.validateLive(accountId)).status;
+  } catch {
+    postStatus = 0;
+  }
+  logEvent(entry, accountId, `post-capture settings status=${postStatus}`);
+  if (postStatus !== 200) {
+    try {
+      await deps.closeHeadless(accountId);
+    } catch {
+      // Best effort: quarantine the possibly contaminated context.
+    }
+    finishOnEntry(
+      entry,
+      "failed",
+      `Post-capture live validation failed (settings ${postStatus})`,
+    );
+    return false;
+  }
+  // 7. Cooldown cleared ONLY after validated fresh auth.
   await deps.clearCooldown(accountId);
   finishOnEntry(
     entry,

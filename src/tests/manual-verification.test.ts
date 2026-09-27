@@ -58,6 +58,7 @@ function installHarness(opts: {
     saveThrows?: boolean;
     dontAdvance?: boolean;
     validateStatus?: number;
+    validateSequence?: number[];
   };
   /** Credential/autofill behavior for the flow. */
   creds?: "ok" | "none";
@@ -162,8 +163,10 @@ function installHarness(opts: {
       calls.closedHeadless.push(id);
     },
     initHeadless: async () => {},
-    capture: async (id: string) => {
+    capture: async (id: string, captureOpts?: { persistSession?: boolean }) => {
       calls.capture.push(id);
+      (calls as { captureOpts?: Array<{ persistSession?: boolean }> }).captureOpts =
+        ((calls as { captureOpts?: Array<{ persistSession?: boolean }> }).captureOpts ?? []).concat([captureOpts ?? {}]);
       if (opts.captureBehavior === "fail") throw new Error("capture boom");
     },
     clearCooldown: async (id: string) => {
@@ -184,7 +187,14 @@ function installHarness(opts: {
       if (opts.persist?.dontAdvance) return;
       meta = { exists: true, capturedAt: Date.now() };
     },
-    validateLive: async () => ({ status: opts.persist?.validateStatus ?? 200 }),
+    validateLive: (() => {
+      let n = 0;
+      return async () => {
+        const seq = opts.persist?.validateSequence;
+        const status = seq ? (seq[Math.min(n++, seq.length - 1)] ?? 200) : (opts.persist?.validateStatus ?? 200);
+        return { status };
+      };
+    })(),
     probeSameContext: async () => {
       calls.probed.push("probe");
       return {
@@ -695,6 +705,48 @@ test("manual verification: same-context probe emits no secrets", async () => {
   const blob = JSON.stringify(st);
   assert.ok(!blob.includes("token="));
   assert.ok(!blob.includes("cookie"));
+});
+
+test("manual verification: final capture uses persistSession=false", async () => {
+  const { calls, emit } = installHarness({ loggedIn: false });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  const opts = (calls as { captureOpts?: Array<{ persistSession?: boolean }> }).captureOpts ?? [];
+  assert.ok(opts.length >= 1);
+  assert.ok(opts.every((o) => o.persistSession === false));
+});
+
+test("manual verification: pre-200 post-401 → failed, cooldown intact, context reset", async () => {
+  const { calls, emit } = installHarness({
+    loggedIn: false,
+    persist: { validateSequence: [200, 401] },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.deepEqual(calls.clearedCooldown, []);
+  assert.deepEqual(calls.clearedBusy, [TEST_ID]);
+  assert.ok(calls.closedHeadless.length >= 1);
+});
+
+test("manual verification: captureQwenHeaders default persists (existing behavior)", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const sig = "options: { persistSession?: boolean } = {}";
+  assert.ok(src.includes(sig));
+  const idx = src.indexOf("options: { persistSession?: boolean } = {}");
+  const fn = src.slice(src.lastIndexOf("export async function captureQwenHeaders", idx), idx);
+  assert.ok(fn.includes("captureQwenHeaders"));
+});
+
+test("manual verification: captureQwenHeaders persistSession=false skips saveAuthSession", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const idx = src.indexOf("if (persistSession) {");
+  assert.ok(idx >= 0);
+  const block = src.slice(idx, idx + 400);
+  assert.ok(block.includes("saveAuthSession"));
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

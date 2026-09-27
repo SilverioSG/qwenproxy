@@ -2748,7 +2748,12 @@ export async function captureQwenHeaders(
   pageOverride?: Page,
   timeoutMs = config.timeouts.headers,
   triggerGraceMs = HEADER_CAPTURE_TRIGGER_GRACE_MS,
+  options: { persistSession?: boolean } = {},
 ): Promise<void> {
+  // persistSession=false: refresh runtime/header cache only, NEVER touch
+  // qwen_auth_sessions (used by manual verification, whose fresh snapshot is
+  // already durable). Default true preserves existing behavior everywhere.
+  const persistSession = options.persistSession !== false;
   const page = pageOverride ?? accountPages.get(accountId);
   if (!page || page.isClosed()) {
     throw new Error(`Playwright page unavailable for header capture: ${accountId}`);
@@ -2970,7 +2975,10 @@ export async function captureQwenHeaders(
       cookieCaches.delete(accountId);
       touchAccountActivity(accountId);
 
-      // Persist captured anti-bot headers to SQLite for instant boot
+      // Persist captured anti-bot headers to SQLite for instant boot.
+      // Skipped when persistSession=false (manual verification owns the
+      // durable row; capture only refreshes runtime cache here).
+      if (persistSession) {
       try {
         const { saveAuthSession } = await import("../core/database.ts");
         const { parseJwtExpiry } = await import("../utils/jwt.ts");
@@ -2989,6 +2997,7 @@ export async function captureQwenHeaders(
           capturedAt: Date.now(),
         });
       } catch {}
+      }
 
       await route.abort("aborted").catch(() => {});
       routeResult = "abort";
