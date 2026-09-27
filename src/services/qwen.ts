@@ -1539,7 +1539,7 @@ export async function probeChatShaping(
                 const j: any = JSON.parse(text);
                 if (j && typeof j === "object") {
                   created = Boolean(
-                    j.chat_id || j.id || j.data?.chat_id || j.data?.id,
+                    j.chat_id || j.id || j.data?.chat_id || j.data?.id || j.data?.chat?.id,
                   );
                   appFail =
                     j.success === false &&
@@ -1694,7 +1694,7 @@ export async function probeChatShaping(
               const pj: any = JSON.parse(postText);
               if (pj && typeof pj === "object") {
                 postCreated = Boolean(
-                  pj.chat_id || pj.id || pj.data?.chat_id || pj.data?.id,
+                  pj.chat_id || pj.id || pj.data?.chat_id || pj.data?.id || pj.data?.chat?.id,
                 );
                 postFail =
                   pj.success === false &&

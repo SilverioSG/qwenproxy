@@ -329,3 +329,31 @@ test("qwen-auth-diag: shaping probe + endpoint exist with sanitized surface", as
     assert.ok(allowed.has(ident), `unexpected interpolation: ${ident}`);
   }
 });
+
+test("qwen-auth-diag: shaping probe recognizes nested data.chat.id", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const hits = src.split("data?.chat?.id").length - 1;
+  assert.ok(hits >= 2, `expected nested chat id checks, found ${hits}`);
+  // Functional shape check mirroring the in-page predicate (inline there
+  // for bundler __name constraints).
+  const shapes = [
+    [{ chat_id: "a" }, true],
+    [{ id: "a" }, true],
+    [{ data: { chat_id: "a" } }, true],
+    [{ data: { id: "a" } }, true],
+    [{ data: { chat: { id: "a" } } }, true],
+    [{ success: false }, false],
+    [{ data: {} }, false],
+  ];
+  for (const [json, expected] of shapes) {
+    const j = json as {
+      chat_id?: string;
+      id?: string;
+      data?: { chat_id?: string; id?: string; chat?: { id?: string } };
+    };
+    const created = Boolean(
+      j.chat_id || j.id || j.data?.chat_id || j.data?.id || j.data?.chat?.id,
+    );
+    assert.equal(created, expected);
+  }
+});
