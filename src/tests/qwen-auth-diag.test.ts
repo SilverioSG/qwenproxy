@@ -7,6 +7,7 @@ import {
   bearerMatchesLiveToken,
   isUsableRefreshPayload,
   sanitizeRefreshErrorClass,
+  isAppUnauthorized,
 } from "../services/qwen.ts";
 
 test("qwen-auth-diag: cache bearer == live token → matchesLive=true", () => {
@@ -103,5 +104,36 @@ test("qwen-auth-diag: no secret values in new instrumentation", () => {
       allowed.has(ident),
       `unexpected interpolation in [QwenAuth] log: ${ident}`,
     );
+  }
+});
+
+test("qwen-auth-diag: HTTP 401 triggers heal classification", () => {
+  assert.equal(isAppUnauthorized(401, ""), true);
+  assert.equal(isAppUnauthorized(401, "anything"), true);
+});
+
+test("qwen-auth-diag: HTTP 200 + success:false Unauthorized triggers heal", () => {
+  assert.equal(
+    isAppUnauthorized(200, '{"success":false,"data":{"code":"Unauthorized","details":"401 No autorizado"}}'),
+    true,
+  );
+  assert.equal(isAppUnauthorized(200, '{"success":false,"code":"Unauthorized"}'), true);
+});
+
+test("qwen-auth-diag: HTTP 200 + non-auth failure never triggers heal", () => {
+  assert.equal(isAppUnauthorized(200, '{"success":true}'), false);
+  assert.equal(isAppUnauthorized(200, '{"success":false,"data":{"code":"RateLimited"}}'), false);
+  assert.equal(isAppUnauthorized(200, ""), false);
+  assert.equal(isAppUnauthorized(200, "not json{{{"), false);
+  assert.equal(isAppUnauthorized(500, "error"), false);
+});
+
+test("qwen-auth-diag: in-page predicate mirrors isAppUnauthorized markers", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const start = src.indexOf("Auth failure = HTTP 401 OR application-level");
+  assert.ok(start >= 0);
+  const block = src.slice(start, start + 2500);
+  for (const marker of ["success === false", "Unauthorized", "401", "appUnauthorized"]) {
+    assert.ok(block.includes(marker), `in-page predicate missing: ${marker}`);
   }
 });

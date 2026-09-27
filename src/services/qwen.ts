@@ -945,6 +945,10 @@ export interface BrowserAuthDiag {
   liveTokenPresent: boolean;
   /** Outgoing bearer vs live token: true/false, or null when incomparable. */
   authMatchesLive: boolean | null;
+  /** Which credential won: live token, cookies only, post-heal, or none. */
+  authSource: "live" | "cookie-only" | "healed" | "none";
+  /** First response carried application-level Unauthorized (HTTP 200 body). */
+  firstAppAuthFailure: boolean;
   refreshAttempted: boolean;
   refreshStatus: number;
   refreshUsable: boolean;
@@ -987,6 +991,39 @@ export function isUsableRefreshPayload(json: unknown): boolean {
   if (j.success !== true) return false;
   const d = j.data as { token?: unknown } | null | undefined;
   return !!d && typeof d.token === "string" && d.token.length > 0;
+}
+
+/**
+ * Application-level Unauthorized classification for a completed response.
+ * Mirrors the inline in-page predicate in requestQwenTextInBrowser (which
+ * cannot import helpers — bundler __name constraints). Pure and unit-tested;
+ * a source-consistency test pins the two copies together.
+ */
+export function isAppUnauthorized(status: number, bodyText: string): boolean {
+  if (status === 401) return true;
+  if (typeof bodyText !== "string" || bodyText.length === 0) return false;
+  try {
+    const parsed: {
+      success?: unknown;
+      code?: unknown;
+      message?: unknown;
+      data?: { code?: unknown; details?: unknown } | null;
+      details?: unknown;
+    } = JSON.parse(bodyText);
+    if (!parsed || parsed.success !== false) return false;
+    const code = String(parsed.data?.code ?? parsed.code ?? "");
+    const details = String(
+      parsed.data?.details ?? parsed.details ?? parsed.message ?? "",
+    );
+    return (
+      code === "Unauthorized" ||
+      /unauthorized/i.test(code) ||
+      /unauthorized/i.test(details) ||
+      /\b401\b/.test(details)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Sanitized exception class for refresh failures (no messages/values). */
@@ -1062,6 +1099,8 @@ export async function requestQwenTextInBrowser(
         const diag: BrowserAuthDiag = {
           liveTokenPresent: false,
           authMatchesLive: null,
+          authSource: "none",
+          firstAppAuthFailure: false,
           refreshAttempted: false,
           refreshStatus: 0,
           refreshUsable: false,
@@ -1073,31 +1112,74 @@ export async function requestQwenTextInBrowser(
           retryStatus: 0,
         };
         try {
-          let liveBefore: string | null = null;
+          let liveToken: string | null = null;
           try {
             const t = localStorage.getItem("token");
-            liveBefore = typeof t === "string" && t.length > 0 ? t : null;
+            liveToken = typeof t === "string" && t.length > 0 ? t : null;
           } catch {
-            liveBefore = null;
+            liveToken = null;
           }
-          diag.liveTokenPresent = liveBefore !== null;
+          diag.liveTokenPresent = liveToken !== null;
+          // Effective auth policy: prefer the LIVE token; omit Authorization
+          // entirely when there is none (cookies govern). Never trust a
+          // cached bearer over the live session.
+          const effHeaders: Record<string, string> = { ...headers };
+          const hadCachedAuth = Boolean(
+            effHeaders["authorization"] || effHeaders["Authorization"],
+          );
+          if (liveToken) {
+            effHeaders["authorization"] = `Bearer ${liveToken}`;
+            effHeaders["Authorization"] = `Bearer ${liveToken}`;
+            diag.authSource = "live";
+          } else {
+            delete effHeaders["authorization"];
+            delete effHeaders["Authorization"];
+            diag.authSource = hadCachedAuth ? "cookie-only" : "none";
+          }
           const sentRaw =
-            headers["authorization"] || headers["Authorization"] || "";
+            effHeaders["authorization"] || effHeaders["Authorization"] || "";
           const sentMatch = sentRaw.match(/^\s*Bearer\s+(\S+)\s*$/i);
-          const sentBefore = sentMatch ? sentMatch[1] : null;
+          const sentEff = sentMatch ? sentMatch[1] : null;
           diag.authMatchesLive =
-            sentBefore && liveBefore ? sentBefore === liveBefore : null;
+            sentEff && liveToken ? sentEff === liveToken : null;
           let response = await fetch(url, {
             method,
             credentials: "include",
-            headers,
+            headers: effHeaders,
             body,
             signal: controller.signal,
             ...(referrer ? { referrer } : {}),
           });
+          let bodyText = "";
+          try {
+            bodyText = await response.text();
+          } catch {
+            bodyText = "";
+          }
 
-          // If 401 Unauthorized in browser, try silent in-page token refresh before giving up
-          if (response.status === 401) {
+          // Auth failure = HTTP 401 OR application-level Unauthorized
+          // (Qwen answers HTTP 200 + {success:false} on create-chat).
+          let appUnauthorized = false;
+          try {
+            const parsed: any = JSON.parse(bodyText);
+            if (parsed && parsed.success === false) {
+              const code = String(parsed.data?.code || parsed.code || "");
+              const details = String(
+                parsed.data?.details || parsed.details || parsed.message || "",
+              );
+              appUnauthorized =
+                code === "Unauthorized" ||
+                /unauthorized/i.test(code) ||
+                /unauthorized/i.test(details) ||
+                /\b401\b/.test(details);
+            }
+          } catch {
+            appUnauthorized = false;
+          }
+          diag.firstAppAuthFailure = appUnauthorized;
+
+          // Silent in-page token refresh + single retry on auth failure.
+          if (response.status === 401 || appUnauthorized) {
             diag.refreshAttempted = true;
             try {
               const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
@@ -1119,34 +1201,26 @@ export async function requestQwenTextInBrowser(
                   diag.refreshUpdatedLs = true;
                   document.cookie = `token=${encodeURIComponent(freshTok)}; path=/; domain=.qwen.ai; max-age=31536000`;
                   diag.refreshUpdatedCookie = true;
-                  if (headers["authorization"] || headers["Authorization"]) {
-                    headers["authorization"] = `Bearer ${freshTok}`;
-                    headers["Authorization"] = `Bearer ${freshTok}`;
-                    diag.refreshUpdatedAuth = true;
-                  }
+                  effHeaders["authorization"] = `Bearer ${freshTok}`;
+                  effHeaders["Authorization"] = `Bearer ${freshTok}`;
+                  diag.refreshUpdatedAuth = true;
+                  diag.authSource = "healed";
                   response = await fetch(url, {
                     method,
                     credentials: "include",
-                    headers,
+                    headers: effHeaders,
                     body,
                     signal: controller.signal,
                     ...(referrer ? { referrer } : {}),
                   });
                   diag.retried = true;
                   diag.retryStatus = response.status;
-                  let liveAfter: string | null = null;
                   try {
-                    const t2 = localStorage.getItem("token");
-                    liveAfter = typeof t2 === "string" && t2.length > 0 ? t2 : null;
+                    bodyText = await response.text();
                   } catch {
-                    liveAfter = null;
+                    // Keep first body on retry read failure.
                   }
-                  const sentRaw2 =
-                    headers["authorization"] || headers["Authorization"] || "";
-                  const sentMatch2 = sentRaw2.match(/^\s*Bearer\s+(\S+)\s*$/i);
-                  const sentAfter = sentMatch2 ? sentMatch2[1] : null;
-                  diag.authMatchesLive =
-                    sentAfter && liveAfter ? sentAfter === liveAfter : null;
+                  diag.authMatchesLive = true;
                 }
               }
             } catch (err) {
@@ -1162,7 +1236,7 @@ export async function requestQwenTextInBrowser(
           return {
             status: response.status,
             contentType: response.headers.get("content-type") || "",
-            raw: await response.text(),
+            raw: bodyText,
             diag,
           };
         } finally {
@@ -1201,10 +1275,11 @@ export async function requestQwenTextInBrowser(
     const d = response.diag;
     console.log(
       `[QwenAuth] account=${id8} path=${path} attempt=1 ` +
-        `authSource=header hasAuth=${hasAuth} ` +
+        `authSource=${d ? d.authSource : "unknown"} hasAuth=${hasAuth} ` +
         `matchesLive=${d ? String(d.authMatchesLive) : "unknown"} ` +
         `liveToken=${d ? String(d.liveTokenPresent) : "unknown"} ` +
-        `status=${response.status}`,
+        `status=${response.status}` +
+        (d?.firstAppAuthFailure ? " appUnauthorized=true" : ""),
     );
     if (d?.refreshAttempted) {
       console.log(
