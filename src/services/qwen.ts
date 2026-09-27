@@ -1333,7 +1333,429 @@ export async function probeRefreshStructure(
     false,
   );
 }
-/** Sanitized in-page auth diagnostics. Booleans/codes only — never tokens. */
+/** Sanitized single header-test outcome. Names/codes only. */
+export interface ShapingHeaderResult {
+  name: string;
+  status: number;
+  appAuthFailure: boolean;
+}
+
+/** Sanitized shaping-probe outcome. No secrets, no bodies. */
+export interface ChatShapingResult {
+  baseline: { status: number; appAuthFailure: boolean; created: boolean };
+  stoppedEarly: boolean;
+  headerTests: ShapingHeaderResult[];
+  causalHeader: string | null;
+  groupTests: Array<{ group: string; status: number; appAuthFailure: boolean }>;
+  causalGroup: string | null;
+  preCreate: { status: number; appAuthFailure: boolean };
+  settingsUpdate: { status: number; appAuthFailure: boolean };
+  postCreate: { status: number; appAuthFailure: boolean };
+  loginOk: boolean;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC: isolate which pipeline request shaping turns a
+ * valid session into appUnauthorized/401. Same live page/context throughout:
+ * fresh loginViaApi first, then baseline minimal create-chat, then single
+ * headers added one by one (stop at first failure), then group tests, then
+ * settings/update pre/post create-chat comparison. No re-auth, no refresh,
+ * no cooldown/DB changes, no rotation, no context recreation.
+ * In-page code uses inline statements only (__name constraints).
+ */
+export async function probeChatShaping(
+  accountId: string,
+): Promise<ChatShapingResult> {
+  const { withAccountPage, getCachedQwenHeaders } = await import("./playwright.ts");
+  const { probeLoginOnce } = await import("./playwright.ts");
+  const login = await probeLoginOnce(accountId);
+  const failResult: ChatShapingResult = {
+    baseline: { status: 0, appAuthFailure: false, created: false },
+    stoppedEarly: true,
+    headerTests: [],
+    causalHeader: null,
+    groupTests: [],
+    causalGroup: null,
+    preCreate: { status: 0, appAuthFailure: false },
+    settingsUpdate: { status: 0, appAuthFailure: false },
+    postCreate: { status: 0, appAuthFailure: false },
+    loginOk: login.loginOk,
+  };
+  if (!login.loginOk) return failResult;
+  const cached = getCachedQwenHeaders(accountId) || {};
+  const { qwenUrl } = await import("./qwen-url.ts");
+  const referer = qwenUrl("/");
+  const baseEntries: Array<{ name: string; value: string }> = [
+    { name: "accept", value: "application/json, text/plain, */*" },
+    { name: "content-type", value: "application/json" },
+    { name: "source", value: "web" },
+  ];
+  const baseNames = new Set(baseEntries.map((e) => e.name));
+  const singleNames = [
+    "Version",
+    "Timezone",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "bx-v",
+    "bx-ua",
+    "bx-umidtoken",
+  ];
+  const tests: Array<{
+    name: string;
+    headers: Array<{ name: string; value: string }>;
+  }> = [{ name: "baseline-minimal", headers: baseEntries.map((e) => ({ ...e })) }];
+  const pickCached = (name: string): string | null => {
+    for (const k of Object.keys(cached)) {
+      if (k.toLowerCase() === name.toLowerCase()) {
+        const v = cached[k];
+        if (typeof v === "string" && v.length > 0) return v;
+      }
+    }
+    return null;
+  };
+  for (const hname of singleNames) {
+    if (hname === "Referer") continue;
+    const v = pickCached(hname);
+    if (v === null) continue;
+    tests.push({
+      name: `+${hname}`,
+      headers: [...baseEntries.map((e) => ({ ...e })), { name: hname, value: v }],
+    });
+  }
+  // Referer variant goes through the fetch referrer option, not a header.
+  tests.push({ name: "+Referer", headers: baseEntries.map((e) => ({ ...e })), referer: true } as unknown as {
+    name: string;
+    headers: Array<{ name: string; value: string }>;
+  });
+  const groupOf = (names: string[]): Array<{ name: string; value: string }> | null => {
+    const out: Array<{ name: string; value: string }> = baseEntries.map((e) => ({ ...e }));
+    for (const hname of names) {
+      const v = pickCached(hname);
+      if (v === null) return null;
+      out.push({ name: hname, value: v });
+    }
+    return out;
+  };
+  const groups: Array<{ group: string; headers: Array<{ name: string; value: string }> }> = [];
+  const gh = groupOf(["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"]);
+  if (gh) groups.push({ group: "client-hints", headers: gh });
+  const ab: Array<{ name: string; value: string }> = baseEntries.map((e) => ({ ...e }));
+  let abAny = false;
+  for (const hname of ["bx-v", "bx-ua", "bx-umidtoken"]) {
+    const v = pickCached(hname);
+    if (v !== null) {
+      ab.push({ name: hname, value: v });
+      abAny = true;
+    }
+  }
+  if (abAny) groups.push({ group: "antibot", headers: ab });
+  const spa = groupOf(["Version", "Timezone"]);
+  if (spa) groups.push({ group: "spa-headers", headers: spa });
+  groups.push({
+    group: "full-pipeline",
+    headers: [...baseEntries.map((e) => ({ ...e }))].concat(
+      Object.keys(cached)
+        .filter((k) => {
+          const l = k.toLowerCase();
+          return (
+            !baseNames.has(l) &&
+            l !== "cookie" &&
+            l !== "authorization" &&
+            l !== "user-agent"
+          );
+        })
+        .map((k) => ({ name: k, value: cached[k] })),
+    ),
+  });
+  try {
+    console.log(
+      `[Shaping] account=${accountId.slice(0, 8)} loginOk=true baseline-next singles=${tests.length - 1} groups=${groups.length}`,
+    );
+  } catch {
+    // Diagnostics must never break the probe.
+  }
+  const shaping = await withAccountPage(
+    accountId,
+    async (page: Page): Promise<ChatShapingResult> => {
+      return page.evaluate(
+        async (args: {
+          tests: Array<{
+            name: string;
+            headers: Array<{ name: string; value: string }>;
+            referer?: boolean;
+          }>;
+          groups: Array<{
+            group: string;
+            headers: Array<{ name: string; value: string }>;
+          }>;
+          referer: string;
+          createUrl: string;
+          settingsUrl: string;
+          updateUrl: string;
+        }): Promise<ChatShapingResult> => {
+          const result: ChatShapingResult = {
+            baseline: { status: 0, appAuthFailure: false, created: false },
+            stoppedEarly: true,
+            headerTests: [],
+            causalHeader: null,
+            groupTests: [],
+            causalGroup: null,
+            preCreate: { status: 0, appAuthFailure: false },
+            settingsUpdate: { status: 0, appAuthFailure: false },
+            postCreate: { status: 0, appAuthFailure: false },
+            loginOk: true,
+          };
+          const newBody = JSON.stringify({
+            chatId: "",
+            models: ["qwen3.8-max"],
+            project_id: "",
+            timestamp: Date.now(),
+          });
+          for (let ti = 0; ti < args.tests.length; ti++) {
+            const t = args.tests[ti];
+            const hh: Record<string, string> = {};
+            for (let hi = 0; hi < t.headers.length; hi++) {
+              hh[t.headers[hi].name] = t.headers[hi].value;
+            }
+            let status = 0;
+            let appFail = false;
+            let created = false;
+            try {
+              const fetchInit: RequestInit = {
+                method: "POST",
+                credentials: "include",
+                headers: hh,
+                body: newBody,
+                signal: AbortSignal.timeout(25000),
+              };
+              if (t.referer) {
+                (fetchInit as Record<string, unknown>)["referrer"] = args.referer;
+              }
+              const resp = await fetch(args.createUrl, fetchInit);
+              status = resp.status;
+              const text = await resp.text().catch(() => "");
+              try {
+                const j: any = JSON.parse(text);
+                if (j && typeof j === "object") {
+                  created = Boolean(
+                    j.chat_id || j.id || j.data?.chat_id || j.data?.id,
+                  );
+                  appFail =
+                    j.success === false &&
+                    (j.data?.code === "Unauthorized" ||
+                      j.code === "Unauthorized");
+                }
+              } catch {
+                appFail = false;
+              }
+            } catch {
+              status = 0;
+              appFail = false;
+            }
+            if (ti === 0) {
+              result.baseline = { status, appAuthFailure: appFail, created };
+              result.preCreate = { status, appAuthFailure: appFail };
+              if (status !== 200 || appFail || !created) {
+                result.stoppedEarly = true;
+                return result;
+              }
+              result.stoppedEarly = false;
+            } else {
+              result.headerTests.push({ name: t.name, status, appAuthFailure: appFail });
+              if (status === 401 || appFail) {
+                result.causalHeader = t.name;
+                result.stoppedEarly = true;
+                return result;
+              }
+            }
+          }
+          for (let gi = 0; gi < args.groups.length; gi++) {
+            const g = args.groups[gi];
+            const ghh: Record<string, string> = {};
+            for (let hi = 0; hi < g.headers.length; hi++) {
+              ghh[g.headers[hi].name] = g.headers[hi].value;
+            }
+            let status = 0;
+            let appFail = false;
+            try {
+              const resp = await fetch(args.createUrl, {
+                method: "POST",
+                credentials: "include",
+                headers: ghh,
+                body: newBody,
+                signal: AbortSignal.timeout(25000),
+              });
+              status = resp.status;
+              const text = await resp.text().catch(() => "");
+              try {
+                const j: any = JSON.parse(text);
+                appFail =
+                  !!j &&
+                  j.success === false &&
+                  (j.data?.code === "Unauthorized" || j.code === "Unauthorized");
+              } catch {
+                appFail = false;
+              }
+            } catch {
+              status = 0;
+              appFail = false;
+            }
+            result.groupTests.push({ group: g.group, status, appAuthFailure: appFail });
+            if (status === 401 || appFail) {
+              result.causalGroup = g.group;
+              result.stoppedEarly = true;
+              return result;
+            }
+          }
+          // settings/update phase with real echoed instruction shape.
+          let current: any = null;
+          try {
+            const getRes = await fetch(args.settingsUrl, {
+              method: "GET",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                source: "web",
+              },
+              signal: AbortSignal.timeout(20000),
+            });
+            if (getRes.status === 200) {
+              try {
+                current = await getRes.json().catch(() => null);
+              } catch {
+                current = null;
+              }
+            }
+          } catch {
+            current = null;
+          }
+          const curP =
+            current && current.data && typeof current.data.personalization === "object"
+              ? current.data.personalization
+              : {};
+          let updStatus = 0;
+          let updFail = false;
+          try {
+            const updBody = JSON.stringify({
+              personalization: {
+                name: "",
+                description: curP.description === undefined ? null : curP.description,
+                style: null,
+                instruction: "",
+                enable_for_new_chat: false,
+              },
+            });
+            const updRes = await fetch(args.updateUrl, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+              },
+              body: updBody,
+              signal: AbortSignal.timeout(25000),
+            });
+            updStatus = updRes.status;
+            const updText = await updRes.text().catch(() => "");
+            try {
+              const uj: any = JSON.parse(updText);
+              updFail =
+                !!uj &&
+                uj.success === false &&
+                (uj.data?.code === "Unauthorized" || uj.code === "Unauthorized");
+            } catch {
+              updFail = false;
+            }
+          } catch {
+            updStatus = 0;
+            updFail = false;
+          }
+          result.settingsUpdate = { status: updStatus, appAuthFailure: updFail };
+          let postStatus = 0;
+          let postFail = false;
+          let postCreated = false;
+          try {
+            const postRes = await fetch(args.createUrl, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+              },
+              body: newBody,
+              signal: AbortSignal.timeout(25000),
+            });
+            postStatus = postRes.status;
+            const postText = await postRes.text().catch(() => "");
+            try {
+              const pj: any = JSON.parse(postText);
+              if (pj && typeof pj === "object") {
+                postCreated = Boolean(
+                  pj.chat_id || pj.id || pj.data?.chat_id || pj.data?.id,
+                );
+                postFail =
+                  pj.success === false &&
+                  (pj.data?.code === "Unauthorized" || pj.code === "Unauthorized");
+              }
+            } catch {
+              postFail = false;
+            }
+          } catch {
+            postStatus = 0;
+            postFail = false;
+          }
+          result.postCreate = { status: postStatus, appAuthFailure: postFail };
+          void postCreated;
+          return result;
+        },
+        {
+          tests,
+          groups,
+          referer,
+          createUrl: qwenUrl("/api/v2/chats/new"),
+          settingsUrl: qwenUrl("/api/v2/users/user/settings"),
+          updateUrl: qwenUrl("/api/v2/users/user/settings/update"),
+        },
+      );
+    },
+    600_000,
+    60_000,
+    false,
+  );
+  const id8 = accountId.slice(0, 8);
+  try {
+    const b = shaping.baseline;
+    console.log(
+      `[Shaping] account=${id8} baseline status=${b.status} appFail=${b.appAuthFailure} created=${b.created} stoppedEarly=${shaping.stoppedEarly}`,
+    );
+    for (const h of shaping.headerTests) {
+      console.log(
+        `[Shaping] account=${id8} header name=${h.name} status=${h.status} appFail=${h.appAuthFailure}`,
+      );
+    }
+    if (shaping.causalHeader) {
+      console.log(`[Shaping] account=${id8} causalHeader=${shaping.causalHeader}`);
+    }
+    for (const g of shaping.groupTests) {
+      console.log(
+        `[Shaping] account=${id8} group=${g.group} status=${g.status} appFail=${g.appAuthFailure}`,
+      );
+    }
+    if (shaping.causalGroup) {
+      console.log(`[Shaping] account=${id8} causalGroup=${shaping.causalGroup}`);
+    }
+    console.log(
+      `[Shaping] account=${id8} settingsUpdate status=${shaping.settingsUpdate.status} appFail=${shaping.settingsUpdate.appAuthFailure} ` +
+        `postCreate status=${shaping.postCreate.status} appFail=${shaping.postCreate.appAuthFailure}`,
+    );
+  } catch {
+    // Diagnostics must never break the probe.
+  }
+  return shaping;
+}
 export interface BrowserAuthDiag {
   /** Live localStorage token readable in-page. */
   liveTokenPresent: boolean;

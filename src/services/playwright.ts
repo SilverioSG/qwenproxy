@@ -1192,6 +1192,18 @@ export function getStealthScript(profile: FingerprintProfile): string {
   `;
 }
 
+/**
+ * EXPERIMENTAL DIAGNOSTIC: read-only copy of the cached header set for an
+ * account (values stay server-side; probes log names only).
+ */
+export function getCachedQwenHeaders(
+  accountId: string,
+): Record<string, string> | null {
+  const cache = headerCaches.get(accountId);
+  if (!cache || !cache.headers) return null;
+  return { ...cache.headers };
+}
+
 function getHeaderCache(accountId: string): AccountHeaderCache {
   let cache = headerCaches.get(accountId);
   if (!cache) {

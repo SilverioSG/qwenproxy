@@ -622,3 +622,24 @@ dashboardApp.post("/v1/accounts/:id/probe-login", async (c) => {
     );
   }
 });
+
+dashboardApp.post("/v1/accounts/:id/probe-chat-shaping", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: fresh loginViaApi, then baseline minimal
+  // create-chat, single-header additions (stop at first failure), group
+  // tests, and settings/update pre/post comparison — all on the SAME live
+  // page/context. No re-auth, no refresh, no cooldown/DB changes, no
+  // rotation, no context recreation. Sanitized results only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeChatShaping } = await import("../services/qwen.js");
+    const result = await probeChatShaping(id);
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});

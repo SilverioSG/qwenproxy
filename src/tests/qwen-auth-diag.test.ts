@@ -294,7 +294,33 @@ test("qwen-auth-diag: probe-login endpoint registered with verifyApiKey", () => 
   assert.ok(noComments.includes("verifyApiKey"));
   assert.ok(noComments.includes("probeLoginOnce"));
   const allowed = new Set(["id", "result", "err"]);
-  const idents = new Set();
+  const idents = new Set<string>();
+  for (const m of noComments.matchAll(/\$\{([^}]+)\}/g)) {
+    const root = m[1].split(/[.?(\s]/)[0];
+    if (root) idents.add(root);
+  }
+  for (const ident of idents) {
+    assert.ok(allowed.has(ident), `unexpected interpolation: ${ident}`);
+  }
+});
+
+test("qwen-auth-diag: shaping probe + endpoint exist with sanitized surface", async () => {
+  const mod = await import("../services/qwen.ts");
+  assert.equal(typeof mod.probeChatShaping, "function");
+  assert.equal(typeof mod.isCookieOnlyRoute, "function");
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("src/api/dashboard.ts", "utf-8");
+  const idx = src.indexOf('"/v1/accounts/:id/probe-chat-shaping"');
+  assert.ok(idx >= 0);
+  const noComments = src
+    .slice(idx, idx + 1500)
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("//"))
+    .join("\n");
+  assert.ok(noComments.includes("verifyApiKey"));
+  assert.ok(noComments.includes("probeChatShaping"));
+  const allowed = new Set(["id", "result", "err"]);
+  const idents = new Set<string>();
   for (const m of noComments.matchAll(/\$\{([^}]+)\}/g)) {
     const root = m[1].split(/[.?(\s]/)[0];
     if (root) idents.add(root);
