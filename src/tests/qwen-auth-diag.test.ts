@@ -414,3 +414,24 @@ test("qwen-auth-diag: create-chat omits version, preserves other headers", () =>
     2,
   );
 });
+
+test("qwen-auth-diag: classifySigninChallenge signals without values", async () => {
+  const { classifySigninChallenge } = await import("../services/playwright.ts");
+  assert.deepEqual(classifySigninChallenge("OTP_REQUIRED", "enter code"), ["otp-required"]);
+  assert.deepEqual(classifySigninChallenge("x", "baxia slider challenge"), ["captcha-required"]);
+  assert.deepEqual(classifySigninChallenge("x", "wrong password mode"), ["password-mode-rejected"]);
+  assert.deepEqual(classifySigninChallenge("Forbidden", "risk flagged"), ["account-flag"]);
+  assert.deepEqual(classifySigninChallenge("Unauthorized", "401"), []);
+  assert.deepEqual(classifySigninChallenge(null, null), []);
+});
+
+test("qwen-auth-diag: login trace carries phase fields, never secrets", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const idx = src.indexOf("export interface LoginAttemptTrace");
+  assert.ok(idx >= 0);
+  const block = src.slice(idx, idx + 1500);
+  for (const f of ["cookieInstallOk", "lsWriteOk", "reloadOk", "tokenHashBefore", "tokenHashAfter", "tokenChanged", "challengeSignals"]) {
+    assert.ok(block.includes(f), `trace missing ${f}`);
+  }
+});

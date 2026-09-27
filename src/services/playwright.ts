@@ -2392,6 +2392,13 @@ export interface LoginAttemptTrace {
   lsTokenPresentAfter: boolean;
   lsTokenChanged: boolean;
   validated: boolean | null;
+  cookieInstallOk: boolean | null;
+  lsWriteOk: boolean | null;
+  reloadOk: boolean | null;
+  tokenHashBefore: string | null;
+  tokenHashAfter: string | null;
+  tokenChanged: boolean | null;
+  challengeSignals: string[];
 }
 
 const lastLoginTraces = new Map<string, LoginAttemptTrace>();
@@ -2736,6 +2743,33 @@ export async function probeLoginOnce(accountId: string): Promise<{
   };
 }
 
+/** Sanitized challenge-signal classification (names only, never values). */
+export function classifySigninChallenge(
+  code: unknown,
+  details: unknown,
+): string[] {
+  try {
+    const codeStr = String(code || "").toLowerCase();
+    const detStr = String(details || "").toLowerCase();
+    const sig: string[] = [];
+    if (/otp|verification|code|2fa|two-factor|mfa/.test(codeStr + " " + detStr)) {
+      sig.push("otp-required");
+    }
+    if (/captcha|slider|challenge|verify-human|tmd|baxia/.test(codeStr + " " + detStr)) {
+      sig.push("captcha-required");
+    }
+    if (/password|credential|login-type|logintype/.test(codeStr + " " + detStr)) {
+      sig.push("password-mode-rejected");
+    }
+    if (/forbidden|banned|suspend|restrict|risk|flagged|abnormal/.test(codeStr + " " + detStr)) {
+      sig.push("account-flag");
+    }
+    return sig;
+  } catch {
+    return [];
+  }
+}
+
 function topKeysOf(v: unknown): string[] {
   if (!v || typeof v !== "object") return [];
   return Object.keys(v as Record<string, unknown>).slice(0, 12);
@@ -2752,6 +2786,15 @@ function cookieNamesOf(
     h1 = Math.imul(h1, 0x01000193);
   }
   return { count: names.length, hash: (h1 >>> 0).toString(16) };
+}
+
+function traceHashStr(v: string): string {
+  let h1 = 0x811c9dc5;
+  for (let i = 0; i < v.length; i++) {
+    h1 ^= v.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
+  }
+  return (h1 >>> 0).toString(16);
 }
 
 /** Which token path fired inside extractAuthToken (structure only). */
@@ -2797,6 +2840,13 @@ async function loginViaApi(
     lsTokenPresentAfter: false,
     lsTokenChanged: false,
     validated: null,
+    cookieInstallOk: null,
+    lsWriteOk: null,
+    reloadOk: null,
+    tokenHashBefore: null,
+    tokenHashAfter: null,
+    tokenChanged: null,
+    challengeSignals: [],
   };
   const storeTrace = (): void => {
     if (accountId) lastLoginTraces.set(accountId, trace);
@@ -2818,6 +2868,11 @@ async function loginViaApi(
       const snap = cookieNamesOf(preCookies);
       trace.cookieCountBefore = snap.count;
       preCookieHash = snap.hash;
+      const preTok = preCookies.find(
+        (c: { name: string; value: string }) => c.name === "token",
+      );
+      trace.tokenHashBefore =
+        preTok && preTok.value ? traceHashStr(preTok.value) : null;
     } catch {
       // Best effort baseline.
     }
@@ -2919,6 +2974,7 @@ async function loginViaApi(
       trace.topKeys = topKeysOf(data);
       trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
       trace.tokenPathUsed = authTokenPathUsed(data);
+      trace.challengeSignals = classifySigninChallenge(code, details);
       storeTrace();
       return {
         success: false,
@@ -2935,6 +2991,17 @@ async function loginViaApi(
       trace.topKeys = topKeysOf(data);
       trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
       trace.tokenPathUsed = authTokenPathUsed(data);
+      // Pre-install token hash baseline (cookie token before install).
+      try {
+        const preCookies = await page.context().cookies().catch(() => []);
+        const preTok = preCookies.find(
+          (c: { name: string; value: string }) => c.name === "token",
+        );
+        trace.tokenHashBefore =
+          preTok && preTok.value ? traceHashStr(preTok.value) : null;
+      } catch {
+        trace.tokenHashBefore = null;
+      }
       if (token) {
         try {
           await page.context().addCookies([
@@ -2949,7 +3016,10 @@ async function loginViaApi(
               sameSite: "Lax",
             },
           ]);
-        } catch {}
+          trace.cookieInstallOk = true;
+        } catch {
+          trace.cookieInstallOk = false;
+        }
       }
 
       await page
@@ -2960,21 +3030,48 @@ async function loginViaApi(
         .catch(() => {});
 
       if (token) {
-        await page
-          .evaluate((tok) => {
-            try {
-              localStorage.removeItem("qwen_token_logged_out_marker");
-              localStorage.setItem("token", tok);
-              document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
-            } catch {}
-          }, token)
-          .catch(() => {});
-        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        try {
+          await page
+            .evaluate((tok) => {
+              try {
+                localStorage.removeItem("qwen_token_logged_out_marker");
+                localStorage.setItem("token", tok);
+                document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+              } catch {}
+            }, token)
+            .catch(() => {
+              throw new Error("ls-write-failed");
+            });
+          trace.lsWriteOk = true;
+        } catch {
+          trace.lsWriteOk = false;
+        }
+        try {
+          await page
+            .reload({ waitUntil: "domcontentloaded" })
+            .catch(() => {
+              throw new Error("reload-failed");
+            });
+          trace.reloadOk = true;
+        } catch {
+          trace.reloadOk = false;
+        }
         try {
           const postCookies = await page.context().cookies().catch(() => []);
           const snap = cookieNamesOf(postCookies);
           trace.cookieCountAfter = snap.count;
           trace.cookieNamesChanged = snap.hash !== preCookieHash;
+          const postTok = postCookies.find(
+            (c: { name: string; value: string }) => c.name === "token",
+          );
+          trace.tokenHashAfter =
+            postTok && postTok.value ? traceHashStr(postTok.value) : null;
+          trace.tokenChanged =
+            trace.tokenHashBefore !== null && trace.tokenHashAfter !== null
+              ? trace.tokenHashBefore !== trace.tokenHashAfter
+              : trace.tokenHashBefore === null && trace.tokenHashAfter === null
+                ? null
+                : true;
         } catch {
           // Best effort.
         }
