@@ -52,6 +52,8 @@ function installHarness(opts: {
   launchLogins?: boolean[];
   /** Reason reported when the probe is not ok. */
   probeReason?: string;
+  /** Simulate a restored background tab in the same context. */
+  extraPage?: boolean;
   /** Controls the mock persisted-session store. */
   persist?: {
     initialCapturedAt?: number;
@@ -77,19 +79,20 @@ function installHarness(opts: {
     // validation windows stay open — models the reported race exactly.
     const closeAfter = myLaunch === 0 ? (opts.closedAfter ?? Infinity) : Infinity;
     let polls = 0;
-    const listeners = new Map<string, Array<(res: never) => void>>();
-    const page = {
-      isClosed: () => forceClosed || polls >= closeAfter,
-      goto: async () => {},
-      on: (ev: string, fn: (res: never) => void) => {
-        const arr = listeners.get(ev) ?? [];
-        arr.push(fn);
-        listeners.set(ev, arr);
-      },
-      removeListener: (ev: string, fn: (res: never) => void) => {
-        const arr = listeners.get(ev) ?? [];
-        listeners.set(ev, arr.filter((f) => f !== fn));
-      },
+    const makePage = () => {
+      const listeners = new Map<string, Array<(res: never) => void>>();
+      const pg = {
+        isClosed: () => forceClosed || polls >= closeAfter,
+        goto: async () => {},
+        on: (ev: string, fn: (res: never) => void) => {
+          const arr = listeners.get(ev) ?? [];
+          arr.push(fn);
+          listeners.set(ev, arr);
+        },
+        removeListener: (ev: string, fn: (res: never) => void) => {
+          const arr = listeners.get(ev) ?? [];
+          listeners.set(ev, arr.filter((f) => f !== fn));
+        },
       __emit: async (res: {
         url: string;
         status: number;
@@ -110,15 +113,22 @@ function installHarness(opts: {
         }
       },
       __listenerCount: (ev: string) => listeners.get(ev)?.length ?? 0,
+      };
+      return pg;
     };
+    const page = makePage();
+    const extra = opts.extraPage ? makePage() : null;
     const fakeContext = {
       closed: false,
       close: async () => {
         fakeContext.closed = true;
       },
+      pages: () => (extra ? [page, extra] : [page]),
+      on: (_ev: string, _fn: unknown) => {},
     };
     contexts.push(fakeContext);
     pages.push(page);
+    if (extra) pages.push(extra);
     return { page, fakeContext, loginForThis, tick: () => { polls += 1; } };
   };
   let current: { page: { isClosed: () => boolean; goto: () => Promise<void> }; fakeContext: { closed: boolean; close: () => Promise<void> }; loginForThis: boolean; tick: () => void } | null = null;
@@ -747,6 +757,39 @@ test("manual verification: captureQwenHeaders persistSession=false skips saveAut
   assert.ok(idx >= 0);
   const block = src.slice(idx, idx + 400);
   assert.ok(block.includes("saveAuthSession"));
+});
+
+test("manual verification: chat on background tab still verifies", async () => {
+  const { calls, emit, pages } = installHarness({ loggedIn: false, extraPage: true });
+  await startManualVerification(TEST_ID);
+  await waitForLaunch(calls);
+  assert.ok(pages.length >= 2);
+  await waitForLaunch(calls);
+  // Emit on the SECOND (background) tab: multi-page attach must catch it.
+  await pages[1].__emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+});
+
+test("manual verification: redactApiPathname strips ids, keeps structure", async () => {
+  const { redactApiPathname } = await import("../services/manual-verification.ts");
+  assert.equal(
+    redactApiPathname("https://chat.qwen.ai/api/v2/chats/f74bcec4-a450-4b6c-bea6-0b2be44ff6d3"),
+    "/api/v2/chats/<id>",
+  );
+  assert.equal(redactApiPathname("https://chat.qwen.ai/api/v2/chat/completions?chat_id=abc"), "/api/v2/chat/completions");
+  assert.equal(redactApiPathname("https://chat.qwen.ai/api/models"), "/api/models");
+});
+
+test("manual verification: non-completions api traffic never verifies and leaks nothing", async () => {
+  const { emit } = installHarness({ loggedIn: false });
+  await startManualVerification(TEST_ID);
+  await emit({ url: "https://chat.qwen.ai/api/v2/users/user/settings", status: 200, body: '{"success":true}' });
+  await new Promise((r) => setTimeout(r, 100));
+  const st = getManualVerificationStatus(TEST_ID)?.state;
+  assert.ok(st === "waiting" || st === "authenticated", `unexpected ${st}`);
+  cancelManualVerification(TEST_ID);
+  assert.equal(await waitForState("cancelled"), "cancelled");
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

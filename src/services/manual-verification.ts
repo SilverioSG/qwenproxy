@@ -538,6 +538,20 @@ const deps: {
   },
 };
 
+/** Redact IDs from an API pathname for safe discovery logging. */
+export function redactApiPathname(url: string): string {
+  let path = url;
+  try {
+    path = new URL(url).pathname;
+  } catch {
+    const q = path.indexOf("?");
+    if (q >= 0) path = path.slice(0, q);
+  }
+  return path
+    .replace(/[0-9a-f]{8}-[0-9a-f-]{4,}/gi, "<id>")
+    .replace(/\b\d{5,}\b/g, "<id>")
+    .replace(/\b[0-9a-f]{16,}\b/gi, "<id>");
+}
 /** Test hook: replace browser launch / validation / sleep. */
 export function setManualVerificationDeps(
   overrides: Partial<typeof deps>,
@@ -762,7 +776,28 @@ async function runVerification(accountId: string): Promise<void> {
       try {
         if (entry.finished) return;
         const url = typeof res.url === "function" ? res.url() : "";
-        if (!url.includes(CHAT_COMPLETIONS_PATH)) return;
+        if (!url.includes(CHAT_COMPLETIONS_PATH)) {
+          // Discovery: which /api/v2 endpoints does the real UI actually
+          // hit? Pathnames only, IDs redacted, no bodies/values.
+          try {
+            if (url.includes("/api/v2/")) {
+              const method =
+                typeof res.request === "function"
+                  ? res.request().method?.() ?? ""
+                  : "";
+              if (method === "POST") {
+                logEvent(
+                  entry,
+                  accountId,
+                  `api-path=${redactApiPathname(url)}`,
+                );
+              }
+            }
+          } catch {
+            // Discovery must never break verification.
+          }
+          return;
+        }
         const method =
           typeof res.request === "function"
             ? res.request().method?.() ?? ""
@@ -814,6 +849,18 @@ async function runVerification(accountId: string): Promise<void> {
         }
       })();
     };
+    const attachedPages = new Set<unknown>();
+    const attachToPage = (p: unknown): void => {      try {
+        if (!p || attachedPages.has(p)) return;
+        attachedPages.add(p);
+        (p as { on?: (ev: string, fn: unknown) => void }).on?.(
+          "response",
+          onResponse,
+        );
+      } catch {
+        // Best effort per page.
+      }
+    };
     const detachListener = (): void => {
       try {
         (page as { removeListener?: (ev: string, fn: unknown) => void }).removeListener?.(
@@ -823,12 +870,39 @@ async function runVerification(accountId: string): Promise<void> {
       } catch {
         // Best effort.
       }
+      try {
+        const c: unknown = context;
+        if (!c) return;
+        const pages: unknown[] =
+          typeof (c as { pages?: unknown }).pages === "function"
+            ? (c as { pages: () => unknown[] }).pages()
+            : [];
+        for (const p of pages) {
+          try {
+            (p as { removeListener?: (ev: string, fn: unknown) => void }).removeListener?.(
+              "response",
+              onResponse,
+            );
+          } catch {
+            continue;
+          }
+        }
+      } catch {
+        // Best effort.
+      }
     };
     try {
-      (page as { on?: (ev: string, fn: unknown) => void }).on?.(
-        "response",
-        onResponse,
-      );
+      // Attach to every page in the visible context (restored profiles may
+      // hold background tabs; the user may chat in any of them) plus future
+      // pages opened during the flow.
+      if (context === null) throw new Error("no visible context");
+      const pages: unknown[] =
+        typeof context.pages === "function" ? context.pages() : [page];
+      for (const p of pages) attachToPage(p);
+      const ctxWithOn = context as unknown as {
+        on?: (ev: string, fn: (p: unknown) => void) => void;
+      };
+      ctxWithOn.on?.("page", (p: unknown) => attachToPage(p));
     } catch {
       // If listeners are unsupported, chat evidence can never arrive and the
       // flow ends in timeout rather than false success.
