@@ -2910,6 +2910,10 @@ export async function syncQwenRequestPersonalization(
   let requestHeaders = buildCapturedQwenHeaders(headers, {
     referer: qwenUrl("/settings/personalization"),
   });
+  // Bisect-proven (same context/session): the cached `version` header turns
+  // settings/personalization into appUnauthorized; omit it here only.
+  delete requestHeaders["version"];
+  delete requestHeaders["Version"];
   let currentSettings: any = null;
   let payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
 
@@ -3090,6 +3094,8 @@ export async function syncQwenRequestPersonalization(
       requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
         referer: qwenUrl("/settings/personalization"),
       });
+      delete requestHeaders["version"];
+      delete requestHeaders["Version"];
       ({ raw, json } = await attemptPost(requestHeaders));
     } catch (retryErr) {
       // Layer 3: Retry failed → non-fatal, continue without personalization

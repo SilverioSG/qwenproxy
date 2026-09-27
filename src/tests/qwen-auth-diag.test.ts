@@ -379,3 +379,20 @@ test("qwen-auth-diag: bisect structure present with budget and confirm sequence"
   assert.ok(block.includes("interactionCausal"));
   assert.ok(block.includes("confirmed = ok1 && bad2 && ok3"));
 });
+
+test("qwen-auth-diag: personalization omits cached version header", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const idx = src.indexOf("Bisect-proven (same context/session)");
+  assert.ok(idx >= 0);
+  const block = src.slice(idx - 400, idx + 600);
+  assert.ok(block.includes('delete requestHeaders["version"]'));
+  // Create-chat path must keep version untouched.
+  const pool = fs.readFileSync("src/services/qwen-chat-pool.ts", "utf-8");
+  assert.ok(!pool.includes('delete requestHeaders["version"]'));
+});
+
+test("qwen-auth-diag: version strip is personalization-scoped", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const occurrences = src.split('delete requestHeaders["version"]').length - 1;
+  assert.equal(occurrences, 2);
+});
