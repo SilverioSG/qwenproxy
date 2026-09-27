@@ -402,9 +402,12 @@ export function getSessionTrace(): {
       (e.event === "SETTINGS_STATUS" ||
         e.event === "CREATE_CHAT_STATUS" ||
         e.event === "SETTINGS_UPDATE_STATUS") &&
-      !/unauthorized|401/i.test(e.detail),
+      !/unauthorized|401/i.test(e.detail) &&
+      !/appFail=true/.test(e.detail),
   );
-  const base = okEvents.length > 0 ? okEvents[0] : null;
+  // Prefer the earliest ok event carrying a snapshot (comparable states).
+  const withSnap = okEvents.filter((e) => e.snapshot !== null);
+  const base = (withSnap.length > 0 ? withSnap : okEvents)[0] ?? null;
   const from = (firstFailureTs ?? Date.now()) - 120_000;
   const to = (firstFailureTs ?? Date.now()) + 10_000;
   const window = ring.filter((e) => e.ts >= from && e.ts <= to);
