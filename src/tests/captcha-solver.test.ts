@@ -612,3 +612,64 @@ test("withAccountPage respects recoverOnTimeout=false and does not destroy conte
     unregisterPlaywrightAccountForTests(accountId);
   }
 });
+
+test("challenge recovery skips solve entirely on a dead page", async () => {
+  const { solveChallengeOnPage } = await import(
+    "../services/captcha-coordinator.ts"
+  );
+  let gotos = 0;
+  const page = {
+    isClosed: () => true,
+    url: () => "https://chat.qwen.ai/",
+    goto: async () => {
+      gotos += 1;
+    },
+  } as unknown as Page;
+  const start = Date.now();
+  assert.equal(await solveChallengeOnPage(page, null, 5000), false);
+  assert.equal(gotos, 0);
+  assert.ok(Date.now() - start < 1000, "must fail fast, not burn solver budget");
+});
+
+test("challenge recovery tolerates aborted goto on a live challenge page", async () => {
+  const { solveChallengeOnPage } = await import(
+    "../services/captcha-coordinator.ts"
+  );
+  const visited: string[] = [];
+  let challengeVisible = true;
+  const challenge = locator({ isVisible: async () => challengeVisible });
+  const slider = locator({
+    waitFor: async () => undefined,
+    boundingBox: async () => ({ x: 10, y: 20, width: 40, height: 40 }),
+  });
+  const track = locator({
+    boundingBox: async () => ({ x: 10, y: 20, width: 300, height: 40 }),
+  });
+  const page = {
+    ...pageWithLocators(
+      {
+        "#nocaptcha": challenge,
+        "#baxia-punish": challenge,
+        "#nc_1_n1z": slider,
+        "#nc_1_n1t": track,
+      },
+      baxiaFrame(slider, track),
+      {
+        move: async () => undefined,
+        down: async () => undefined,
+        up: async () => {
+          challengeVisible = false;
+        },
+      } as unknown as Page["mouse"],
+    ),
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/_____tmd_____/punish?x5secdata=abc",
+    goto: async (url: string) => {
+      visited.push(url);
+      // First navigation aborts benignly (SPA replaces it); page stays usable.
+      throw new Error("net::ERR_ABORTED at https://chat.qwen.ai/");
+    },
+  } as unknown as Page;
+  // In-place solve path runs before any navigation: visible slider solves.
+  assert.equal(await solveChallengeOnPage(page, null, 1000), true);
+});
