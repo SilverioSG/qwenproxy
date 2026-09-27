@@ -64,6 +64,25 @@ const pageIds = new WeakMap<object, string>();
 let contextCounter = 0;
 let pageCounter = 0;
 
+// Per-account session generations: incremented on every successful login.
+// Lets observers tell whether a failure belongs to a superseded generation.
+const generations = new Map<string, number>();
+const loginInflight = new Map<string, string[]>();
+
+export function currentGeneration(accountId: string): number {
+  return generations.get(accountId) ?? 0;
+}
+
+function bumpGeneration(accountId: string): number {
+  const n = (generations.get(accountId) ?? 0) + 1;
+  generations.set(accountId, n);
+  return n;
+}
+
+export function loginOverlapDetected(accountId: string): boolean {
+  return (loginInflight.get(accountId) ?? []).length > 1;
+}
+
 export function traceContextId(context: object | null): string | null {
   if (!context || typeof context !== "object") return null;
   let id = contextIds.get(context);
@@ -177,10 +196,27 @@ export function traceSessionEvent(
   snapshot: SessionSnapshot | null = null,
 ): void {
   if (!isTarget(accountId)) return;
+  if (event === "LOGIN_START") {
+    const stack = loginInflight.get(accountId!) ?? [];
+    stack.push(`t${Date.now()}`);
+    loginInflight.set(accountId!, stack);
+    if (stack.length > 1) {
+      detail = `${detail} CONCURRENT_LOGIN_DETECTED=true depth=${stack.length}`;
+    }
+  }
+  if (event === "LOGIN_END") {
+    const stack = loginInflight.get(accountId!) ?? [];
+    stack.pop();
+    if (stack.length === 0) loginInflight.delete(accountId!);
+    if (/^ok\b/.test(detail)) {
+      bumpGeneration(accountId!);
+    }
+  }
+  const gen = currentGeneration(accountId!);
   const entry: SessionTraceEntry = {
     ts: Date.now(),
     event,
-    detail: detail.slice(0, 160),
+    detail: `${detail} gen=${gen}`.slice(0, 160),
     snapshot,
   };
   ring.push(entry);
@@ -395,6 +431,8 @@ export function getSessionTrace(): {
   firstFailureTs: number | null;
   firstFailure: { event: SessionTraceEvent; snapshot: SessionSnapshot | null } | null;
   classification: TransitionClassification | null;
+  generation: number;
+  loginOverlap: boolean;
   window: SessionTraceEntry[];
 } {
   const okEvents = ring.filter(
@@ -431,6 +469,8 @@ export function getSessionTrace(): {
     firstFailureTs,
     firstFailure: firstFailureRef,
     classification,
+    generation: currentGeneration(TRACE_TARGET_ACCOUNT),
+    loginOverlap: loginOverlapDetected(TRACE_TARGET_ACCOUNT),
     window,
   };
 }

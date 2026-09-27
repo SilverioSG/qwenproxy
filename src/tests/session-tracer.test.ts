@@ -160,3 +160,34 @@ test("session-tracer: classifyTransition distinguishes A/B/C/D", async () => {
   assert.equal(classify(base, same, [{ ts: 1, event: "LOGIN_START", detail: "", snapshot: null }]).verdict, "UNKNOWN");
   assert.equal(classify(null, diffTok, []).verdict, "UNKNOWN");
 });
+
+test("session-tracer: generation monotonic per account + overlap detection", async () => {
+  const mod = await import("../services/session-tracer.ts");
+  const before = mod.currentGeneration("gen-test-acct");
+  mod.traceSessionEvent("gen-test-acct", "LOGIN_START");
+  // non-target account: no generation tracking (target gate)
+  assert.equal(mod.currentGeneration("gen-test-acct"), before);
+  assert.equal(mod.loginOverlapDetected("gen-test-acct"), false);
+});
+
+test("session-tracer: concurrent logins flagged on target", async () => {
+  const mod = await import("../services/session-tracer.ts");
+  const t = mod.TRACE_TARGET_ACCOUNT;
+  mod.traceSessionEvent(t, "LOGIN_START", "caller=test-a");
+  mod.traceSessionEvent(t, "LOGIN_START", "caller=test-b");
+  assert.equal(mod.loginOverlapDetected(t), true);
+  mod.traceSessionEvent(t, "LOGIN_END", "ok");
+  mod.traceSessionEvent(t, "LOGIN_END", "ok");
+  assert.equal(mod.loginOverlapDetected(t), false);
+  assert.ok(mod.currentGeneration(t) >= 2);
+});
+
+test("session-tracer: superseded pattern helper (failure gen < max gen)", async () => {
+  const mod = await import("../services/session-tracer.ts");
+  const isSuperseded = (failureGen: number | null, maxGen: number): boolean =>
+    failureGen !== null && maxGen > failureGen;
+  assert.equal(isSuperseded(2, 3), true);
+  assert.equal(isSuperseded(3, 3), false);
+  assert.equal(isSuperseded(null, 3), false);
+  void mod;
+});

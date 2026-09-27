@@ -1887,7 +1887,7 @@ export async function initPlaywrightForAccount(
       );
 
       if (!hasAuthCookie && account.email && account.password) {
-        await loginToQwen(account.id, account.email, account.password);
+        await loginToQwen(account.id, account.email, account.password, "startup-init");
       }
 
       // Navigate to the stable chat page to validate the session and populate cookies.
@@ -1906,7 +1906,7 @@ export async function initPlaywrightForAccount(
               console.warn(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
-              const ok = await loginToQwen(account.id, account.email, account.password);
+              const ok = await loginToQwen(account.id, account.email, account.password, "startup-validation");
               if (!ok || !(await isPageLoggedIn(acctPage))) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
@@ -2084,7 +2084,7 @@ export async function validateAccountLogin(
         // Need to register page temporarily for login functions
         accountPages.set(account.id, acctPage);
         try {
-          loggedIn = await loginToQwen(account.id, account.email, account.password);
+          loggedIn = await loginToQwen(account.id, account.email, account.password, "background-validation");
         } finally {
           accountPages.delete(account.id);
         }
@@ -2102,7 +2102,7 @@ export async function validateAccountLogin(
             if (account.email && account.password) {
               accountPages.set(account.id, acctPage);
               try {
-                loggedIn = await loginToQwen(account.id, account.email, account.password);
+                loggedIn = await loginToQwen(account.id, account.email, account.password, "background-validation");
               } finally {
                 accountPages.delete(account.id);
               }
@@ -2192,9 +2192,10 @@ async function loginToQwen(
   accountId: string,
   email: string,
   password: string,
+  caller = "unknown",
 ): Promise<boolean> {
   try {
-    traceSessionEvent(accountId, "LOGIN_START");
+    traceSessionEvent(accountId, "LOGIN_START", `caller=${caller}`);
   } catch {}
   try {
     const ok = await loginToQwenInner(accountId, email, password);
@@ -3475,7 +3476,7 @@ export async function captureQwenHeaders(
             `⚠️  [Playwright] Session expired or guest state detected during header capture for ${accountId}; re-authenticating...`,
           );
           armOverallDeadline();
-          const ok = await loginToQwen(accountId, creds.email, creds.password);
+          const ok = await loginToQwen(accountId, creds.email, creds.password, "capture-recovery");
           if (ok) {
             // Re-login navigated; load the chat page and wait for hydration so
             // the check below probes a live authenticated chat page.
@@ -3918,7 +3919,7 @@ async function refreshHeadersInternal(
         const { getAccountCredentials } = await import("../core/accounts.ts");
         const creds = getAccountCredentials(accountId);
         if (creds && creds.email && creds.password) {
-          const ok = await loginToQwen(accountId, creds.email, creds.password);
+          const ok = await loginToQwen(accountId, creds.email, creds.password, "request-reauth");
           cookieCaches.delete(accountId);
           if (!ok || !(await isPageLoggedIn(page, 5_000))) {
             unmarkAccountHeadersReady(accountId);
