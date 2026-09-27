@@ -1057,19 +1057,8 @@ export async function requestQwenTextInBrowser(
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
         // Read-only observation of the live in-page token (never modifies
         // the request, never leaves the page; only booleans are reported).
-        const readLiveToken = (): string | null => {
-          try {
-            const t = localStorage.getItem("token");
-            return typeof t === "string" && t.length > 0 ? t : null;
-          } catch {
-            return null;
-          }
-        };
-        const bearerOf = (h: Record<string, string>): string | null => {
-          const raw = h["authorization"] || h["Authorization"] || "";
-          const m = raw.match(/^\s*Bearer\s+(\S+)\s*$/i);
-          return m ? m[1] : null;
-        };
+        // NOTE: no helper consts/arrow functions in here — the bundler wraps
+        // those with __name(), which does not exist in the page context.
         const diag: BrowserAuthDiag = {
           liveTokenPresent: false,
           authMatchesLive: null,
@@ -1084,13 +1073,20 @@ export async function requestQwenTextInBrowser(
           retryStatus: 0,
         };
         try {
-          const liveBefore = readLiveToken();
+          let liveBefore: string | null = null;
+          try {
+            const t = localStorage.getItem("token");
+            liveBefore = typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            liveBefore = null;
+          }
           diag.liveTokenPresent = liveBefore !== null;
-          const sentBefore = bearerOf(headers);
+          const sentRaw =
+            headers["authorization"] || headers["Authorization"] || "";
+          const sentMatch = sentRaw.match(/^\s*Bearer\s+(\S+)\s*$/i);
+          const sentBefore = sentMatch ? sentMatch[1] : null;
           diag.authMatchesLive =
-            sentBefore && liveBefore
-              ? sentBefore === liveBefore
-              : null;
+            sentBefore && liveBefore ? sentBefore === liveBefore : null;
           let response = await fetch(url, {
             method,
             credentials: "include",
@@ -1138,8 +1134,17 @@ export async function requestQwenTextInBrowser(
                   });
                   diag.retried = true;
                   diag.retryStatus = response.status;
-                  const liveAfter = readLiveToken();
-                  const sentAfter = bearerOf(headers);
+                  let liveAfter: string | null = null;
+                  try {
+                    const t2 = localStorage.getItem("token");
+                    liveAfter = typeof t2 === "string" && t2.length > 0 ? t2 : null;
+                  } catch {
+                    liveAfter = null;
+                  }
+                  const sentRaw2 =
+                    headers["authorization"] || headers["Authorization"] || "";
+                  const sentMatch2 = sentRaw2.match(/^\s*Bearer\s+(\S+)\s*$/i);
+                  const sentAfter = sentMatch2 ? sentMatch2[1] : null;
                   diag.authMatchesLive =
                     sentAfter && liveAfter ? sentAfter === liveAfter : null;
                 }

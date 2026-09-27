@@ -56,6 +56,30 @@ test("qwen-auth-diag: refresh exception → sanitized class only", () => {
   assert.ok(!cls.includes("secret"));
 });
 
+test("qwen-auth-diag: in-page evaluate closure is __name-free (no bundler helpers)", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const start = src.indexOf("const evaluateRequest = (page: Page)");
+  assert.ok(start >= 0);
+  // End of requestQwenTextInBrowser: the `return new Response(response.raw`
+  // that follows the withQwenBrowserPage call.
+  const end = src.indexOf("return new Response(response.raw", start);
+  assert.ok(end > start);
+  const block = src.slice(start, end);
+  // Nested arrow-function declarations inside page.evaluate would be wrapped
+  // with __name() by the bundler and throw ReferenceError in the page
+  // (regression covered: d3c7140 family). Only direct parameter arrows and
+  // method calls are allowed. Start inside the evaluate callback itself so
+  // the outer Node-side wrapper is not counted.
+  const innerStart = block.indexOf("page.evaluate(");
+  assert.ok(innerStart >= 0);
+  const inner = block.slice(innerStart);
+  const nested = [...inner.matchAll(/const \w+ ?= ?(?:async )?\(.*?\) ?=>/gs)];
+  assert.deepEqual(
+    nested.map((m) => m[0].slice(0, 40)),
+    [],
+  );
+});
+
 test("qwen-auth-diag: no secret values in new instrumentation", () => {
   const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
   const start = src.indexOf("[QwenAuth] account=");
