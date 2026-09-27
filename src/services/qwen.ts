@@ -1333,7 +1333,19 @@ export async function probeRefreshStructure(
     false,
   );
 }
-/** Sanitized single header-test outcome. Names/codes only. */
+/** Sanitized shape of a chats/new response. Structure only, never values. */
+export interface ChatResponseShape {
+  topKeys: string[];
+  dataType: string;
+  dataKeys: string[];
+  nestedKeys: string[];
+  arrayLengths: string[];
+  successPresent: boolean;
+  successValue: boolean | null;
+  codePresent: boolean;
+  codeLen: number;
+  chatIdCandidates: string[];
+}
 export interface ShapingHeaderResult {
   name: string;
   status: number;
@@ -1343,6 +1355,7 @@ export interface ShapingHeaderResult {
 /** Sanitized shaping-probe outcome. No secrets, no bodies. */
 export interface ChatShapingResult {
   baseline: { status: number; appAuthFailure: boolean; created: boolean };
+  baselineShape: ChatResponseShape | null;
   stoppedEarly: boolean;
   headerTests: ShapingHeaderResult[];
   causalHeader: string | null;
@@ -1371,6 +1384,7 @@ export async function probeChatShaping(
   const login = await probeLoginOnce(accountId);
   const failResult: ChatShapingResult = {
     baseline: { status: 0, appAuthFailure: false, created: false },
+    baselineShape: null,
     stoppedEarly: true,
     headerTests: [],
     causalHeader: null,
@@ -1496,6 +1510,7 @@ export async function probeChatShaping(
         }): Promise<ChatShapingResult> => {
           const result: ChatShapingResult = {
             baseline: { status: 0, appAuthFailure: false, created: false },
+    baselineShape: null,
             stoppedEarly: true,
             headerTests: [],
             causalHeader: null,
@@ -1521,6 +1536,7 @@ export async function probeChatShaping(
             let status = 0;
             let appFail = false;
             let created = false;
+            let shape: ChatResponseShape | null = null;
             try {
               const fetchInit: RequestInit = {
                 method: "POST",
@@ -1545,6 +1561,94 @@ export async function probeChatShaping(
                     j.success === false &&
                     (j.data?.code === "Unauthorized" ||
                       j.code === "Unauthorized");
+                  if (ti === 0) {
+                    // Sanitized shape recording, inline (no helpers: __name).
+                    const topKeys: string[] = [];
+                    for (const k in j) {
+                      if (Object.prototype.hasOwnProperty.call(j, k)) {
+                        topKeys.push(k);
+                      }
+                    }
+                    const dv = j.data;
+                    const dataType =
+                      dv === null ? "null" : Array.isArray(dv) ? "array" : typeof dv;
+                    const dataKeys: string[] = [];
+                    const nestedKeys: string[] = [];
+                    const arrayLengths: string[] = [];
+                    if (dv && typeof dv === "object" && !Array.isArray(dv)) {
+                      for (const k in dv) {
+                        if (!Object.prototype.hasOwnProperty.call(dv, k)) continue;
+                        dataKeys.push(k);
+                        const vv = (dv as Record<string, unknown>)[k];
+                        const vt =
+                          vv === null ? "null" : Array.isArray(vv) ? "array" : typeof vv;
+                        if (Array.isArray(vv)) {
+                          arrayLengths.push(k + "=" + vv.length);
+                        } else if (vv && typeof vv === "object") {
+                          let nk = 0;
+                          for (const kk in vv as Record<string, unknown>) {
+                            if (Object.prototype.hasOwnProperty.call(vv, kk)) nk += 1;
+                          }
+                          nestedKeys.push(k + "{keys=" + nk + "}");
+                        } else {
+                          nestedKeys.push(k + ":" + vt);
+                        }
+                      }
+                    } else if (Array.isArray(dv)) {
+                      arrayLengths.push("data=" + dv.length);
+                    }
+                    const found: string[] = [];
+                    const cands = [
+                      "chat_id",
+                      "id",
+                      "data.chat_id",
+                      "data.id",
+                      "data.chat.id",
+                    ];
+                    for (let ci = 0; ci < cands.length; ci++) {
+                      const segs = cands[ci].split(".");
+                      let cur: unknown = j;
+                      let okk = true;
+                      for (let s = 0; s < segs.length; s++) {
+                        if (
+                          cur &&
+                          typeof cur === "object" &&
+                          segs[s] in (cur as Record<string, unknown>)
+                        ) {
+                          cur = (cur as Record<string, unknown>)[segs[s]];
+                        } else {
+                          okk = false;
+                          break;
+                        }
+                      }
+                      if (okk && typeof cur === "string" && cur.length > 0) {
+                        found.push(cands[ci]);
+                      }
+                    }
+                    let codePresent = false;
+                    let codeLen = 0;
+                    try {
+                      const codeV = j.data?.code ?? j.code;
+                      if (typeof codeV === "string") {
+                        codePresent = true;
+                        codeLen = codeV.length;
+                      }
+                    } catch {
+                      codePresent = false;
+                    }
+                    shape = {
+                      topKeys,
+                      dataType,
+                      dataKeys,
+                      nestedKeys,
+                      arrayLengths,
+                      successPresent: "success" in j,
+                      successValue: j.success === true ? true : j.success === false ? false : null,
+                      codePresent,
+                      codeLen,
+                      chatIdCandidates: found,
+                    };
+                  }
                 }
               } catch {
                 appFail = false;
@@ -1555,8 +1659,11 @@ export async function probeChatShaping(
             }
             if (ti === 0) {
               result.baseline = { status, appAuthFailure: appFail, created };
+              result.baselineShape = shape;
               result.preCreate = { status, appAuthFailure: appFail };
-              if (status !== 200 || appFail || !created) {
+              // created/chat_id is INFORMATIONAL ONLY: HTTP 2xx without app
+              // failure continues the matrix regardless of response shape.
+              if (status !== 200 || appFail) {
                 result.stoppedEarly = true;
                 return result;
               }
@@ -1731,6 +1838,19 @@ export async function probeChatShaping(
     console.log(
       `[Shaping] account=${id8} baseline status=${b.status} appFail=${b.appAuthFailure} created=${b.created} stoppedEarly=${shaping.stoppedEarly}`,
     );
+    try {
+      const sh = shaping.baselineShape;
+      if (sh) {
+        console.log(
+          `[Shaping] account=${id8} shape top=[${sh.topKeys.join(",")}] dataType=${sh.dataType} ` +
+            `dataKeys=[${sh.dataKeys.join(",")}] nested=[${sh.nestedKeys.join(",")}] ` +
+            `arrays=[${sh.arrayLengths.join(",")}] success=${sh.successPresent}/${sh.successValue} ` +
+            `code=${sh.codePresent}/${sh.codeLen} chatIdPaths=[${sh.chatIdCandidates.join(",")}]`,
+        );
+      }
+    } catch {
+      // Diagnostics must never break the probe.
+    }
     for (const h of shaping.headerTests) {
       console.log(
         `[Shaping] account=${id8} header name=${h.name} status=${h.status} appFail=${h.appAuthFailure}`,

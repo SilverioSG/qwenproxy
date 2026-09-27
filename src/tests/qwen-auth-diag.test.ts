@@ -357,3 +357,13 @@ test("qwen-auth-diag: shaping probe recognizes nested data.chat.id", () => {
     assert.equal(created, expected);
   }
 });
+
+test("qwen-auth-diag: baseline gate ignores created/chat_id (2xx + no appFail continues)", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const idx = src.indexOf("created/chat_id is INFORMATIONAL ONLY");
+  const anchor = idx >= 0 ? idx : src.indexOf("result.baseline = { status, appAuthFailure: appFail, created };");
+  assert.ok(anchor >= 0);
+  const block = src.slice(anchor, anchor + 800);
+  assert.ok(block.includes("if (status !== 200 || appFail)"));
+  assert.ok(!block.includes("!created"));
+});
