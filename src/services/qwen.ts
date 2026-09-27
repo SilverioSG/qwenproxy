@@ -2327,6 +2327,17 @@ export async function requestQwenTextInBrowser(
           `retryStatus=${d.retried ? d.retryStatus : "none"}` +
           (d.refreshErrorClass ? ` errClass=${d.refreshErrorClass}` : ""),
       );
+      try {
+        const { traceSessionEvent } = await import("./session-tracer.ts");
+        traceSessionEvent(accountId, "REFRESH_START", `path=${path}`);
+        traceSessionEvent(
+          accountId,
+          "REFRESH_END",
+          `status=${d.refreshStatus} usable=${d.refreshUsable} retry=${d.retried ? d.retryStatus : "none"}`,
+        );
+      } catch {
+        // Tracing must never break requests.
+      }
     }
   } catch {
     // Diagnostics must never break requests.
@@ -3080,6 +3091,12 @@ export async function syncQwenRequestPersonalization(
     console.warn(
       `[Qwen] Personalization sync failed (non-fatal) | account=${cacheKey} | response=${raw.slice(0, 200)}`,
     );
+    try {
+      const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
+      noteUpstreamAuthResult(accountId, "settings-update", 200, true);
+    } catch {
+      // Tracing must never break flows.
+    }
     return false;
   }
 
@@ -3145,6 +3162,12 @@ export async function syncQwenRequestPersonalization(
     matchReturned,
     matchStored,
   });
+  try {
+    const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
+    noteUpstreamAuthResult(accountId, "settings-update", 200, false);
+  } catch {
+    // Tracing must never break flows.
+  }
   return true;
 }
 

@@ -56,6 +56,7 @@ function autoInstallPlaywrightChromium(): void {
   } catch {}
 }
 import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
+import { traceSessionEvent } from "./session-tracer.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
 // only depends on config/logger, so playwright -> account-concurrency stays
 // acyclic, while the reverse direction would drag the browser layer into core.
@@ -1779,6 +1780,18 @@ export async function initPlaywrightForAccount(
       accountContexts.set(account.id, acctContext);
       accountPages.set(account.id, acctPage);
       installContextDeathHandlers(account.id, acctContext, acctPage);
+      try {
+        const { snapshotSessionState, traceSessionEvent } = await import(
+          "./session-tracer.ts"
+        );
+        const snap = await snapshotSessionState(account.id, {
+          context: acctContext,
+          page: acctPage,
+        }).catch(() => null);
+        traceSessionEvent(account.id, "CONTEXT_CREATE", "", snap);
+      } catch {
+        // Tracing must never break init.
+      }
       touchAccountActivity(account.id);
 
       // 1. Fast boot: if a valid session exists in SQLite, restore headers and cookies instantly.
@@ -2163,6 +2176,28 @@ export function classifyQwenAuthError(
 }
 
 async function loginToQwen(
+  accountId: string,
+  email: string,
+  password: string,
+): Promise<boolean> {
+  try {
+    traceSessionEvent(accountId, "LOGIN_START");
+  } catch {}
+  try {
+    const ok = await loginToQwenInner(accountId, email, password);
+    try {
+      traceSessionEvent(accountId, "LOGIN_END", ok ? "ok" : "failed");
+    } catch {}
+    return ok;
+  } catch (err) {
+    try {
+      traceSessionEvent(accountId, "LOGIN_END", "error");
+    } catch {}
+    throw err;
+  }
+}
+
+async function loginToQwenInner(
   accountId: string,
   email: string,
   password: string,
@@ -2716,6 +2751,20 @@ async function loginViaApi(
         } catch {
           trace.validated = false;
         }
+        try {
+          const { snapshotSessionState, traceSessionEvent } = await import(
+            "./session-tracer.ts"
+          );
+          const snap = await snapshotSessionState(accountId || "", {
+            context: page.context(),
+            page,
+          }).catch(() => null);
+          if (accountId) {
+            traceSessionEvent(accountId, "LOGIN_END", "installed", snap);
+          }
+        } catch {
+          // Tracing must never break login.
+        }
         storeTrace();
         return { success: true };
       }
@@ -3096,6 +3145,9 @@ export async function captureQwenHeaders(
   if (!page || page.isClosed()) {
     throw new Error(`Playwright page unavailable for header capture: ${accountId}`);
   }
+  try {
+    traceSessionEvent(accountId, "CAPTURE_START");
+  } catch {}
 
   touchAccountActivity(accountId);
   const cache = getHeaderCache(accountId);
@@ -3301,6 +3353,18 @@ export async function captureQwenHeaders(
       }
 
       headersCaptured = true;
+      try {
+        const { snapshotSessionState, traceSessionEvent } = await import(
+          "./session-tracer.ts"
+        );
+        const snap = await snapshotSessionState(accountId, {
+          context: page.context(),
+          page,
+        }).catch(() => null);
+        traceSessionEvent(accountId, "CAPTURE_END", "intercept", snap);
+      } catch {
+        // Tracing must never break capture.
+      }
       if (timeout) clearTimeout(timeout);
       cache.headers = capturedHeaders;
       if (capturedHeaders["version"]) {
@@ -3832,6 +3896,9 @@ async function refreshHeadersInternal(
     let reauthExecuted = false;
     if (page) {
       const executeReauth = async () => {
+        try {
+          traceSessionEvent(accountId, "REAUTH_START");
+        } catch {}
         console.warn(
           `⚠️  [Playwright] Session expired or forced re-auth for ${accountId}, re-authenticating...`,
         );
@@ -3847,6 +3914,9 @@ async function refreshHeadersInternal(
             );
           }
           reauthExecuted = true;
+          try {
+            traceSessionEvent(accountId, "REAUTH_END", "ok");
+          } catch {}
         } else {
           unmarkAccountHeadersReady(accountId);
           throw new Error(
@@ -4409,6 +4479,9 @@ export async function closeIdlePlaywrightAccounts(
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
+    try {
+      traceSessionEvent(candidate.accountId, "SESSIONKEEPER_CLOSE");
+    } catch {}
     await closePlaywrightForAccount(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
@@ -4447,6 +4520,9 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
+    try {
+      traceSessionEvent(candidate.accountId, "SESSIONKEEPER_CLOSE");
+    } catch {}
     await closePlaywrightForAccount(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
@@ -4547,6 +4623,9 @@ export function installContextDeathHandlers(
 }
 
 function cleanupPlaywrightAccountState(accountId: string): void {
+  try {
+    traceSessionEvent(accountId, "CONTEXT_CLOSE");
+  } catch {}
   accountContexts.delete(accountId);
   accountPages.delete(accountId);
   headerCaches.delete(accountId);

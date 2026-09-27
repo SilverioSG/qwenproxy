@@ -643,3 +643,20 @@ dashboardApp.post("/v1/accounts/:id/probe-chat-shaping", async (c) => {
     );
   }
 });
+
+dashboardApp.get("/v1/accounts/:id/session-trace", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC READ: sanitized temporal session-transition
+  // trace (ring + baseline + first-failure window). No traffic, no writes.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { getSessionTrace } = await import("../services/session-tracer.js");
+    return c.json({ ok: true, ...getSessionTrace() });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});

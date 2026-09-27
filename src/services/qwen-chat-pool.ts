@@ -77,6 +77,12 @@ async function createQwenChatSession(
       rawLower.includes("unauthorized") ||
       rawLower.includes("permission to access")
     ) {
+      try {
+        const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
+        noteUpstreamAuthResult(accountId, "create-chat", response.ok ? 200 : response.status, true);
+      } catch {
+        // Tracing must never break flows.
+      }
       throw new QwenUpstreamError(
         `Qwen create chat unauthorized: ${raw.substring(0, 300)}`,
         "Unauthorized",
@@ -90,6 +96,12 @@ async function createQwenChatSession(
     );
   }
 
+  try {
+    const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
+    noteUpstreamAuthResult(accountId, "create-chat", 200, false);
+  } catch {
+    // Tracing must never break flows.
+  }
   return chatId;
 }
 

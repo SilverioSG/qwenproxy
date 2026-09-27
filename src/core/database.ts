@@ -356,6 +356,20 @@ export function saveAuthSession(
     session.tokenExpiresAt || null,
     session.capturedAt ?? Date.now(),
   );
+  try {
+    const capturedAt = session.capturedAt ?? Date.now();
+    void import("../services/session-tracer.ts")
+      .then((m) =>
+        m.traceSessionEvent(
+          accountId,
+          "DB_SESSION_WRITE",
+          `captured_at=${capturedAt}`,
+        ),
+      )
+      .catch(() => {});
+  } catch {
+    // Tracing must never break persistence.
+  }
 }
 
 export function getValidAuthSession(
@@ -372,7 +386,14 @@ export function getValidAuthSession(
     )
     .get(accountId) as any;
 
-  if (!row) return null;
+  if (!row) {
+    try {
+      void import("../services/session-tracer.ts").then((m) =>
+        m.traceSessionEvent(accountId, "DB_SESSION_READ", "miss"),
+      ).catch(() => {});
+    } catch {}
+    return null;
+  }
 
   const capturedAt = Number(row.captured_at) || 0;
   if (capturedAt <= 0 || Date.now() - capturedAt > maxAgeMs) {
@@ -392,6 +413,11 @@ export function getValidAuthSession(
     return null;
   }
 
+  try {
+    void import("../services/session-tracer.ts").then((m) =>
+      m.traceSessionEvent(accountId, "DB_SESSION_READ", `hit age=${Date.now() - capturedAt}`),
+    ).catch(() => {});
+  } catch {}
   return {
     accountId: row.account_id,
     cookie: row.cookie,
