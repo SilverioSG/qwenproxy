@@ -367,3 +367,15 @@ test("qwen-auth-diag: baseline gate ignores created/chat_id (2xx + no appFail co
   assert.ok(block.includes("if (status !== 200 || appFail)"));
   assert.ok(!block.includes("!created"));
 });
+
+test("qwen-auth-diag: bisect structure present with budget and confirm sequence", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const idx = src.indexOf("Binary search for a single causal header");
+  assert.ok(idx >= 0);
+  const block = src.slice(idx, idx + 3500);
+  assert.ok(block.includes("budget"));
+  assert.ok(block.includes("causalHeader"));
+  assert.ok(block.includes("minimalCausalSet"));
+  assert.ok(block.includes("interactionCausal"));
+  assert.ok(block.includes("confirmed = ok1 && bad2 && ok3"));
+});

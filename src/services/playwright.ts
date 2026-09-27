@@ -2421,6 +2421,15 @@ export async function probeLoginOnce(accountId: string): Promise<{
     createChat: { status: number; appFail: boolean; created: boolean };
   };
   snapAfterFull: unknown;
+  bisect: {
+    ran: boolean;
+    steps: Array<{ names: string[]; status: number; appFail: boolean }>;
+    causalHeader: string | null;
+    minimalCausalSet: string[] | null;
+    interactionCausal: boolean;
+    confirmed: boolean;
+    headerMeta: Array<{ name: string; hash: string; len: number }>;
+  };
 }> {
   const { getAccountCredentials } = await import("../core/accounts.ts");
   const creds = getAccountCredentials(accountId);
@@ -2563,6 +2572,134 @@ export async function probeLoginOnce(accountId: string): Promise<{
     fullExtra,
   );
   const snap2 = await takeSnap();
+  // Bisect the full extra-header set when minimal passes but full fails.
+  // Same page/context/cookies/session throughout; single headers first,
+  // then minimal interaction search. Bounded request budget.
+  const bisect: {
+    ran: boolean;
+    steps: Array<{ names: string[]; status: number; appFail: boolean }>;
+    causalHeader: string | null;
+    minimalCausalSet: string[] | null;
+    interactionCausal: boolean;
+    confirmed: boolean;
+    headerMeta: Array<{ name: string; hash: string; len: number }>;
+  } = {
+    ran: false,
+    steps: [],
+    causalHeader: null,
+    minimalCausalSet: null,
+    interactionCausal: false,
+    confirmed: false,
+    headerMeta: [],
+  };
+  const fnv = (v: string): string => {
+    let h1 = 0x811c9dc5;
+    for (let i = 0; i < v.length; i++) {
+      h1 ^= v.charCodeAt(i);
+      h1 = Math.imul(h1, 0x01000193);
+    }
+    return (h1 >>> 0).toString(16);
+  };
+  const extraNames = Object.keys(fullExtra);
+  for (const n of extraNames) {
+    bisect.headerMeta.push({ name: n, hash: fnv(fullExtra[n]), len: fullExtra[n].length });
+  }
+  try {
+    console.log(
+      `[Bisect ${accountId.slice(0, 8)}] headers=[${extraNames.join(",")}]`,
+    );
+  } catch {}
+  const pickHeaders = (
+    names: string[],
+  ): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const n of names) {
+      if (fullExtra[n] !== undefined) out[n] = fullExtra[n];
+    }
+    return out;
+  };
+  const testSubset = async (
+    names: string[],
+  ): Promise<{ status: number; appFail: boolean }> => {
+    const r = await runFetch(
+      "GET",
+      qwenUrl("/api/v2/users/user/settings"),
+      undefined,
+      pickHeaders(names),
+    );
+    return { status: r.status, appFail: r.appFail };
+  };
+  const isFail = (r: { status: number; appFail: boolean }): boolean =>
+    r.status === 401 || r.appFail;
+  const aSettingsOk =
+    s.status === 200 && !s.appFail;
+  const bSettingsFail = (() => {
+    const b = { status: bSettings.status, appFail: bSettings.appFail };
+    return isFail(b);
+  })();
+  if (aSettingsOk && bSettingsFail && extraNames.length > 0) {
+    bisect.ran = true;
+    // Binary search for a single causal header.
+    let candidates = [...extraNames];
+    let budget = 12;
+    const stack: string[][] = [candidates];
+    const confirmedSingles: string[] = [];
+    while (stack.length > 0 && budget > 0) {
+      const cur = stack.pop() as string[];
+      if (cur.length === 0) continue;
+      if (cur.length === 1) {
+        const r = await testSubset(cur);
+        bisect.steps.push({ names: [...cur], status: r.status, appFail: r.appFail });
+        budget -= 1;
+        if (isFail(r)) confirmedSingles.push(cur[0]);
+        continue;
+      }
+      const mid = Math.floor(cur.length / 2);
+      const left = cur.slice(0, mid);
+      const right = cur.slice(mid);
+      const rL = await testSubset(left);
+      bisect.steps.push({ names: [...left], status: rL.status, appFail: rL.appFail });
+      budget -= 1;
+      const rR = await testSubset(right);
+      bisect.steps.push({ names: [...right], status: rR.status, appFail: rR.appFail });
+      budget -= 1;
+      const fL = isFail(rL);
+      const fR = isFail(rR);
+      if (fL && !fR) stack.push(left);
+      else if (fR && !fL) stack.push(right);
+      else if (fL && fR) {
+        stack.push(left);
+        stack.push(right);
+      } else {
+        bisect.interactionCausal = true;
+      }
+    }
+    if (confirmedSingles.length === 1) {
+      bisect.causalHeader = confirmedSingles[0];
+      // Confirm: PASS -> FAIL -> PASS.
+      const p1 = await testSubset([]);
+      const p2 = await testSubset([confirmedSingles[0]]);
+      const p3 = await testSubset([]);
+      bisect.steps.push({ names: [], status: p1.status, appFail: p1.appFail });
+      bisect.steps.push({ names: [confirmedSingles[0]], status: p2.status, appFail: p2.appFail });
+      bisect.steps.push({ names: [], status: p3.status, appFail: p3.appFail });
+      const ok1 = p1.status === 200 && !p1.appFail;
+      const bad2 = isFail(p2);
+      const ok3 = p3.status === 200 && !p3.appFail;
+      bisect.confirmed = ok1 && bad2 && ok3;
+      bisect.minimalCausalSet = bisect.confirmed ? [confirmedSingles[0]] : null;
+    } else if (confirmedSingles.length > 1) {
+      bisect.minimalCausalSet = [...confirmedSingles];
+      bisect.confirmed = true;
+    }
+    try {
+      console.log(
+        `[Bisect ${accountId.slice(0, 8)}] causalHeader=${bisect.causalHeader} ` +
+          `interaction=${bisect.interactionCausal} confirmed=${bisect.confirmed} ` +
+          `steps=${bisect.steps.length}`,
+      );
+    } catch {}
+  }
   const stripSnap = (x: Awaited<ReturnType<typeof takeSnap>>) =>
     x
       ? {
@@ -2595,6 +2732,7 @@ export async function probeLoginOnce(accountId: string): Promise<{
       },
     },
     snapAfterFull: stripSnap(snap2),
+    bisect,
   };
 }
 
