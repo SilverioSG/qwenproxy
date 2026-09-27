@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import {
+  isCookieOnlyRoute,
+  stripExplicitAuth,
   extractBearerToken,
   bearerMatchesLiveToken,
   isUsableRefreshPayload,
@@ -136,4 +138,39 @@ test("qwen-auth-diag: in-page predicate mirrors isAppUnauthorized markers", () =
   for (const marker of ["success === false", "Unauthorized", "401", "appUnauthorized"]) {
     assert.ok(block.includes(marker), `in-page predicate missing: ${marker}`);
   }
+});
+
+test("qwen-auth-diag: cookie-only routes strip Authorization (both cases)", () => {
+  const withAuth = { Authorization: "Bearer x", authorization: "Bearer x", Cookie: "a=b" };
+  const stripped = stripExplicitAuth(withAuth);
+  assert.ok(!("Authorization" in stripped) && !("authorization" in stripped));
+  assert.equal(stripped["Cookie"], "a=b");
+  assert.equal(withAuth["Authorization"], "Bearer x");
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/chats/new"), true);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings"), true);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings/update"), true);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/files/getstsToken"), false);
+  assert.equal(isCookieOnlyRoute("https://auth.qwen.ai/api/v2/auths/refresh"), false);
+});
+
+test("qwen-auth-diag: in-page transport mirrors cookie-only routing", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const start = src.indexOf("Cookie-only routes (chat + chat personalization)");
+  assert.ok(start >= 0);
+  const block = src.slice(start, start + 1500);
+  assert.ok(block.includes("/api/v2/chats/new"));
+  assert.ok(block.includes("/api/v2/users/user/settings"));
+  assert.ok(block.includes('delete effHeaders["authorization"]'));
+  assert.ok(block.includes('delete effHeaders["Authorization"]'));
+  assert.ok(block.includes("credentials:"));
+});
+
+test("qwen-auth-diag: heal performs at most one retry (no loop)", () => {
+  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  const start = src.indexOf("Silent in-page token refresh + single retry");
+  const start2 = src.indexOf("single retry on auth failure");
+  const anchor = start >= 0 ? start : start2;
+  assert.ok(anchor >= 0);
+  const block = src.slice(anchor, anchor + 4000);
+  assert.ok(!/while\s*\(|for\s*\(.*?retries/i.test(block));
 });

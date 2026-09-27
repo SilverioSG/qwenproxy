@@ -947,6 +947,10 @@ export interface BrowserAuthDiag {
   authMatchesLive: boolean | null;
   /** Which credential won: live token, cookies only, post-heal, or none. */
   authSource: "live" | "cookie-only" | "healed" | "none";
+  /** True when this request matched a cookie-only chat route. */
+  cookieOnlyRoute: boolean;
+  /** Explicit Authorization actually sent on the effective request. */
+  explicitAuthPresent: boolean;
   /** First response carried application-level Unauthorized (HTTP 200 body). */
   firstAppAuthFailure: boolean;
   refreshAttempted: boolean;
@@ -982,6 +986,29 @@ export function bearerMatchesLiveToken(
     diff |= headerBearer.charCodeAt(i) ^ liveToken.charCodeAt(i);
   }
   return diff === 0;
+}
+
+/**
+ * Chat routes that must use cookie/session-centric browser auth: NO explicit
+ * Authorization header (mirrors the reference client). Pure and unit-tested;
+ * the in-page transport mirrors this predicate inline (bundler __name
+ * constraints forbid importing it there) with a consistency test below.
+ */
+export function isCookieOnlyRoute(url: string): boolean {
+  return (
+    url.includes("/api/v2/chats/new") ||
+    url.includes("/api/v2/users/user/settings")
+  );
+}
+
+/** Return headers without any Authorization variant (new object). */
+export function stripExplicitAuth(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...headers };
+  delete out["authorization"];
+  delete out["Authorization"];
+  return out;
 }
 
 /** Structural usability of an auth-refresh payload (no values inspected). */
@@ -1110,6 +1137,8 @@ export async function requestQwenTextInBrowser(
           refreshErrorClass: null,
           retried: false,
           retryStatus: 0,
+          cookieOnlyRoute: false,
+          explicitAuthPresent: false,
         };
         try {
           let liveToken: string | null = null;
@@ -1120,14 +1149,23 @@ export async function requestQwenTextInBrowser(
             liveToken = null;
           }
           diag.liveTokenPresent = liveToken !== null;
-          // Effective auth policy: prefer the LIVE token; omit Authorization
-          // entirely when there is none (cookies govern). Never trust a
-          // cached bearer over the live session.
+          // Cookie-only routes (chat + chat personalization): reproduce the
+          // cookie/session-centric behavior of the reference client — NO
+          // explicit Authorization; credentials:include + live browser
+          // cookies govern. All other routes keep current behavior.
+          const cookieOnlyRoute =
+            url.includes("/api/v2/chats/new") ||
+            url.includes("/api/v2/users/user/settings");
+          diag.cookieOnlyRoute = cookieOnlyRoute;
           const effHeaders: Record<string, string> = { ...headers };
           const hadCachedAuth = Boolean(
             effHeaders["authorization"] || effHeaders["Authorization"],
           );
-          if (liveToken) {
+          if (cookieOnlyRoute) {
+            delete effHeaders["authorization"];
+            delete effHeaders["Authorization"];
+            diag.authSource = hadCachedAuth ? "cookie-only" : "none";
+          } else if (liveToken) {
             effHeaders["authorization"] = `Bearer ${liveToken}`;
             effHeaders["Authorization"] = `Bearer ${liveToken}`;
             diag.authSource = "live";
@@ -1136,6 +1174,9 @@ export async function requestQwenTextInBrowser(
             delete effHeaders["Authorization"];
             diag.authSource = hadCachedAuth ? "cookie-only" : "none";
           }
+          diag.explicitAuthPresent =
+            Boolean(effHeaders["authorization"]) ||
+            Boolean(effHeaders["Authorization"]);
           const sentRaw =
             effHeaders["authorization"] || effHeaders["Authorization"] || "";
           const sentMatch = sentRaw.match(/^\s*Bearer\s+(\S+)\s*$/i);
@@ -1201,10 +1242,12 @@ export async function requestQwenTextInBrowser(
                   diag.refreshUpdatedLs = true;
                   document.cookie = `token=${encodeURIComponent(freshTok)}; path=/; domain=.qwen.ai; max-age=31536000`;
                   diag.refreshUpdatedCookie = true;
-                  effHeaders["authorization"] = `Bearer ${freshTok}`;
-                  effHeaders["Authorization"] = `Bearer ${freshTok}`;
-                  diag.refreshUpdatedAuth = true;
-                  diag.authSource = "healed";
+                  if (!cookieOnlyRoute) {
+                    effHeaders["authorization"] = `Bearer ${freshTok}`;
+                    effHeaders["Authorization"] = `Bearer ${freshTok}`;
+                    diag.refreshUpdatedAuth = true;
+                    diag.authSource = "healed";
+                  }
                   response = await fetch(url, {
                     method,
                     credentials: "include",
@@ -1220,7 +1263,21 @@ export async function requestQwenTextInBrowser(
                   } catch {
                     // Keep first body on retry read failure.
                   }
-                  diag.authMatchesLive = true;
+                  try {
+                    const t3 = localStorage.getItem("token");
+                    const live3 =
+                      typeof t3 === "string" && t3.length > 0 ? t3 : null;
+                    const sRaw3 =
+                      effHeaders["authorization"] ||
+                      effHeaders["Authorization"] ||
+                      "";
+                    const sMatch3 = sRaw3.match(/^\s*Bearer\s+(\S+)\s*$/i);
+                    const sent3 = sMatch3 ? sMatch3[1] : null;
+                    diag.authMatchesLive =
+                      sent3 && live3 ? sent3 === live3 : null;
+                  } catch {
+                    diag.authMatchesLive = null;
+                  }
                 }
               }
             } catch (err) {
@@ -1276,6 +1333,8 @@ export async function requestQwenTextInBrowser(
     console.log(
       `[QwenAuth] account=${id8} path=${path} attempt=1 ` +
         `authSource=${d ? d.authSource : "unknown"} hasAuth=${hasAuth} ` +
+        `explicitAuth=${d ? String(d.explicitAuthPresent) : "unknown"} ` +
+        `cookieOnly=${d ? String(d.cookieOnlyRoute) : "unknown"} ` +
         `matchesLive=${d ? String(d.authMatchesLive) : "unknown"} ` +
         `liveToken=${d ? String(d.liveTokenPresent) : "unknown"} ` +
         `status=${response.status}` +
