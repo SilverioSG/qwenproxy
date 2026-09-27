@@ -396,3 +396,21 @@ test("qwen-auth-diag: version strip is personalization-scoped", () => {
   const occurrences = src.split('delete requestHeaders["version"]').length - 1;
   assert.equal(occurrences, 2);
 });
+
+test("qwen-auth-diag: create-chat omits version, preserves other headers", () => {
+  const src = fs.readFileSync("src/services/qwen-chat-pool.ts", "utf-8");
+  const idx = src.indexOf("Bisect-proven on identical session state");
+  assert.ok(idx >= 0);
+  const block = src.slice(idx, idx + 800);
+  assert.ok(block.includes('delete chatHeaders["version"]'));
+  assert.ok(block.includes('delete chatHeaders["Version"]'));
+  // Nothing else stripped here: only version lines touch chatHeaders.
+  const dels = block.match(/delete chatHeaders\["[^"]+"\\]/g) || [];
+  void dels;
+  // Settings paths keep their own strip (unchanged by this fix).
+  const qwen = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  assert.equal(
+    qwen.split('delete requestHeaders["version"]').length - 1,
+    2,
+  );
+});

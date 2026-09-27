@@ -28,13 +28,20 @@ async function createQwenChatSession(
     return process.env.TEST_SESSION_ID || "mock-session";
   }
 
+  const chatHeaders = buildCapturedQwenHeaders(headers, {
+    referer: qwenUrl("/"),
+  });
+  // Bisect-proven on identical session state: the cached `version` header
+  // turns create-chat into appUnauthorized; cookie/session material governs.
+  // Scoped to chats/new only; personalization strips it at its own call
+  // sites, everything else keeps current behavior.
+  delete chatHeaders["version"];
+  delete chatHeaders["Version"];
   const response = await requestQwenTextInBrowser(
     accountId,
     "POST",
     "/api/v2/chats/new",
-    buildCapturedQwenHeaders(headers, {
-      referer: qwenUrl("/"),
-    }),
+    chatHeaders,
     JSON.stringify(buildChatNewBody(model, chatMode)),
     { referrer: qwenUrl("/") },
   );
