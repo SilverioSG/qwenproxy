@@ -37,10 +37,15 @@ export interface SessionSnapshot {
   ts: number;
   contextId: string | null;
   pageId: string | null;
+  url: string | null;
+  origin: string | null;
   tokenHash: string | null;
   tokenPresent: boolean;
   tokenIat: number | null;
   tokenExp: number | null;
+  lsKeys: string[] | null;
+  lsTokenHash: string | null;
+  ssKeys: string[] | null;
   cookieNameHash: string | null;
   cookieCount: number | null;
   capturedAt: number | null;
@@ -146,14 +151,83 @@ export async function snapshotSessionState(
     ts: Date.now(),
     contextId: handles.context ? traceContextId(handles.context) : null,
     pageId: handles.page ? tracePageId(handles.page as object) : null,
+    url: null,
+    origin: null,
     tokenHash: null,
     tokenPresent: false,
     tokenIat: null,
     tokenExp: null,
+    lsKeys: null,
+    lsTokenHash: null,
+    ssKeys: null,
     cookieNameHash: null,
     cookieCount: null,
     capturedAt: null,
   };
+  try {
+    const pg = handles.page as unknown as {
+      url?: () => string;
+      evaluate?: (fn: () => unknown) => Promise<unknown>;
+    } | null;
+    if (pg) {
+      try {
+        const u = typeof pg.url === "function" ? pg.url() : "";
+        if (u) {
+          snap.url = u.split("?")[0].slice(0, 80);
+          const m = u.match(/^https?:\/\/[^/]+/);
+          snap.origin = m ? m[0] : null;
+        }
+      } catch {
+        // Best effort.
+      }
+      try {
+        if (typeof pg.evaluate === "function") {
+          const dom = (await pg.evaluate((): unknown => {
+            try {
+              const ls: string[] = [];
+              for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k) ls.push(k);
+              }
+              ls.sort();
+              const ss: string[] = [];
+              for (let i = 0; i < sessionStorage.length; i++) {
+                const k = sessionStorage.key(i);
+                if (k) ss.push(k);
+              }
+              ss.sort();
+              const t = localStorage.getItem("token");
+              let th: string | null = null;
+              if (typeof t === "string" && t.length > 0) {
+                let h1 = 0x811c9dc5;
+                for (let i = 0; i < t.length; i++) {
+                  h1 ^= t.charCodeAt(i);
+                  h1 = Math.imul(h1, 0x01000193);
+                }
+                th = (h1 >>> 0).toString(16);
+              }
+              return { ls, ss, th };
+            } catch {
+              return null;
+            }
+          }).catch(() => null)) as {
+            ls?: string[];
+            ss?: string[];
+            th?: string | null;
+          } | null;
+          if (dom) {
+            snap.lsKeys = Array.isArray(dom.ls) ? dom.ls.slice(0, 40) : null;
+            snap.ssKeys = Array.isArray(dom.ss) ? dom.ss.slice(0, 40) : null;
+            snap.lsTokenHash = typeof dom.th === "string" ? dom.th : null;
+          }
+        }
+      } catch {
+        // Best effort.
+      }
+    }
+  } catch {
+    // Best effort.
+  }
   try {
     if (handles.context && typeof handles.context.cookies === "function") {
       const cookies = await handles.context.cookies().catch(() => []);

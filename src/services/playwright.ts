@@ -2414,6 +2414,13 @@ export async function probeLoginOnce(accountId: string): Promise<{
   models: { status: number; appFail: boolean };
   settings: { status: number; appFail: boolean };
   createChat: { status: number; appFail: boolean; created: boolean };
+  snapPostLogin: unknown;
+  snapAfterMinimal: unknown;
+  fullHeaders: {
+    settings: { status: number; appFail: boolean };
+    createChat: { status: number; appFail: boolean; created: boolean };
+  };
+  snapAfterFull: unknown;
 }> {
   const { getAccountCredentials } = await import("../core/accounts.ts");
   const creds = getAccountCredentials(accountId);
@@ -2441,19 +2448,30 @@ export async function probeLoginOnce(accountId: string): Promise<{
     method: string,
     url: string,
     body?: string,
+    extraHeaders?: Record<string, string>,
   ): Promise<{ status: number; appFail: boolean; created: boolean }> => {
     try {
       const r = await page.evaluate(
-        async (args: { method: string; url: string; body?: string }) => {
+        async (args: {
+          method: string;
+          url: string;
+          body?: string;
+          extra?: Array<{ name: string; value: string }>;
+        }) => {
           try {
+            const hh: Record<string, string> = {
+              accept: "application/json, text/plain, */*",
+              "content-type": "application/json",
+              source: "web",
+            };
+            const extra = args.extra || [];
+            for (let i = 0; i < extra.length; i++) {
+              hh[extra[i].name] = extra[i].value;
+            }
             const resp = await fetch(args.url, {
               method: args.method,
               credentials: "include",
-              headers: {
-                accept: "application/json, text/plain, */*",
-                "content-type": "application/json",
-                source: "web",
-              },
+              headers: hh,
               body: args.body,
               signal: AbortSignal.timeout(25000),
             });
@@ -2478,13 +2496,38 @@ export async function probeLoginOnce(accountId: string): Promise<{
             return { status: 0, appFail: false, created: false };
           }
         },
-        { method, url, body },
+        {
+          method,
+          url,
+          body,
+          extra: extraHeaders
+            ? Object.keys(extraHeaders).map((k) => ({
+                name: k,
+                value: extraHeaders[k],
+              }))
+            : [],
+        },
       );
       return r;
     } catch {
       return { status: 0, appFail: false, created: false };
     }
   };
+  const { snapshotSessionState: snapState } = await import(
+    "./session-tracer.ts"
+  ).catch(() => ({ snapshotSessionState: null as never }));
+  const takeSnap = async () => {
+    try {
+      if (!snapState) return null;
+      return await snapState(accountId, {
+        context: page.context(),
+        page,
+      }).catch(() => null);
+    } catch {
+      return null;
+    }
+  };
+  const snap0 = await takeSnap();
   const m = await runFetch("GET", qwenUrl("/api/models"));
   result.models = { status: m.status, appFail: m.appFail };
   const s = await runFetch("GET", qwenUrl("/api/v2/users/user/settings"));
@@ -2495,7 +2538,64 @@ export async function probeLoginOnce(accountId: string): Promise<{
     JSON.stringify({ chatId: "", models: ["qwen3.8-max"], project_id: "", timestamp: Date.now() }),
   );
   result.createChat = cc;
-  return result;
+  const snap1 = await takeSnap();
+  // B: same page, full pipeline header set from the live runtime cache
+  // (minus cookie/Authorization values, which stay server-side; only names
+  // and outcomes are reported).
+  const cachedHeaders = headerCaches.get(accountId)?.headers || {};
+  const fullExtra: Record<string, string> = {};
+  for (const k of Object.keys(cachedHeaders)) {
+    const l = k.toLowerCase();
+    if (l === "cookie" || l === "authorization" || l === "user-agent") continue;
+    const v = cachedHeaders[k];
+    if (typeof v === "string" && v.length > 0) fullExtra[k] = v;
+  }
+  const bSettings = await runFetch(
+    "GET",
+    qwenUrl("/api/v2/users/user/settings"),
+    undefined,
+    fullExtra,
+  );
+  const bCreate = await runFetch(
+    "POST",
+    qwenUrl("/api/v2/chats/new"),
+    JSON.stringify({ chatId: "", models: ["qwen3.8-max"], project_id: "", timestamp: Date.now() }),
+    fullExtra,
+  );
+  const snap2 = await takeSnap();
+  const stripSnap = (x: Awaited<ReturnType<typeof takeSnap>>) =>
+    x
+      ? {
+          contextId: x.contextId,
+          pageId: x.pageId,
+          url: x.url,
+          origin: x.origin,
+          tokenHash: x.tokenHash,
+          tokenPresent: x.tokenPresent,
+          tokenIat: x.tokenIat,
+          tokenExp: x.tokenExp,
+          lsKeys: x.lsKeys,
+          lsTokenHash: x.lsTokenHash,
+          ssKeys: x.ssKeys,
+          cookieNameHash: x.cookieNameHash,
+          cookieCount: x.cookieCount,
+          capturedAt: x.capturedAt,
+        }
+      : null;
+  return {
+    ...result,
+    snapPostLogin: stripSnap(snap0),
+    snapAfterMinimal: stripSnap(snap1),
+    fullHeaders: {
+      settings: { status: bSettings.status, appFail: bSettings.appFail },
+      createChat: {
+        status: bCreate.status,
+        appFail: bCreate.appFail,
+        created: bCreate.created,
+      },
+    },
+    snapAfterFull: stripSnap(snap2),
+  };
 }
 
 function topKeysOf(v: unknown): string[] {

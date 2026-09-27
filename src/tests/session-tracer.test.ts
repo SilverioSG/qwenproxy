@@ -146,8 +146,10 @@ test("session-tracer: endpoint shape carries baseline+firstFailure+classificatio
 test("session-tracer: classifyTransition distinguishes A/B/C/D", async () => {
   const { classifyTransition: classify } = await import("../services/session-tracer.ts");
   const base = {
-    ts: 1, contextId: "ctx1", pageId: "pg1", tokenHash: "aa", tokenPresent: true,
-    tokenIat: 1, tokenExp: 9999999999, cookieNameHash: "ck", cookieCount: 3, capturedAt: 100,
+    ts: 1, contextId: "ctx1", pageId: "pg1", url: "https://chat.qwen.ai/", origin: "https://chat.qwen.ai",
+    tokenHash: "aa", tokenPresent: true,
+    tokenIat: 1, tokenExp: 9999999999, lsKeys: ["token"], lsTokenHash: "aa", ssKeys: [],
+    cookieNameHash: "ck", cookieCount: 3, capturedAt: 100,
   };
   const same = { ...base, ts: 2 };
   const diffTok = { ...same, tokenHash: "bb" };
@@ -190,4 +192,46 @@ test("session-tracer: superseded pattern helper (failure gen < max gen)", async 
   assert.equal(isSuperseded(3, 3), false);
   assert.equal(isSuperseded(null, 3), false);
   void mod;
+});
+
+test("session-tracer: probeLoginOnce exposes A/B comparison surface", async () => {
+  const mod = await import("../services/playwright.ts");
+  assert.equal(typeof mod.probeLoginOnce, "function");
+  const src = (await import("node:fs")).readFileSync(
+    "src/services/playwright.ts",
+    "utf-8",
+  );
+  const idx = src.indexOf("snapAfterFull");
+  assert.ok(idx >= 0);
+  const block = src.slice(idx - 200, idx + 1200);
+  assert.ok(block.includes("fullHeaders"));
+  // B-headers must exclude cookie/Authorization values by construction.
+  assert.ok(
+    block.includes('"cookie"') || src.includes('l === "cookie"'),
+  );
+});
+
+test("session-tracer: snapshot carries url/origin/storage keys without values", async () => {
+  const { snapshotSessionState } = await import("../services/session-tracer.ts");
+  const fakePage = {
+    url: () => "https://chat.qwen.ai/c/abc123?x=1",
+    evaluate: async () => ({
+      ls: ["token", "theme"],
+      ss: [],
+      th: "deadbeef",
+    }),
+    isClosed: () => false,
+  };
+  const snap = await snapshotSessionState("0b6a5a7b-5385-d8fe-9e98-d78b32d80be6", {
+    context: { cookies: async () => [] },
+    page: fakePage,
+  });
+  assert.ok(snap);
+  assert.equal(snap.url, "https://chat.qwen.ai/c/abc123");
+  assert.equal(snap.origin, "https://chat.qwen.ai");
+  assert.deepEqual(snap.lsKeys, ["token", "theme"]);
+  assert.equal(snap.lsTokenHash, "deadbeef");
+  assert.deepEqual(snap.ssKeys, []);
+  const blob = JSON.stringify(snap);
+  assert.ok(!blob.includes("abc123?x=1"));
 });
