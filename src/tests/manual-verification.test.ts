@@ -52,6 +52,13 @@ function installHarness(opts: {
   launchLogins?: boolean[];
   /** Reason reported when the probe is not ok. */
   probeReason?: string;
+  /** Controls the mock persisted-session store. */
+  persist?: {
+    initialCapturedAt?: number;
+    saveThrows?: boolean;
+    dontAdvance?: boolean;
+    validateStatus?: number;
+  };
   calls?: { capture: string[]; clearedCooldown: string[]; markedBusy: string[]; clearedBusy: string[]; closedHeadless: string[]; launched: Array<Record<string, string>> };
 }) {
   const calls = opts.calls ?? { capture: [], clearedCooldown: [], markedBusy: [], clearedBusy: [], closedHeadless: [], launched: [] };
@@ -111,6 +118,10 @@ function installHarness(opts: {
     return { page, fakeContext, loginForThis, tick: () => { polls += 1; } };
   };
   let current: { page: { isClosed: () => boolean; goto: () => Promise<void> }; fakeContext: { closed: boolean; close: () => Promise<void> }; loginForThis: boolean; tick: () => void } | null = null;
+  let meta = {
+    exists: (opts.persist?.initialCapturedAt ?? 0) > 0,
+    capturedAt: opts.persist?.initialCapturedAt ?? 0,
+  };
   setManualVerificationDeps({
     launchBrowser: async (profileDir: string, env: Record<string, string>) => {
       calls.launched.push({ profileDir, DISPLAY: env.DISPLAY ?? "", XAUTHORITY: env.XAUTHORITY ?? "" });
@@ -155,6 +166,22 @@ function installHarness(opts: {
     clearCooldown: async (id: string) => {
       calls.clearedCooldown.push(id);
     },
+    unmarkReady: async () => {},
+    readPersistedMeta: async () => ({ ...meta }),
+    snapshotVisible: async () => ({
+      cookie: "token=mock-jwt; acw_tc=mock",
+      userAgent: "mock-ua",
+      bxV: "2.5.37",
+      bxUa: "mock-bx-ua",
+      bxUmidtoken: "mock-bx-umid",
+      capturedAt: Date.now(),
+    }),
+    saveSession: async () => {
+      if (opts.persist?.saveThrows) throw new Error("db locked");
+      if (opts.persist?.dontAdvance) return;
+      meta = { exists: true, capturedAt: Date.now() };
+    },
+    validateLive: async () => ({ status: opts.persist?.validateStatus ?? 200 }),
   });
   return {
     calls,
@@ -414,7 +441,7 @@ test("manual verification: prompt/response content never surfaces in status", as
   assert.ok(!JSON.stringify(st).includes("SECRET-PROMPT"));
 });
 
-test("manual verification: login probe false/timeout/destroyed + valid chat \u2192 verified", async () => {
+test("manual verification: login probe false/timeout/destroyed + valid chat → verified", async () => {
   for (const reason of ["auths-status", "timeout", "context-destroyed"]) {
     const { calls, pages, emit } = installHarness({ loggedIn: false, probeReason: reason });
     await startManualVerification(TEST_ID);
@@ -426,7 +453,7 @@ test("manual verification: login probe false/timeout/destroyed + valid chat \u21
   }
 });
 
-test("manual verification: pending body + close \u2192 grace; valid during grace \u2192 verified", async () => {
+test("manual verification: pending body + close → grace; valid during grace → verified", async () => {
   const { calls, emit, closeCurrent } = installHarness({ loggedIn: false });
   let resolveBody: ((body: string) => void) | null = null;
   const gate = new Promise<string>((resolve) => {
@@ -452,7 +479,7 @@ test("manual verification: pending body + close \u2192 grace; valid during grace
   assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
 });
 
-test("manual verification: pending body + close \u2192 grace expires \u2192 cancelled", async () => {
+test("manual verification: pending body + close → grace expires → cancelled", async () => {
   const { calls, emit, closeCurrent } = installHarness({ loggedIn: false });
   let rejectBody: ((err: unknown) => void) | null = null;
   const gate = new Promise<string>((_, reject) => {
@@ -475,6 +502,58 @@ test("manual verification: pending body + close \u2192 grace expires \u2192 canc
   assert.deepEqual(calls.clearedCooldown, []);
   assert.deepEqual(calls.clearedBusy, [TEST_ID]);
 });
+test("manual verification: save throws → failed, never verified", async () => {
+  const { emit } = installHarness({ loggedIn: false, persist: { saveThrows: true } });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+});
+
+test("manual verification: row does not advance → failed", async () => {
+  const { emit } = installHarness({
+    loggedIn: false,
+    persist: { initialCapturedAt: Date.now() - 7200000, dontAdvance: true },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+});
+
+test("manual verification: stale row + fresh persist + settings 200 → verified", async () => {
+  const { calls, emit } = installHarness({
+    loggedIn: false,
+    persist: { initialCapturedAt: Date.now() - 7200000, validateStatus: 200 },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+});
+
+test("manual verification: fresh persist + settings 401 → failed, cooldown intact", async () => {
+  const { calls, emit } = installHarness({
+    loggedIn: false,
+    persist: { validateStatus: 401 },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.deepEqual(calls.clearedCooldown, []);
+  assert.deepEqual(calls.clearedBusy, [TEST_ID]);
+});
+
+test("manual verification: fresh persist + settings 403 → failed, cooldown intact", async () => {
+  const { calls, emit } = installHarness({
+    loggedIn: false,
+    persist: { validateStatus: 403 },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.deepEqual(calls.clearedCooldown, []);
+});
+
+
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {
   const res = resolveManualDisplay() as { display?: string; xauthority?: string; error?: string };
   if ("error" in res && res.error) {

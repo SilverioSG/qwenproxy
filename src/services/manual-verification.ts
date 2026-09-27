@@ -49,6 +49,8 @@ const POLL_INTERVAL_MS = 2500;
 const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
 const PROFILE_LOCK_WAIT_MS = 15000;
 const CLOSE_GRACE_MS = 4000;
+// A persisted row only counts as fresh if written by this flow just now.
+const PERSIST_FRESH_WINDOW_MS = 30000;
 
 const HEADED_CHROME_PATH =
   "/home/silver/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome";
@@ -137,6 +139,41 @@ const deps: {
   initHeadless: (account: never) => Promise<void>;
   capture: (accountId: string) => Promise<void>;
   clearCooldown: (accountId: string) => Promise<void>;
+  unmarkReady: (accountId: string) => Promise<void>;
+  readPersistedMeta: (
+    accountId: string,
+  ) => Promise<{ exists: boolean; capturedAt: number }>;
+  snapshotVisible: (
+    page: Page,
+    context: BrowserContext,
+  ) => Promise<{
+    cookie: string;
+    userAgent: string;
+    bxV?: string;
+    bxUa?: string;
+    bxUmidtoken?: string;
+    secChUa?: string;
+    secChUaMobile?: string;
+    secChUaPlatform?: string;
+    version?: string;
+    tokenExpiresAt?: number;
+  } | null>;
+  saveSession: (
+    accountId: string,
+    session: {
+      cookie: string;
+      userAgent: string;
+      bxV?: string;
+      bxUa?: string;
+      bxUmidtoken?: string;
+      secChUa?: string;
+      secChUaMobile?: string;
+      secChUaPlatform?: string;
+      version?: string;
+      tokenExpiresAt?: number;
+    },
+  ) => Promise<void>;
+  validateLive: (accountId: string) => Promise<{ status: number }>;
 } = {
   launchBrowser: defaultBrowserLauncher,
   probeLogin: async (page: Page, timeoutMs: number) => {
@@ -203,6 +240,127 @@ const deps: {
   clearCooldown: async (accountId: string) => {
     const { clearAccountCooldown } = await import("../core/account-manager.ts");
     clearAccountCooldown(accountId);
+  },
+  unmarkReady: async (accountId: string) => {
+    const { unmarkAccountHeadersReady } = await import(
+      "../core/account-manager.ts"
+    );
+    unmarkAccountHeadersReady(accountId);
+  },
+  readPersistedMeta: async (accountId: string) => {
+    // Metadata only: existence + captured_at. Never cookies or tokens.
+    const { getDatabase } = await import("../core/database.ts");
+    const row = getDatabase()
+      .prepare(
+        "SELECT captured_at FROM qwen_auth_sessions WHERE account_id = ?",
+      )
+      .get(accountId) as { captured_at?: unknown } | undefined;
+    const capturedAt = Number(row?.captured_at) || 0;
+    return { exists: capturedAt > 0, capturedAt };
+  },
+  snapshotVisible: async (page: Page, context: BrowserContext) => {
+    // Fresh material from the context that just proved a real chat. Values
+    // stay in memory and go straight to saveAuthSession; only names/counts
+    // are ever logged by callers (which log nothing here at all).
+    const cookies: Array<{ name: string; value: string }> =
+      await context.cookies();
+    if (cookies.length === 0) return null;
+    const byName = new Map(cookies.map((c) => [c.name, c.value]));
+    if (!byName.get("token")) return null;
+    const cookie = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    let userAgent = "";
+    try {
+      userAgent = await page.evaluate(() => navigator.userAgent);
+    } catch {
+      userAgent = "";
+    }
+    let secChUa: string | undefined;
+    let secChUaMobile: string | undefined;
+    let secChUaPlatform: string | undefined;
+    try {
+      const hints = await page.evaluate(() => {
+        const ud = (navigator as unknown as { userAgentData?: unknown }).userAgentData as
+          | {
+              brands?: Array<{ brand: string; version: string }>;
+              mobile?: boolean;
+              platform?: string;
+            }
+          | undefined;
+        if (!ud || !Array.isArray(ud.brands)) return null;
+        return {
+          secChUa: ud.brands
+            .map((b) => `"${b.brand}";v="${b.version}"`)
+            .join(", "),
+          secChUaMobile: ud.mobile ? "?1" : "?0",
+          secChUaPlatform: ud.platform ? `"${ud.platform}"` : undefined,
+        };
+      });
+      secChUa = hints?.secChUa;
+      secChUaMobile = hints?.secChUaMobile;
+      secChUaPlatform = hints?.secChUaPlatform;
+    } catch {
+      // Client hints are optional; restore tolerates their absence.
+    }
+    let version: string | undefined;
+    try {
+      const { getQwenWebVersion } = await import("./qwen-headers.ts");
+      version = getQwenWebVersion() || undefined;
+    } catch {
+      version = undefined;
+    }
+    let tokenExpiresAt: number | undefined;
+    try {
+      const { parseJwtExpiry } = await import("../utils/jwt.ts");
+      tokenExpiresAt = parseJwtExpiry(cookie) || undefined;
+    } catch {
+      tokenExpiresAt = undefined;
+    }
+    return {
+      cookie,
+      userAgent,
+      bxV: byName.get("bx-v") || "2.5.37",
+      bxUa: byName.get("bx-ua") || "",
+      bxUmidtoken: byName.get("bx-umidtoken") || "",
+      secChUa,
+      secChUaMobile,
+      secChUaPlatform,
+      version,
+      tokenExpiresAt,
+    };
+  },
+  saveSession: async (accountId, session) => {
+    const { saveAuthSession } = await import("../core/database.ts");
+    saveAuthSession(accountId, { ...session, capturedAt: Date.now() });
+  },
+  validateLive: async (accountId: string) => {
+    // Authoritative check against the OPERATIONAL (headless) context: the
+    // same browser transport production will use. Status only, no bodies.
+    const { getBasicHeaders } = await import("./playwright.ts");
+    const {
+      buildCapturedQwenHeaders,
+      requestQwenTextInBrowser,
+    } = await import("./qwen.ts");
+    const { qwenUrl } = await import("./qwen-url.ts");
+    const basic = await getBasicHeaders(accountId);
+    const headers = buildCapturedQwenHeaders(
+      {
+        cookie: basic.cookie,
+        "user-agent": basic.userAgent,
+        "bx-v": basic.bxV,
+        "bx-ua": basic.bxUa,
+        "bx-umidtoken": basic.bxUmidtoken,
+      },
+      { referer: qwenUrl("/settings/personalization") },
+    );
+    const res = await requestQwenTextInBrowser(
+      accountId,
+      "GET",
+      "/api/v2/users/user/settings",
+      headers,
+      undefined,
+      { referrer: qwenUrl("/settings/personalization") },
+    );
+    return { status: res.status };
   },
 };
 
@@ -327,9 +485,6 @@ async function runVerification(accountId: string): Promise<void> {
     entry.finished = true;
     setStatus(entry, state, detail);
   };
-  const markExpectedClose = (): void => {
-    entry.expectedClose = true;
-  };
 
   try {
     const account = await deps.findAccount(accountId);
@@ -342,6 +497,9 @@ async function runVerification(accountId: string): Promise<void> {
       return;
     }
     await deps.markBusy(accountId);
+    // Hygiene: a stale row must never surface as Ready during this flow.
+    // Ready is re-earned only through the gated success path below.
+    await deps.unmarkReady(accountId).catch(() => {});
 
     if (!deps.headedChromeExists()) {
       finish("failed", "Headed Chromium not installed");
@@ -391,6 +549,12 @@ async function runVerification(accountId: string): Promise<void> {
     const chat: { evidence: "none" | "streaming" | "done" } = { evidence: "none" };
     const evidence = (): "none" | "streaming" | "done" => chat.evidence;
     let pendingChatClassification = 0;
+    let pendingSnapshot: {
+      at: number;
+      session: NonNullable<
+        Awaited<ReturnType<typeof deps.snapshotVisible>>
+      >;
+    } | null = null;
     const onResponse: ChatResponseListener = (res) => {
       // Synchronous header part only: url/method/status. Never blocks.
       let status = 0;
@@ -413,6 +577,19 @@ async function runVerification(accountId: string): Promise<void> {
       if (evidence() === "none") {
         chat.evidence = "streaming";
         logEvent(entry, accountId, "chat=streaming");
+        // Opportunistic snapshot at streaming time: cookies are stable once
+        // the challenge is solved and the send is accepted. Memory-only,
+        // never logged; lets the grace path persist genuinely fresh material
+        // even if the window closes before done-classification.
+        void (async () => {
+          try {
+            if (entry.finished || context === null) return;
+            const s = await deps.snapshotVisible(page, context);
+            if (s) pendingSnapshot = { at: Date.now(), session: s };
+          } catch {
+            // Best-effort; the gated path re-checks freshness.
+          }
+        })();
       }
       // Controlled body classification: tracked so close/timeout can wait
       // for it briefly instead of concluding on a pending read. Content is
@@ -519,9 +696,8 @@ async function runVerification(accountId: string): Promise<void> {
     if (evidence() === "done") {
       entry.finalizing = true;
       setStatus(entry, "verifying", "Chat verified, capturing session");
-      await closeVisible(entry, context);
+      if (!(await completeSuccess(entry, accountId, { page, context }, pendingSnapshot))) return;
       context = null;
-      if (!(await completeSuccess(entry, accountId))) return;
       return;
     }
     if (sawClose) {
@@ -541,9 +717,10 @@ async function runVerification(accountId: string): Promise<void> {
           logEvent(entry, accountId, "close-grace-success");
           entry.finalizing = true;
           setStatus(entry, "verifying", "Chat verified, capturing session");
-          await closeVisible(entry, context);
+          // Visible context already closed: fall back to the opportunistic
+          // snapshot taken while it was open (fresh by construction).
+          if (!(await completeSuccess(entry, accountId, null, pendingSnapshot))) return;
           context = null;
-          if (!(await completeSuccess(entry, accountId))) return;
           return;
         }
         logEvent(entry, accountId, "close-grace-expired");
@@ -569,18 +746,119 @@ async function runVerification(accountId: string): Promise<void> {
 }
 
 /**
- * Shared success path: headless re-init on the validated profile, canonical
- * header capture (persists via saveAuthSession), cooldown cleared ONLY after
- * capture succeeds. Returns true on verified.
+ * Shared success path. verified requires ALL of:
+ * 1. real manual chat completion observed (caller guarantees chatEvidence);
+ * 2. fresh auth snapshot persisted from the validated visible context;
+ * 3. DB captured_at actually advanced within a tight window;
+ * 4. live validation (authoritative settings check on the operational
+ *    headless context) returns 200;
+ * 5. only then cooldown cleared.
+ * Anything else ends failed. Never marks Ready on stale material.
  */
 async function completeSuccess(
   entry: ActiveVerification,
   accountId: string,
+  visible: { page: Page; context: BrowserContext } | null,
+  pending: {
+    at: number;
+    session: NonNullable<Awaited<ReturnType<typeof deps.snapshotVisible>>>;
+  } | null,
 ): Promise<boolean> {
+  const before = await deps.readPersistedMeta(accountId).catch(() => ({
+    exists: false,
+    capturedAt: 0,
+  }));
+  logEvent(
+    entry,
+    accountId,
+    `persist before capturedAt=${before.capturedAt} ageMs=${before.exists ? Date.now() - before.capturedAt : -1}`,
+  );
+  // 2. Fresh snapshot from the context that proved the real chat — BEFORE
+  // closing it, and BEFORE headless init can restore the old row. Grace
+  // path (visible already closed): fall back to the opportunistic snapshot
+  // taken while it was open.
+  let snapshot: Awaited<ReturnType<typeof deps.snapshotVisible>> = null;
+  if (visible) {
+    try {
+      snapshot = await deps.snapshotVisible(visible.page, visible.context);
+    } catch (err) {
+      finishOnEntry(
+        entry,
+        "failed",
+        `Visible session snapshot failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  } else if (pending) {
+    snapshot = pending.session;
+  }
+  if (!snapshot) {
+    finishOnEntry(
+      entry,
+      "failed",
+      "Visible session has no usable auth cookies",
+    );
+    return false;
+  }
+  try {
+    await deps.saveSession(accountId, snapshot);
+  } catch (err) {
+    // A failed persist must NEVER become verified (previously silent).
+    logEvent(entry, accountId, "auth-persist failed");
+    finishOnEntry(
+      entry,
+      "failed",
+      `Auth persist failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+  // 3. Verify the row actually advanced (catches silent persist failures).
+  const after = await deps.readPersistedMeta(accountId).catch(() => ({
+    exists: false,
+    capturedAt: 0,
+  }));
+  const fresh =
+    after.exists &&
+    after.capturedAt > before.capturedAt &&
+    Date.now() - after.capturedAt <= PERSIST_FRESH_WINDOW_MS;
+  logEvent(
+    entry,
+    accountId,
+    `persist after capturedAt=${after.capturedAt} fresh=${fresh}`,
+  );
+  if (!fresh) {
+    finishOnEntry(
+      entry,
+      "failed",
+      "Persisted session is not fresh after snapshot",
+    );
+    return false;
+  }
+  // Only now release the visible window: the fresh row is already durable,
+  // so headless init restores the NEW auth instead of the old one.
+  if (visible) {
+    await closeVisible(entry, visible.context);
+  }
   try {
     await deps.initHeadless(await deps.fullAccount(accountId));
   } catch {
-    // initHeadless is best-effort; capture below revalidates anyway.
+    // initHeadless is best-effort; live validation below decides.
+  }
+  // 4. Live validation on the operational context (settings 200 required).
+  let liveStatus = 0;
+  try {
+    liveStatus = (await deps.validateLive(accountId)).status;
+  } catch {
+    liveStatus = 0;
+  }
+  logEvent(entry, accountId, `live settings status=${liveStatus}`);
+  if (liveStatus !== 200) {
+    finishOnEntry(
+      entry,
+      "failed",
+      `Post-persist live validation failed (settings ${liveStatus})`,
+    );
+    return false;
   }
   try {
     await deps.capture(accountId);
@@ -592,6 +870,7 @@ async function completeSuccess(
     );
     return false;
   }
+  // 5. Cooldown cleared ONLY after validated fresh auth.
   await deps.clearCooldown(accountId);
   finishOnEntry(
     entry,
