@@ -536,3 +536,32 @@ dashboardApp.post("/v1/accounts/:id/manual-verification/cancel", async (c) => {
   if (!status) return c.json({ ok: true, accountId: id, state: "idle" });
   return c.json({ ok: true, ...status });
 });
+
+dashboardApp.post("/v1/accounts/:id/probe-settings-auth", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: A/B settings auth (live bearer vs cookie-only)
+  // on the live account context. Read-only: no heal, no login, no DB, no
+  // cooldown changes. Booleans/codes only in the response.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeSettingsAuthAB } = await import("../services/qwen.js");
+    const result = await probeSettingsAuthAB(id);
+    try {
+      console.log(
+        `[SettingsAB] account=${id.slice(0, 8)} ` +
+          `bearer=${result.bearerStatus}/${result.bearerAppAuthFailure} ` +
+          `cookieOnly=${result.cookieStatus}/${result.cookieAppAuthFailure} ` +
+          `liveToken=${result.liveTokenPresent} cookies=${result.cookieCount}`,
+      );
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});

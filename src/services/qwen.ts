@@ -939,6 +939,163 @@ interface BrowserTextResponse {
   raw: string;
 }
 
+/** Sanitized result of the settings A/B auth experiment. No secrets. */
+export interface SettingsAuthABResult {
+  bearerStatus: number;
+  bearerAppAuthFailure: boolean;
+  cookieStatus: number;
+  cookieAppAuthFailure: boolean;
+  liveTokenPresent: boolean;
+  cookieCount: number;
+  cookieNameHash: string;
+  liveTokenStable: boolean | null;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC (read-only): compare settings auth with live
+ * bearer (A) vs cookie-only (B) on the SAME live page/context, back to
+ * back. No heal, no refresh, no login, no DB writes, no cooldown changes.
+ * Single attempt each. Inline statements only (__name constraints).
+ */
+export async function probeSettingsAuthAB(
+  accountId: string,
+): Promise<SettingsAuthABResult> {
+  const { withAccountPage } = await import("./playwright.ts");
+  return withAccountPage(
+    accountId,
+    async (page: Page): Promise<SettingsAuthABResult> => {
+      return page.evaluate(async (): Promise<SettingsAuthABResult> => {
+        try {
+          let liveToken: string | null = null;
+          try {
+            const t = localStorage.getItem("token");
+            liveToken = typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            liveToken = null;
+          }
+          const base: Record<string, string> = {
+            accept: "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "x-request-id":
+              Math.random().toString(36).slice(2) +
+              Math.random().toString(36).slice(2),
+            source: "web",
+          };
+          // A: live bearer.
+          const headersA: Record<string, string> = { ...base };
+          if (liveToken) {
+            headersA["authorization"] = "Bearer " + liveToken;
+            headersA["Authorization"] = "Bearer " + liveToken;
+          }
+          const resA = await fetch(
+            "https://chat.qwen.ai/api/v2/users/user/settings",
+            {
+              method: "GET",
+              credentials: "include",
+              headers: headersA,
+              signal: AbortSignal.timeout(20000),
+            },
+          );
+          const textA = await resA.text().catch(() => "");
+          let appFailA = false;
+          try {
+            const p: any = JSON.parse(textA);
+            appFailA =
+              p &&
+              p.success === false &&
+              (p.data?.code === "Unauthorized" || p.code === "Unauthorized");
+          } catch {
+            appFailA = false;
+          }
+          // B: cookie-only (no Authorization at all).
+          const headersB: Record<string, string> = { ...base };
+          const resB = await fetch(
+            "https://chat.qwen.ai/api/v2/users/user/settings",
+            {
+              method: "GET",
+              credentials: "include",
+              headers: headersB,
+              signal: AbortSignal.timeout(20000),
+            },
+          );
+          const textB = await resB.text().catch(() => "");
+          let appFailB = false;
+          try {
+            const p2: any = JSON.parse(textB);
+            appFailB =
+              p2 &&
+              p2.success === false &&
+              (p2.data?.code === "Unauthorized" || p2.code === "Unauthorized");
+          } catch {
+            appFailB = false;
+          }
+          let liveStable: boolean | null = null;
+          try {
+            const t2 = localStorage.getItem("token");
+            const now2 = typeof t2 === "string" && t2.length > 0 ? t2 : null;
+            liveStable =
+              liveToken !== null && now2 !== null
+                ? liveToken === now2
+                : null;
+          } catch {
+            liveStable = null;
+          }
+          let cookieCount = 0;
+          let cookieNameHash = "";
+          try {
+            const rawParts = document.cookie.split(";");
+            const names: string[] = [];
+            for (let i = 0; i < rawParts.length; i++) {
+              const trimmed = rawParts[i].trim();
+              if (!trimmed) continue;
+              cookieCount += 1;
+              const eq = trimmed.indexOf("=");
+              names.push(eq >= 0 ? trimmed.slice(0, eq) : trimmed);
+            }
+            names.sort();
+            let joined = "";
+            for (let i = 0; i < names.length; i++) {
+              joined += (i > 0 ? ";" : "") + names[i];
+            }
+            let h1 = 0x811c9dc5;
+            for (let i = 0; i < joined.length; i++) {
+              h1 ^= joined.charCodeAt(i);
+              h1 = Math.imul(h1, 0x01000193);
+            }
+            cookieNameHash = (h1 >>> 0).toString(16);
+          } catch {
+            cookieCount = 0;
+            cookieNameHash = "";
+          }
+          return {
+            bearerStatus: resA.status,
+            bearerAppAuthFailure: appFailA,
+            cookieStatus: resB.status,
+            cookieAppAuthFailure: appFailB,
+            liveTokenPresent: liveToken !== null,
+            cookieCount,
+            cookieNameHash,
+            liveTokenStable: liveStable,
+          };
+        } catch {
+          return {
+            bearerStatus: 0,
+            bearerAppAuthFailure: false,
+            cookieStatus: 0,
+            cookieAppAuthFailure: false,
+            liveTokenPresent: false,
+            cookieCount: 0,
+            cookieNameHash: "",
+            liveTokenStable: null,
+          };
+        }
+      });
+    },
+    60_000,
+    30_000,
+    false,
+  );
+}
 /** Sanitized in-page auth diagnostics. Booleans/codes only — never tokens. */
 export interface BrowserAuthDiag {
   /** Live localStorage token readable in-page. */

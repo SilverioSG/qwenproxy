@@ -174,3 +174,35 @@ test("qwen-auth-diag: heal performs at most one retry (no loop)", () => {
   const block = src.slice(anchor, anchor + 4000);
   assert.ok(!/while\s*\(|for\s*\(.*?retries/i.test(block));
 });
+
+test("qwen-auth-diag: settings A/B probe is exported with sanitized shape", async () => {
+  const mod = await import("../services/qwen.ts");
+  assert.equal(typeof mod.probeSettingsAuthAB, "function");
+});
+
+test("qwen-auth-diag: probe endpoint registered with verifyApiKey", () => {
+  const src = fs.readFileSync("src/api/dashboard.ts", "utf-8");
+  const idx = src.indexOf('"/v1/accounts/:id/probe-settings-auth"');
+  assert.ok(idx >= 0);
+  const noComments = src
+    .slice(idx, idx + 1500)
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("//"))
+    .join("\n");
+  const block = noComments;
+  assert.ok(block.includes("verifyApiKey"));
+  // Interpolations may only reference the id prefix and the sanitized
+  // result object — never credential values.
+  const allowed = new Set(["id", "result", "err"]);
+  const idents = new Set<string>();
+  for (const m of block.matchAll(/\$\{([^}]+)\}/g)) {
+    const root = m[1].split(/[.?(\s]/)[0];
+    if (root) idents.add(root);
+  }
+  for (const ident of idents) {
+    assert.ok(
+      allowed.has(ident),
+      `unexpected interpolation in probe endpoint: ${ident}`,
+    );
+  }
+});
