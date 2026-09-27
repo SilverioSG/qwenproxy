@@ -2342,7 +2342,9 @@ async function loginViaApi(
           timeout: 10_000,
         });
         data = await response.json().catch(() => null);
-        signinSuccess = Boolean(data && (data.success === true || data.token));
+        signinSuccess = Boolean(
+          data && (data.success === true || extractAuthToken(data) !== null),
+        );
       } catch {}
     }
 
@@ -2378,7 +2380,9 @@ async function loginViaApi(
 
       if (evalRes?.data) {
         data = evalRes.data;
-        signinSuccess = Boolean(data && (data.success === true || data.token));
+        signinSuccess = Boolean(
+          data && (data.success === true || extractAuthToken(data) !== null),
+        );
       }
     }
 
@@ -2394,7 +2398,7 @@ async function loginViaApi(
     }
 
     if (signinSuccess) {
-      const token = data?.data?.token || data?.token;
+      const token = extractAuthToken(data);
       if (token) {
         try {
           await page.context().addCookies([
@@ -2453,6 +2457,28 @@ async function loginViaApi(
   }
 }
 
+/**
+ * Extract an auth token from a signin/refresh payload following the official
+ * SPA contract: accessToken/access_token at top/result/data levels, with
+ * legacy plain `token` as fallback. Pure and unit-tested. Never logs values.
+ */
+export function extractAuthToken(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const levels: unknown[] = [
+    data,
+    (data as { result?: unknown }).result,
+    (data as { data?: unknown }).data,
+  ];
+  for (const level of levels) {
+    if (!level || typeof level !== "object") continue;
+    const rec = level as Record<string, unknown>;
+    for (const key of ["accessToken", "access_token", "token"]) {
+      const v = rec[key];
+      if (typeof v === "string" && v.length > 0) return v;
+    }
+  }
+  return null;
+}
 export interface AutofillResult {
   /** Credentials were submitted (or session already valid). */
   submitted: boolean;

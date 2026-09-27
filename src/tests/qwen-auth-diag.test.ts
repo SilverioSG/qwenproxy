@@ -251,3 +251,26 @@ test("qwen-auth-diag: refresh call carries SPA interceptor headers", () => {
     assert.ok(block.includes(marker), `refresh call missing: ${marker}`);
   }
 });
+
+test("qwen-auth-diag: extractAuthToken covers SPA shapes (accessToken/access_token/token)", async () => {
+  const { extractAuthToken } = await import("../services/playwright.ts");
+  assert.equal(extractAuthToken({ success: true, data: { access_token: "A", expires_at: 1 } }), "A");
+  assert.equal(extractAuthToken({ success: true, data: { accessToken: "B" } }), "B");
+  assert.equal(extractAuthToken({ success: true, data: { token: "C" } }), "C");
+  assert.equal(extractAuthToken({ success: true, result: { access_token: "D" } }), "D");
+  assert.equal(extractAuthToken({ accessToken: "E" }), "E");
+  assert.equal(extractAuthToken({ success: true, data: {} }), null);
+  assert.equal(extractAuthToken(null), null);
+  assert.equal(extractAuthToken({ success: false, data: { code: "X" } }), null);
+});
+
+test("qwen-auth-diag: loginViaApi extracts token via SPA contract helper", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const idx = src.indexOf("async function loginViaApi");
+  assert.ok(idx >= 0);
+  const end = src.indexOf("export interface AutofillResult", idx);
+  const block = src.slice(idx, end > 0 ? end : idx + 9000);
+  assert.ok(block.includes("extractAuthToken(data)"));
+  assert.ok(!block.includes("data?.data?.token || data?.token"));
+});
