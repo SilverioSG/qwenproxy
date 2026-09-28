@@ -96,67 +96,65 @@ export interface ComposerProbeResult {
  *  page does not have — regression d3c7140). */
 export const COMPOSER_INSTALL_FN = `
 (args) => {
-  const [COMPOSER_SEL, SEND_SEL] = args.selectors;
-  const OUT = args.out;
+  const COMPOSER_SEL = args.selectors[0];
+  const SEND_SEL = args.selectors[1];
+  // Array literals, not consts: esbuild keepNames rewrites named function
+  // expressions to __name(f, "f") and __name does not exist in the page.
+  const VIS = [
+    (el) => {
+      if (!el) return false;
+      try {
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el);
+        return (
+          r.width > 0 && r.height > 0 &&
+          st.visibility !== "hidden" && st.display !== "none" &&
+          st.opacity !== "0"
+        );
+      } catch (e) {
+        return false;
+      }
+    },
+  ];
+  const Q = [
+    (sel) => {
+      try { return document.querySelector(sel); } catch (e) { return null; }
+    },
+  ];
   const SNAP = [
     (label) => {
-      const ta = document.querySelector(COMPOSER_SEL);
-      const btn = document.querySelector(SEND_SEL);
-      // Array literals, not consts: esbuild keepNames rewrites named function
-      // expressions to __name(f, "f") and __name does not exist in the page.
-      const VIS = [
-        (el) => {
-          if (!el) return false;
-          try {
-            const r = el.getBoundingClientRect();
-            const st = window.getComputedStyle(el);
-            return (
-              r.width > 0 && r.height > 0 &&
-              st.visibility !== "hidden" && st.display !== "none" &&
-              st.opacity !== "0"
-            );
-          } catch (e) {
-            return false;
-          }
-        },
-      ];
-      const Q = [
-        (sel) => {
-          try { return document.querySelector(sel); } catch (e) { return null; }
-        },
-      ];
-      const vis = VIS[0];
-      const q = Q[0];
-      const bt = btn ? btn.tagName : null;
+      const ta = Q[0](COMPOSER_SEL);
+      const btn = Q[0](SEND_SEL);
       const bclass = btn && btn.className && typeof btn.className === "string"
         ? btn.className.slice(0, 160) : "";
       return {
         at: label,
         composerFound: !!ta,
-        composerVisible: vis(ta),
+        composerVisible: VIS[0](ta),
         composerEnabled: ta ? !ta.disabled : false,
         composerDisabledAttr: ta ? !!ta.disabled : false,
         composerAriaDisabled: ta ? ta.getAttribute("aria-disabled") : null,
         composerReadonly: ta ? !!ta.readOnly : false,
         composerValueLength: ta && typeof ta.value === "string" ? ta.value.length : 0,
         sendButtonFound: !!btn,
-        sendButtonVisible: vis(btn),
+        sendButtonVisible: VIS[0](btn),
         sendButtonEnabled: btn ? !btn.disabled && !/disabled/.test(bclass) : false,
         sendButtonDisabledAttr: btn ? !!btn.disabled : false,
         sendButtonAriaDisabled: btn ? btn.getAttribute("aria-disabled") : null,
-        sendButtonClassHash: bclass,
-        sendButtonTag: bt,
-        messageEchoVisible: !!q("[data-message-author='user'], .user-message, [class*='user-message']"),
-        stopButtonVisible: !!q("button[aria-label*='Stop' i], .stop-button, [class*='stop-button']"),
-        loadingIndicatorVisible: !!q("[class*='loading'], [class*='spinner'], [aria-busy='true']"),
-        generatingMarkerVisible: !!q("[class*='generating'], [data-generating='true'], [class*='streaming']"),
-        errorBannerVisible: !!q("[class*='error-banner'], [role='alert'], [class*='error-message']"),
-        challengeMarkerVisible: !!q("[class*='captcha'], [id*='captcha'], [class*='punish'], [class*='challenge']"),
+        sendButtonClass: bclass,
+        sendButtonTag: btn ? btn.tagName : null,
+        messageEchoVisible: !!Q[0]("[data-message-author='user'], .user-message, [class*='user-message']"),
+        stopButtonVisible: !!Q[0]("button[aria-label*='Stop' i], .stop-button, [class*='stop-button']"),
+        loadingIndicatorVisible: !!Q[0]("[class*='loading'], [class*='spinner'], [aria-busy='true']"),
+        generatingMarkerVisible: !!Q[0]("[class*='generating'], [data-generating='true'], [class*='streaming']"),
+        errorBannerVisible: !!Q[0]("[class*='error-banner'], [role='alert'], [class*='error-message']"),
+        challengeMarkerVisible: !!Q[0]("[class*='captcha'], [id*='captcha'], [class*='punish'], [class*='challenge']"),
         url: location.href.slice(0, 120),
         title: (document.title || "").slice(0, 80),
       };
     },
   ];
+  const EVENTS = [];
   const REC = [
     (ev) => {
       const t = ev.target;
@@ -169,7 +167,7 @@ export const COMPOSER_INSTALL_FN = `
       } catch (e) {}
       let prevented = false;
       try { prevented = ev.defaultPrevented; } catch (e) {}
-      OUT.events.push({
+      EVENTS.push({
         type: ev.type,
         targetTag: tag,
         targetRole: role,
@@ -179,34 +177,44 @@ export const COMPOSER_INSTALL_FN = `
         valueLength: vl,
         at: Date.now(),
       });
-      if (OUT.events.length > 400) OUT.events.splice(0, OUT.events.length - 400);
+      if (EVENTS.length > 400) EVENTS.splice(0, EVENTS.length - 400);
     },
   ];
   const TYPES = ["input","change","keydown","keyup","keypress","click","submit","beforeinput"];
+  // The collector MUST live on window: page.evaluate arguments are serialized
+  // per call, so an object handed in from Node is a fresh copy every time and
+  // no listener state or recorded event would ever survive to the next call.
+  try { if (window.__qwenComposerProbe) window.__qwenComposerProbe.dispose(); } catch (e) {}
+  window.__qwenComposerProbe = {
+    events: EVENTS,
+    snap: SNAP[0],
+    dispose: [
+      () => { for (const ty of TYPES) document.removeEventListener(ty, REC[0], true); },
+    ],
+  };
   for (const ty of TYPES) {
     document.addEventListener(ty, REC[0], true);
   }
-  OUT.snap = SNAP[0];
-  OUT.teardown = [
-    () => { for (const ty of TYPES) document.removeEventListener(ty, REC[0], true); },
-  ];
-  OUT.pre = SNAP[0]("pre");
-  return true;
+  return SNAP[0]("pre");
 }
 `;
 
 export const COMPOSER_SNAPSHOT_FN = `
 (args) => {
-  const OUT = args.out;
-  return OUT.snap(args.label);
+  const P = window.__qwenComposerProbe;
+  if (!P || typeof P.snap !== "function") return null;
+  return P.snap(args.label);
 }
 `;
 
-export const COMPOSER_TEARDOWN_FN = `
-(args) => {
-  const OUT = args.out;
-  if (OUT.teardown && OUT.teardown[0]) OUT.teardown[0]();
-  return true;
+export const COMPOSER_DRAIN_FN = `
+() => {
+  const P = window.__qwenComposerProbe;
+  if (!P) return null;
+  const events = P.events.slice(-400);
+  if (P.dispose && P.dispose[0]) P.dispose[0]();
+  try { delete window.__qwenComposerProbe; } catch (e) {}
+  return events;
 }
 `;
 
@@ -346,12 +354,6 @@ export async function probeComposerDuringCapture(
     on?: (ev: string, cb: (req: unknown) => void) => void;
     off?: (ev: string, cb: (req: unknown) => void) => void;
   };
-  const out = { events: [] as DomEventRecord[] } as unknown as {
-    events: DomEventRecord[];
-    snap?: (label: string) => unknown;
-    pre?: unknown;
-    teardown?: unknown[];
-  };
   const requests: GenericRequest[] = [];
   const onRequest = (req: unknown): void => {
     try {
@@ -377,15 +379,15 @@ export async function probeComposerDuringCapture(
       // Observer must never break the capture.
     }
   };
+  let installRaw: unknown = null;
   try {
-    await page.evaluate(
-      compileInPage<boolean>(COMPOSER_INSTALL_FN),
+    installRaw = await page.evaluate(
+      compileInPage(COMPOSER_INSTALL_FN),
       {
         selectors: [
           COMPOSER_SELECTORS.join(", "),
           SEND_BUTTON_SELECTORS.join(", "),
         ],
-        out,
       } as unknown,
     );
   } catch (err) {
@@ -399,7 +401,6 @@ export async function probeComposerDuringCapture(
   const snap = async (label: string): Promise<ComposerState | null> => {
     try {
       const raw = await page.evaluate(compileInPage(COMPOSER_SNAPSHOT_FN), {
-        out,
         label,
       } as unknown);
       return toComposerState(raw);
@@ -408,7 +409,7 @@ export async function probeComposerDuringCapture(
     }
   };
 
-  const pre = toComposerState(out.pre);
+  const pre = toComposerState(installRaw);
   let captureError: string | null = null;
   try {
     await runCapture();
@@ -423,10 +424,12 @@ export async function probeComposerDuringCapture(
     if (s) afterSubmit.push(s);
   }
   const post = afterSubmit[afterSubmit.length - 1] ?? (await snap("post"));
+  let drained: DomEventRecord[] = [];
   try {
-    await page.evaluate(compileInPage<boolean>(COMPOSER_TEARDOWN_FN), {
-      out,
-    } as unknown);
+    const raw = await page.evaluate(
+      compileInPage<DomEventRecord[] | null>(COMPOSER_DRAIN_FN),
+    );
+    if (Array.isArray(raw)) drained = raw;
   } catch {
     // Best effort.
   }
@@ -448,7 +451,7 @@ export async function probeComposerDuringCapture(
     pre,
     post,
     afterSubmit,
-    events: out.events.slice(-200),
+    events: drained.slice(-200),
     requests: requests.slice(-200),
     genericRequestCount: requests.length,
     genericPostCount: requests.filter((r) => r.method === "POST").length,
