@@ -213,10 +213,17 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   const prod = src.split("/**")[0] + src; // whole file
   const calls = [...prod.matchAll(/isPageLoggedIn\(\s*[A-Za-z_$][\w$]*\s*(?:,\s*[\d_]+\s*)?\)/g)];
   assert.ok(calls.length >= 7, `expected the legacy call sites, got ${calls.length}`);
-  // Exactly one call site passes an options object: the post-login validation.
+  // Only the two post-login confirmations may pass an options object, and both
+  // must be non-mutating: loginViaApi's post-install validation and the
+  // executeReauth confirmation in refreshHeadersInternal.
   const withOptions = [...prod.matchAll(/isPageLoggedIn\([^)]*\{/g)];
-  assert.equal(withOptions.length, 1, "only the post-login validation may pass options");
-  assert.ok(/nonMutating: true/.test(prod));
+  assert.equal(
+    withOptions.length,
+    2,
+    "only the two post-login confirmations may pass options",
+  );
+  // One trace initializer + the two confirmation call sites.
+  assert.equal([...prod.matchAll(/nonMutating: true/g)].length, 3);
   // And the full probe still calls auths + refresh.
   const start = prod.indexOf("export async function probePageLoggedIn");
   const end = prod.indexOf("export async function isPageLoggedIn", start);

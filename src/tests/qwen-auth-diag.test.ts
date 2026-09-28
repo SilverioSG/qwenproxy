@@ -696,6 +696,7 @@ test("qwen-auth-diag: rotation ingestion stores no secret values", async () => {
         lsWriteObserved: null,
       },
     ],
+    "",
     { context: null, page: null, url: "https://chat.qwen.ai/" },
   );
   const t = mod.getIsLoggedInTrace();

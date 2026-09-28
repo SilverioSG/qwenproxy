@@ -628,7 +628,13 @@ export async function probePageLoggedIn(
           ];
           try {
             SNAP[0]("isloggedin-entry");
-            if (localStorage.getItem("qwen_token_logged_out_marker")) {
+            // The logged-out marker is SPA-local state that our own login
+            // sequence provokes (verified live: the reconcile lands ~250ms
+            // after the settings read, with the session still valid and the
+            // cookie intact). Failing closed on it turns a healthy post-login
+            // page into "did not restore an authenticated session", so in
+            // non-mutating mode the settings read is the authority instead.
+            if (!NON_MUTATING && localStorage.getItem("qwen_token_logged_out_marker")) {
               return { reason: "logged-out-marker", obs: OBS, res: RES };
             }
 
@@ -891,7 +897,7 @@ export async function probePageLoggedIn(
         } catch {
           ctx = null;
         }
-        ingestIsLoggedInTrace(traceAccount, outcome.obs, outcome.res, {
+        ingestIsLoggedInTrace(traceAccount, outcome.obs, outcome.res, outcome.reason, {
           context: ctx,
           page: page as unknown as object,
           url: currentUrl,
@@ -4770,7 +4776,18 @@ async function refreshHeadersInternal(
         if (creds && creds.email && creds.password) {
           const ok = await loginToQwen(accountId, creds.email, creds.password, "request-reauth");
           cookieCaches.delete(accountId);
-          if (!ok || !(await isPageLoggedIn(page, 5_000))) {
+          // Confirm with the NON-MUTATING probe. The full probe reads
+          // /api/v1/auths/ and auth.qwen.ai/api/v2/auths/refresh (both rotate
+          // the session cookie) and additionally fails closed on
+          // qwen_token_logged_out_marker, which the login sequence itself sets
+          // asynchronously. That combination produced the misleading
+          // "did not restore an authenticated session" on a session that was
+          // valid (settings 200, cookie present) and aborted the whole header
+          // capture with intercept_count=0.
+          const confirmed = ok
+            ? await isPageLoggedIn(page, 5_000, { nonMutating: true })
+            : false;
+          if (!confirmed) {
             unmarkAccountHeadersReady(accountId);
             throw new Error(
               `Re-login for ${accountId} did not restore an authenticated session`,

@@ -935,6 +935,7 @@ let isLoggedInObs: LsObservation[] = [];
 /** Per-subrequest results from the most recent traced probe. */
 let isLoggedInResults: IsLoggedInSubResult[] = [];
 /** First rotation across auths / settings / refresh, frozen. */
+let isLoggedInReason = "";
 let firstRotation: {
   step: string;
   ts: number;
@@ -1059,6 +1060,7 @@ export function ingestIsLoggedInTrace(
   accountId: string | undefined,
   obs: LsObservation[],
   results: IsLoggedInSubResult[],
+  probeReason: string = "",
   handles: { context: object | null; page: object | null; url: string | null } = {
     context: null,
     page: null,
@@ -1071,6 +1073,7 @@ export function ingestIsLoggedInTrace(
     isLoggedInObs = isLoggedInObs.slice(0, 40);
   }
   isLoggedInResults = results.map((r) => ({ ...r, responseKeys: [...r.responseKeys] }));
+  isLoggedInReason = probeReason;
   const contextId = traceContextId(handles.context);
   const pageId = tracePageId(handles.page);
   for (const o of isLoggedInObs) {
@@ -1109,7 +1112,7 @@ export function ingestIsLoggedInTrace(
     console.log(
       `[SessTrace ${accountId!.slice(0, 8)}] ISLOGGEDIN steps=${isLoggedInResults.length} ` +
         `firstRotation=${firstRotation ? firstRotation.step : "none"} ` +
-        `case=${cls.rotationCase}`,
+        `case=${cls.rotationCase} reason=${isLoggedInReason || "n/a"}`,
     );
   } catch {}
 }
@@ -1142,6 +1145,7 @@ export function _resetLsTrackingForTests(): void {
   lsGenerations.length = 0;
   isLoggedInObs = [];
   isLoggedInResults = [];
+  isLoggedInReason = "";
   firstRotation = null;
 }
 
@@ -1355,6 +1359,7 @@ export function getSessionTrace(): {
   isLoggedIn: {
     observations: LsObservation[];
     results: IsLoggedInSubResult[];
+    reason: string;
     firstRotation: typeof firstRotation;
     classification: IsLoggedInRotation;
   };
@@ -1411,6 +1416,7 @@ export function getSessionTrace(): {
     isLoggedIn: {
       observations: isLoggedInObs,
       results: isLoggedInResults,
+      reason: isLoggedInReason,
       firstRotation,
       classification: classifyIsLoggedInRotation(),
     },
