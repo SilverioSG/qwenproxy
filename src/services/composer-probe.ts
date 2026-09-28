@@ -210,6 +210,20 @@ export const COMPOSER_TEARDOWN_FN = `
 }
 `;
 
+/**
+ * Compile an in-page arrow source into a real function so Playwright
+ * serializes and CALLS it. Passing the raw string makes Playwright evaluate it
+ * as an expression (a function literal that is never invoked), which is why the
+ * first composer run installed nothing and every snapshot came back null.
+ */
+function compileInPage<T>(source: string): (arg: unknown) => T {
+  try {
+    return new Function(`return (${source});`)() as (arg: unknown) => T;
+  } catch {
+    return () => null as unknown as T;
+  }
+}
+
 const COMPLETION_PATH_RE =
   /\/(completions|chats\/[^/]+\/(completions|messages)|messages|generate|stream|graphql)/i;
 
@@ -365,8 +379,14 @@ export async function probeComposerDuringCapture(
   };
   try {
     await page.evaluate(
-      COMPOSER_INSTALL_FN,
-      { selectors: [COMPOSER_SELECTORS.join(", "), SEND_BUTTON_SELECTORS.join(", ")], out } as unknown,
+      compileInPage<boolean>(COMPOSER_INSTALL_FN),
+      {
+        selectors: [
+          COMPOSER_SELECTORS.join(", "),
+          SEND_BUTTON_SELECTORS.join(", "),
+        ],
+        out,
+      } as unknown,
     );
   } catch (err) {
     return {
@@ -378,10 +398,10 @@ export async function probeComposerDuringCapture(
 
   const snap = async (label: string): Promise<ComposerState | null> => {
     try {
-      const raw = await page.evaluate(
-        COMPOSER_SNAPSHOT_FN,
-        { out, label } as unknown,
-      );
+      const raw = await page.evaluate(compileInPage(COMPOSER_SNAPSHOT_FN), {
+        out,
+        label,
+      } as unknown);
       return toComposerState(raw);
     } catch {
       return null;
@@ -404,10 +424,9 @@ export async function probeComposerDuringCapture(
   }
   const post = afterSubmit[afterSubmit.length - 1] ?? (await snap("post"));
   try {
-    await page.evaluate(
-      COMPOSER_TEARDOWN_FN,
-      { out } as unknown,
-    );
+    await page.evaluate(compileInPage<boolean>(COMPOSER_TEARDOWN_FN), {
+      out,
+    } as unknown);
   } catch {
     // Best effort.
   }

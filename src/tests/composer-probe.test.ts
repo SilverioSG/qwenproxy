@@ -129,3 +129,81 @@ test("composer-probe: output shape carries no secret field names", async () => {
   // Post data is only ever a length + hash.
   assert.ok(!/postData\b/.test(blob));
 });
+
+test("composer-probe: the in-page closures are compiled, not passed as strings", () => {
+  // Regression guard: a raw string is evaluated as an expression by
+  // Playwright, so the install never runs and every snapshot comes back null.
+  const src = fs.readFileSync("src/services/composer-probe.ts", "utf-8");
+  assert.ok(src.includes("compileInPage"));
+  for (const fn of [
+    "COMPOSER_INSTALL_FN",
+    "COMPOSER_SNAPSHOT_FN",
+    "COMPOSER_TEARDOWN_FN",
+  ]) {
+    assert.ok(
+      src.includes(`compileInPage<boolean>(${fn})`) ||
+        src.includes(`compileInPage(${fn})`),
+      `${fn} must be compiled before evaluate`,
+    );
+  }
+  assert.ok(!/evaluate\(\s*COMPOSER_/.test(src), "no raw string may reach evaluate");
+});
+
+test("composer-probe: compiled in-page closures actually run", () => {
+  // Executes the install/snapshot/teardown sources against a minimal DOM stub
+  // and asserts the state probe produces a real record.
+  const listeners: string[] = [];
+  const removed: string[] = [];
+  const el = () => ({
+    tagName: "TEXTAREA",
+    disabled: false,
+    readOnly: false,
+    value: "x".repeat(7),
+    className: "message-input-textarea",
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ width: 100, height: 20 }),
+  });
+  const doc: Record<string, unknown> = {
+    querySelector: () => el(),
+    addEventListener: (t: string) => listeners.push(t),
+    removeEventListener: (t: string) => removed.push(t),
+    title: "Qwen",
+  };
+  const win: Record<string, unknown> = {
+    getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" }),
+  };
+  const mk = (source: string) =>
+    new Function(
+      "document",
+      "window",
+      "location",
+      `return (${source});`,
+    )(doc, win, { href: "https://chat.qwen.ai/" }) as (a: unknown) => unknown;
+  const out: { events: unknown[] } = { events: [] };
+  const install = mk(COMPOSER_INSTALL_FN) as (a: unknown) => boolean;
+  assert.equal(
+    install({ selectors: ["textarea", "button.send-button"], out }),
+    true,
+  );
+  assert.deepEqual(listeners, [
+    "input",
+    "change",
+    "keydown",
+    "keyup",
+    "keypress",
+    "click",
+    "submit",
+    "beforeinput",
+  ]);
+  const snap = mk(COMPOSER_SNAPSHOT_FN) as (a: unknown) => Record<string, unknown>;
+  const state = snap({ out, label: "test" });
+  assert.equal(state.composerFound, true);
+  assert.equal(state.composerVisible, true);
+  assert.equal(state.composerEnabled, true);
+  assert.equal(state.composerValueLength, 7);
+  assert.equal(state.url, "https://chat.qwen.ai/");
+  assert.equal(state.title, "Qwen");
+  const teardown = mk(COMPOSER_TEARDOWN_FN) as (a: unknown) => boolean;
+  assert.equal(teardown({ out }), true);
+  assert.equal(removed.length, 8);
+});
