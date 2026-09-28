@@ -706,7 +706,13 @@ dashboardApp.post("/v1/accounts/:id/probe-settings-update", async (c) => {
     const results = [];
     for (const v of variants) {
       try {
-        results.push(await probeSettingsUpdateAB(id, v as never));
+        results.push(
+          await probeSettingsUpdateAB(
+            id,
+            v as never,
+            c.req.query("instruction") ?? "",
+          ),
+        );
       } catch (err) {
         results.push({
           variant: v,

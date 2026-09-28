@@ -2511,6 +2511,7 @@ export type SettingsUpdateVariant =
 export async function probeSettingsUpdateAB(
   accountId: string,
   variant: SettingsUpdateVariant = "proxy",
+  instruction = "",
 ): Promise<{
   variant: string;
   status: number;
@@ -2550,7 +2551,7 @@ export async function probeSettingsUpdateAB(
     buildCapturedQwenHeaders(headers, { referer: qwenUrl("/settings/personalization") }),
   );
   const currentSettings = getRes.json?.data ?? null;
-  const payload = buildQwenSettingsUpdatePayload(currentSettings, "");
+  const payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
   const payloadJson = JSON.stringify(payload);
   const referer = qwenUrl("/settings/personalization");
 
