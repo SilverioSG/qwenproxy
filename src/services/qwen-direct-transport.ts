@@ -64,6 +64,21 @@ export interface BaxiaProbe {
   uid?: string;
   fy?: string;
   ver?: string;
+  /** Sanitized reason the probe is not ready yet. Never contains values. */
+  diag?: {
+    hasBaxia: boolean;
+    baxiaKeys: string;
+    hasGetFYModule: boolean;
+    hasFyObj: boolean;
+    getFYModuleErr: string;
+    uidLen: number;
+    uidPrefix: string;
+    fyLen: number;
+    verValue: string;
+    href: string;
+    scriptHosts: string;
+  };
+  err?: string;
 }
 
 export interface BaxiaMaterial {
@@ -79,11 +94,19 @@ export interface BaxiaMaterial {
 }
 
 const baxiaCache = new Map<string, BaxiaMaterial>();
+type BaxiaDiag = NonNullable<BaxiaProbe["diag"]>;
+let lastBaxiaProbe: BaxiaDiag | null = null;
+
+/** Sanitized readiness diagnostics for the last Baxia probe. */
+export function getLastBaxiaProbe(): BaxiaDiag | null {
+  return lastBaxiaProbe;
+}
 let baxiaInflight = new Map<string, Promise<BaxiaMaterial | null>>();
 
 export function _resetDirectTransportCachesForTests(): void {
   baxiaCache.clear();
   baxiaInflight = new Map();
+  lastBaxiaProbe = null;
   versionCache = null;
   versionFetchedAt = 0;
   versionInflight = null;
@@ -157,6 +180,7 @@ export async function getBaxiaMaterial(
         const attempt = (await page
           .evaluate(BAXIA_EXTRACT_FN as unknown as () => unknown)
           .catch(() => null)) as BaxiaProbe | null;
+        if (attempt) lastBaxiaProbe = attempt.diag ?? lastBaxiaProbe;
         if (attempt && attempt.ready) {
           const uidNow = typeof attempt.uid === "string" ? attempt.uid : "";
           if (/^T2gA/i.test(uidNow) && uidNow.length > 20) {
@@ -200,22 +224,53 @@ export async function getBaxiaMaterial(
  */
 export const BAXIA_EXTRACT_FN = `
 () => {
+  const DIAG = {
+    hasBaxia: false,
+    baxiaKeys: "",
+    hasGetFYModule: false,
+    hasFyObj: false,
+    getFYModuleErr: "",
+    uidLen: 0,
+    uidPrefix: "",
+    fyLen: 0,
+    verValue: "",
+    href: "",
+    scriptHosts: "",
+  };
+  try { DIAG.href = String(location.href).slice(0, 100); } catch (e) {}
   try {
     const b = window.__baxia__;
+    DIAG.hasBaxia = !!b;
+    if (b) {
+      try { DIAG.baxiaKeys = Object.keys(b).slice(0, 12).join(","); } catch (e) {}
+      DIAG.hasGetFYModule = typeof b.getFYModule === "function";
+    }
     const fm = b && b.getFYModule ? b.getFYModule() : null;
-    if (!fm || !fm.fyObj) return { ready: false };
+    if (!fm) {
+      DIAG.getFYModuleErr = "no-module";
+      return { ready: false, diag: DIAG };
+    }
+    DIAG.hasFyObj = !!fm.fyObj;
     let uid = "";
     let fy = "";
-    try { uid = String(fm.getUidToken()); } catch (e) {}
+    try { uid = String(fm.getUidToken()); } catch (e) { DIAG.getFYModuleErr = "uid:" + e.message; }
     try { fy = String(fm.getFYToken()); } catch (e) {}
+    DIAG.uidLen = uid.length;
+    DIAG.uidPrefix = uid.slice(0, 5);
+    DIAG.fyLen = fy.length;
+    try { DIAG.verValue = (fm.fyObj && fm.fyObj.ver) ? String(fm.fyObj.ver) : ""; } catch (e) {}
+    if (!fm.fyObj) {
+      return { ready: false, diag: DIAG };
+    }
     return {
       ready: true,
       uid: uid,
       fy: fy,
-      ver: (fm.fyObj && fm.fyObj.ver) ? String(fm.fyObj.ver) : "",
+      ver: DIAG.verValue,
+      diag: DIAG,
     };
   } catch (e) {
-    return { ready: false };
+    return { ready: false, diag: DIAG, err: String(e && e.message ? e.message : e).slice(0, 120) };
   }
 }
 `;

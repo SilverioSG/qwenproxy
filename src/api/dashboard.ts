@@ -731,6 +731,7 @@ dashboardApp.post("/v1/accounts/:id/probe-direct-transport", async (c) => {
       baxiaReady: Boolean(baxia && baxia.fromSdk),
       baxiaFromSdk: baxia ? baxia.fromSdk : false,
       baxiaV: baxia ? baxia.bxV : null,
+      baxiaDiag: direct.getLastBaxiaProbe(),
       version,
       createChat: {
         httpStatus: created.httpStatus,
