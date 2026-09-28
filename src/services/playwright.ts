@@ -2579,7 +2579,7 @@ export function classifyQwenAuthError(
   };
 }
 
-async function loginToQwen(
+export async function loginToQwen(
   accountId: string,
   email: string,
   password: string,
