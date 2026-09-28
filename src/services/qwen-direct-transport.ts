@@ -52,8 +52,15 @@ import {
   mintQwenBaxiaMaterial,
 } from "./qwen-baxia-minter.ts";
 
+/**
+ * Feature flag. DEFAULT IS FALSE: the legacy browser transport stays the
+ * production path until the direct account transport is explicitly enabled.
+ *
+ * Read from `config` (not `process.env` directly) so the value resolves through
+ * the same validated env schema as every other setting.
+ */
 export const QWEN_DIRECT_WEB_TRANSPORT_ENABLED =
-  process.env.QWEN_DIRECT_WEB_TRANSPORT !== "false";
+  config.qwen.directWebTransport;
 
 /** Anti-bot material TTL. qwen2api caches the SDK result for 25 minutes. */
 export const BAXIA_CACHE_TTL_MS = 20 * 60 * 1000;
@@ -240,6 +247,15 @@ export interface DirectHeaderInput {
   acceptLanguage?: string;
   /** Guest flow: /c/guest referer and the reference's accept-language. */
   chatModeGuest?: boolean;
+  /**
+   * Account flow: the account's current JWT as `Authorization: Bearer <jwt>`.
+   *
+   * Verified live against the current upstream: account-mode /chats/new and
+   * /chat/completions answer HTTP 200 {"success":false,"code":"Unauthorized"}
+   * when this is absent, even with a complete, freshly-cleared cookie jar. The
+   * cookie alone is the *guest* credential. Guest requests must NOT send it.
+   */
+  bearerToken?: string | null;
   extra?: Record<string, string>;
 }
 
@@ -250,8 +266,8 @@ export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string,
       input.acceptLanguage ||
       (input.chatModeGuest ? "zh-CN,zh;q=0.9,en;q=0.8" : "en-US,en;q=0.9"),
     "Content-Type": "application/json",
-    // Auth is the token COOKIE. A Bearer header is what triggers the Aliyun WAF
-    // punish page (verified in Qwen-Free-Api), so it is never added here.
+    // Guest auth is the token cookie. Account auth additionally carries the
+    // Bearer JWT (see DirectHeaderInput.bearerToken).
     Cookie: input.cookie,
     Origin: qwenOrigin(),
     Referer:
@@ -275,8 +291,10 @@ export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string,
     "sec-ch-ua-platform": '"Windows"',
     ...(input.extra ?? {}),
   };
+  if (input.bearerToken) headers["Authorization"] = `Bearer ${input.bearerToken}`;
   // qwen2api sends bx-ua/bx-umidtoken as headers on both chats/new and
-  // completions, sourced from the real SDK.
+  // completions, sourced from the real SDK. The proven account flow does not
+  // require them, so they are only attached when the caller supplies material.
   if (input.bxUa) headers["bx-ua"] = input.bxUa;
   if (input.bxUmidToken) headers["bx-umidtoken"] = input.bxUmidToken;
   return headers;
@@ -343,11 +361,14 @@ export async function directCreateChat(input: {
   userAgent?: string;
   baxia?: BaxiaMaterial | null;
   version?: string | null;
+  /** Account flow: current account JWT. Required for account mode. */
+  bearerToken?: string | null;
   timeoutMs?: number;
 }): Promise<DirectCreateChatResult> {
   // The guest cookie is minted together with the anti-bot material; when the
   // caller supplies one, use it instead of the account cookie.
   const effectiveCookie = input.cookie || input.baxia?.cookie || "";
+  const accountMode = Boolean(input.bearerToken);
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
@@ -363,8 +384,11 @@ export async function directCreateChat(input: {
         bxUmidToken: input.baxia?.bxUmidToken,
         bxV: input.baxia?.bxV,
         version: input.version,
-        referer: qwenUrl("/c/guest"),
-        chatModeGuest: true,
+        bearerToken: input.bearerToken,
+        // Account chats are referenced by their own session; the guest
+        // referer would be wrong for them.
+        referer: accountMode ? qwenUrl("/") : qwenUrl("/c/guest"),
+        chatModeGuest: !accountMode,
       }),
       body: JSON.stringify({
         title: "",
@@ -453,6 +477,8 @@ export async function directCompletion(input: {
   userAgent?: string;
   baxia?: BaxiaMaterial | null;
   version?: string | null;
+  /** Account flow: current account JWT. Required for account mode. */
+  bearerToken?: string | null;
   timeoutMs?: number;
   maxBytes?: number;
 }): Promise<DirectCompletionResult> {
@@ -518,8 +544,9 @@ export async function directCompletion(input: {
           bxUmidToken: input.baxia?.bxUmidToken,
           bxV: input.baxia?.bxV,
           version: input.version,
+          bearerToken: input.bearerToken,
           chatSessionId: input.chatId,
-          chatModeGuest: true,
+          chatModeGuest: !input.bearerToken,
           extra: { "x-accel-buffering": "no" },
         }),
         body,
@@ -621,9 +648,9 @@ export async function directCompletion(input: {
       if (raw.length > maxBytes) break;
       let idx = buffer.indexOf("\n\n");
       while (idx !== -1) {
-        const frame = buffer.slice(0, idx);
+        const rawFrame = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 2);
-        const payload = frame
+        const payload = rawFrame
           .split("\n")
           .filter((l) => l.startsWith("data:"))
           .map((l) => l.slice(5).trim())
@@ -640,20 +667,21 @@ export async function directCompletion(input: {
           obj = null;
         }
         if (!obj) continue;
-        if (obj.type === "text" || obj.type === "thinking") {
-          if (obj.data && typeof obj.data === "string") {
-            // accumulate below
-          }
-        }
-        const phase = obj.phase ?? obj.data?.phase ?? null;
-        if (phase === "answer" || phase === "final_answer") sseStarted = true;
-        if (phase === "done" || obj.type === "done") {
+        const info = classifySseFrame(obj);
+        if (info.known) sseStarted = true;
+        if (info.done) {
           sseDone = true;
           break;
         }
         idx = buffer.indexOf("\n\n");
       }
       if (sseDone) break;
+    }
+    // A stream that produced events and then closed at the socket IS complete:
+    // the current upstream does not always send an explicit terminator, and
+    // requiring one made a fully answered request report sseDone=false.
+    if (!sseDone && sseStarted) {
+      sseDone = raw.trim().length > 0;
     }
     const text = extractAnswerFromSse(raw);
     return {
@@ -689,9 +717,87 @@ export async function directCompletion(input: {
 }
 
 /**
- * Minimal answer extraction from Qwen's SSE. Mirrors the shapes both working
- * references rely on: a `data:` JSON frame per delta, and an explicit
- * phase=done terminator.
+ * Classify one decoded SSE frame.
+ *
+ * The current upstream emits OpenAI-Responses-style envelopes, where the event
+ * NAME is the single top-level key:
+ *
+ *   data: {"response.created":        {...}}
+ *   data: {"response.output_text.delta":{"delta":"OK", ...}}
+ *   data: {"response.completed":      {...}}
+ *
+ * while older/other shapes carry `choices[].delta.content` or a `phase` field.
+ * Both are accepted; the terminator list deliberately does NOT include `[DONE]`
+ * alone, because the proven account stream never sends it and relying on it made
+ * a working completion look truncated.
+ */
+export interface SseFrameInfo {
+  /** Any assistant text carried by this frame. */
+  delta: string;
+  /** The stream terminator was observed. */
+  done: boolean;
+  /** The frame was a well-formed Qwen event. */
+  known: boolean;
+}
+
+const DONE_EVENT_NAMES = new Set([
+  "response.completed",
+  "response.done",
+  "response.completion",
+  "response.finished",
+]);
+
+export function classifySseFrame(obj: any): SseFrameInfo {
+  const info: SseFrameInfo = { delta: "", done: false, known: false };
+  if (!obj || typeof obj !== "object") return info;
+
+  // ── OpenAI-Responses envelope: the event name is the top-level key ──
+  for (const key of Object.keys(obj)) {
+    if (!key.startsWith("response.")) continue;
+    info.known = true;
+    if (DONE_EVENT_NAMES.has(key)) {
+      info.done = true;
+      return info;
+    }
+    if (key === "response.output_text.delta" || key === "response.text.delta") {
+      const d = obj[key]?.delta ?? obj[key]?.text ?? obj[key]?.content;
+      if (typeof d === "string") info.delta += d;
+    }
+    if (key === "response.output_text.done" || key === "response.text.done") {
+      const d = obj[key]?.text ?? obj[key]?.content;
+      if (typeof d === "string" && d.length > 0 && info.delta.length === 0) {
+        info.delta += d;
+      }
+    }
+  }
+
+  // ── Legacy choice-delta shape ──
+  const choices = Array.isArray(obj.choices) ? obj.choices : [];
+  for (const c of choices) {
+    const d = c?.delta?.content ?? c?.message?.content ?? null;
+    if (typeof d === "string" && d.length > 0) info.delta += d;
+  }
+  const nested = obj.data?.choices;
+  if (Array.isArray(nested)) {
+    for (const c of nested) {
+      const d = c?.delta?.content ?? c?.message?.content ?? null;
+      if (typeof d === "string" && d.length > 0) info.delta += d;
+    }
+  }
+  const content = obj.data?.content;
+  if (typeof content === "string" && content.length > 0) info.delta += content;
+
+  // ── phase / type terminators ──
+  const phase = obj.phase ?? obj.data?.phase ?? null;
+  if (phase === "done" || obj.type === "done") info.done = true;
+  if (obj.type === "text" || obj.type === "thinking" || phase) info.known = true;
+
+  return info;
+}
+
+/**
+ * Minimal answer extraction from Qwen's SSE, tolerant of both the
+ * `response.*` envelope and the legacy choice-delta shape.
  */
 export function extractAnswerFromSse(raw: string): string {
   let out = "";
@@ -705,23 +811,188 @@ export function extractAnswerFromSse(raw: string): string {
     } catch {
       continue;
     }
-    if (!obj || typeof obj !== "object") continue;
-    const choices = Array.isArray(obj.choices) ? obj.choices : [];
-    for (const c of choices) {
-      const delta = c?.delta?.content ?? c?.message?.content ?? null;
-      if (typeof delta === "string" && delta.length > 0) out += delta;
-    }
-    const detail = obj.data?.choices;
-    if (Array.isArray(detail)) {
-      for (const c of detail) {
-        const delta = c?.delta?.content ?? c?.message?.content ?? null;
-        if (typeof delta === "string" && delta.length > 0) out += delta;
-      }
-    }
-    const content = obj.data?.content;
-    if (typeof content === "string" && content.length > 0) out += content;
+    out += classifySseFrame(obj).delta;
   }
   return out;
+}
+
+/**
+ * Streaming variant of `directCompletion`.
+ *
+ * The difference that matters: nothing is emitted to the caller until the
+ * response is confirmed to be a real `text/event-stream`. A WAF/risk-control
+ * answer arrives as `application/json`, so the challenge is detected and can be
+ * handled BEFORE any byte reaches the client — a buffered implementation would
+ * already have committed to a failed response.
+ *
+ * Once confirmed, the body reader is pumped straight through, so the client
+ * sees genuine incremental output.
+ */
+export interface DirectCompletionStreamResult {
+  ok: boolean;
+  httpStatus: number;
+  contentType: string;
+  waf: boolean;
+  punishUrl: string | null;
+  challengeBody: string | null;
+  /** Non-null only when `ok` is true. */
+  stream: ReadableStream<Uint8Array> | null;
+}
+
+export async function directCompletionStream(input: {
+  cookie: string;
+  bearerToken: string | null;
+  chatId: string;
+  model: string;
+  content: string;
+  chatMode?: string;
+  chatType?: string;
+  enableSearch?: boolean;
+  thinkingEnabled?: boolean;
+  userAgent?: string;
+  baxia?: BaxiaMaterial | null;
+  version?: string | null;
+  signal?: AbortSignal;
+  maxBytes?: number;
+}): Promise<DirectCompletionStreamResult> {
+  const chatType = input.chatType || "t2p";
+  const model = input.model;
+  const body = JSON.stringify({
+    stream: true,
+    version: "2.1",
+    incremental_output: true,
+    chat_id: input.chatId,
+    chat_mode: input.chatMode || "normal",
+    model,
+    parent_id: null,
+    messages: [
+      {
+        id: null,
+        fid: crypto.randomUUID(),
+        parentId: null,
+        childrenIds: [crypto.randomUUID()],
+        role: "user",
+        content: input.content,
+        user_action: "chat",
+        files: [],
+        timestamp: Date.now(),
+        models: [model],
+        model: "",
+        chat_type: chatType,
+        feature_config: {
+          thinking_enabled: input.thinkingEnabled !== false,
+          output_schema: "phase",
+          research_mode: "normal",
+          auto_thinking: true,
+          thinking_mode: "Auto",
+          thinking_format: "summary",
+          auto_search: input.enableSearch === true,
+        },
+        extra: { meta: { subChatType: chatType } },
+        sub_chat_type: chatType,
+        parent_id: null,
+      },
+    ],
+    timestamp: Date.now(),
+  });
+
+  const effectiveCookie = input.cookie || input.baxia?.cookie || "";
+  let res: Response;
+  try {
+    res = await fetch(
+      qwenUrl(`/api/v2/chat/completions?chat_id=${encodeURIComponent(input.chatId)}`),
+      {
+        method: "POST",
+        headers: buildDirectQwenHeaders({
+          cookie: effectiveCookie,
+          userAgent: input.userAgent,
+          bxUa: input.baxia?.bxUa,
+          bxUmidToken: input.baxia?.bxUmidToken,
+          bxV: input.baxia?.bxV,
+          version: input.version,
+          bearerToken: input.bearerToken,
+          chatSessionId: input.chatId,
+          chatModeGuest: !input.bearerToken,
+          extra: { "x-accel-buffering": "no" },
+        }),
+        body,
+        signal: input.signal,
+      },
+    );
+  } catch (err) {
+    return {
+      ok: false,
+      httpStatus: 0,
+      contentType: "",
+      waf: false,
+      punishUrl: null,
+      challengeBody: null,
+      stream: null,
+    };
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  if (!/text\/event-stream/i.test(contentType)) {
+    // Not a stream: a WAF challenge, an app error, or a buffered answer. Read
+    // it fully so the caller can classify, and emit NOTHING downstream.
+    const raw = await res.text().catch(() => "");
+    return {
+      ok: false,
+      httpStatus: res.status,
+      contentType,
+      waf: looksLikeWafChallenge(raw, contentType),
+      punishUrl: extractPunishUrl(raw),
+      challengeBody: raw,
+      stream: null,
+    };
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    return {
+      ok: false,
+      httpStatus: res.status,
+      contentType,
+      waf: false,
+      punishUrl: null,
+      challengeBody: null,
+      stream: null,
+    };
+  }
+
+  const maxBytes = input.maxBytes ?? 8 * 1024 * 1024;
+  let emitted = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      if (value && value.length) {
+        emitted += value.length;
+        if (emitted > maxBytes) {
+          await reader.cancel().catch(() => {});
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      }
+    },
+    cancel(reason) {
+      void reader.cancel(reason).catch(() => {});
+    },
+  });
+
+  return {
+    ok: true,
+    httpStatus: res.status,
+    contentType,
+    waf: false,
+    punishUrl: null,
+    challengeBody: null,
+    stream,
+  };
 }
 
 // ── WAF recovery orchestration ─────────────────────────────────────────────
@@ -752,6 +1023,7 @@ export interface DirectWafRunResult {
 async function runLeg(args: {
   baxia: BaxiaMaterial | null;
   cookie: string;
+  bearerToken: string | null;
   model: string;
   content: string;
   chatMode: string;
@@ -766,6 +1038,7 @@ async function runLeg(args: {
     chatType: args.chatType,
     baxia: args.baxia,
     version: args.version,
+    bearerToken: args.bearerToken,
   });
   let completion: DirectCompletionResult | null = null;
   if (created.ok && created.chatId) {
@@ -798,18 +1071,21 @@ async function runLeg(args: {
 /**
  * create-chat -> completion, with AT MOST ONE WAF recovery.
  *
- * On FAIL_SYS_USER_VALIDATE / RGV587 / _____tmd_____/punish / x5sec it hands the
- * challenge body to the existing `recoverBaxiaCaptcha` coordinator (which runs
- * the slider in the ACCOUNT browser), then — only if that succeeded — discards
- * the anti-bot material, mints a fresh one from the dedicated minter, and runs a
- * BRAND NEW chat. The previous chatId is never reused and there are no loops.
+ * On FAIL_SYS_USER_VALIDATE / RGV587 / _____tmd_____/punish / x5sec the
+ * clearance is gone. Recovery is HUMAN: the official challenge is opened in the
+ * ACCOUNT browser and a person solves it. No automated slider, no third-party
+ * service. After a successful solve the cookie jar is re-read and a BRAND NEW
+ * chat is issued — the pre-recovery chatId is never reused — and the completion
+ * is retried exactly ONCE. A second challenge fails cleanly; there are no loops.
  *
- * Browser separation is preserved: account browser = session/solve; dedicated
- * minter = anti-bot material only.
+ * Browser roles stay separated: ACCOUNT browser = session + human solve;
+ * HTTP client = chats/new + completions. The dedicated Baxia minter is NOT on
+ * this path (the proven account flow does not need bx-* material).
  */
 export async function directChatWithWafRecovery(args: {
   accountId?: string;
   cookie: string;
+  bearerToken: string | null;
   model: string;
   content: string;
   chatMode: string;
@@ -818,11 +1094,14 @@ export async function directChatWithWafRecovery(args: {
   baxia: BaxiaMaterial | null;
   timeoutMs?: number;
   allowRecovery?: boolean;
+  /** Budget handed to the human solve. */
+  humanSolveTimeoutMs?: number;
 }): Promise<DirectWafRunResult> {
   const timeoutMs = args.timeoutMs ?? 90_000;
   const first = await runLeg({
     baxia: args.baxia,
     cookie: args.cookie,
+    bearerToken: args.bearerToken,
     model: args.model,
     content: args.content,
     chatMode: args.chatMode,
@@ -832,7 +1111,9 @@ export async function directChatWithWafRecovery(args: {
   });
   const comp = first.completion;
   const wafHit = Boolean(
-    comp && (comp.waf === true || /RGV587|FAIL_SYS_USER_VALIDATE/i.test(comp.bodyPreview)),
+    comp &&
+      (comp.waf === true ||
+        /RGV587|FAIL_SYS_USER_VALIDATE/i.test(comp.bodyPreview)),
   );
   if (!wafHit) {
     return {
@@ -856,18 +1137,42 @@ export async function directChatWithWafRecovery(args: {
       second: null,
     };
   }
+  if (!args.accountId) {
+    return {
+      first,
+      recoveryAttempted: false,
+      recoverySuccess: false,
+      recoveryDurationMs: 0,
+      recoverySkipReason: "no-account-id-for-human-solve",
+      postBaxiaReady: false,
+      second: null,
+    };
+  }
+
   const startedAt = Date.now();
   let recoverySuccess = false;
   let recoverySkipReason: string | null = null;
+  let recoveredCookie = args.cookie;
   try {
-    const { recoverBaxiaCaptcha } = await import("./captcha-coordinator.ts");
-    // The challenge body carries the punish URL; the coordinator extracts and
-    // validates it against the Qwen origin itself (same-origin only).
-    recoverySuccess = await recoverBaxiaCaptcha(
-      args.accountId,
-      "direct-transport",
-      { challengeBody: comp?.challengeBody ?? "" },
+    // The clearance we were refused on is now known to be useless.
+    const { invalidateX5sec } = await import("./qwen-account-session.ts");
+    invalidateX5sec(args.accountId);
+    const { recoverWithHumanCaptcha } = await import(
+      "./qwen-human-captcha.ts"
     );
+    const outcome = await recoverWithHumanCaptcha(args.accountId, {
+      // FULL body: the punish URL's x5secdata is truncated in any preview.
+      challengeBody: comp?.challengeBody ?? "",
+      timeoutMs: args.humanSolveTimeoutMs,
+    });
+    recoverySuccess = outcome.solved;
+    if (outcome.solved && outcome.cookieHeader) {
+      recoveredCookie = outcome.cookieHeader;
+    } else {
+      recoverySkipReason = outcome.solved
+        ? "solve-without-cookie-jar"
+        : "human-solve-failed";
+    }
   } catch (e) {
     recoverySkipReason =
       e instanceof Error ? e.message.slice(0, 120) : "recovery-threw";
@@ -879,27 +1184,17 @@ export async function directChatWithWafRecovery(args: {
       recoveryAttempted: true,
       recoverySuccess: false,
       recoveryDurationMs,
-      recoverySkipReason: recoverySkipReason ?? "recovery-returned-false",
+      recoverySkipReason: recoverySkipReason ?? "human-solve-failed",
       postBaxiaReady: false,
       second: null,
     };
   }
-  // Recovery cleared the challenge: the old token material is now suspect and
-  // the old chatId belongs to a pre-recovery session. Fresh material, new chat.
-  const { invalidateQwenBaxiaMaterial, mintQwenBaxiaMaterial } = await import(
-    "./qwen-baxia-minter.ts"
-  );
-  invalidateQwenBaxiaMaterial();
-  const fresh = await mintQwenBaxiaMaterial({ force: true });
-  const postBaxia = fresh
-    ? {
-        ...toBaxiaMaterial(fresh),
-        cookie: fresh.cookie,
-      }
-    : null;
+  // Clearance refreshed: NEW chat with the post-solve jar. The old chatId
+  // belongs to the pre-solve session and is deliberately discarded.
   const second = await runLeg({
-    baxia: postBaxia,
-    cookie: args.cookie,
+    baxia: null,
+    cookie: recoveredCookie,
+    bearerToken: args.bearerToken,
     model: args.model,
     content: args.content,
     chatMode: args.chatMode,
@@ -913,7 +1208,7 @@ export async function directChatWithWafRecovery(args: {
     recoverySuccess: true,
     recoveryDurationMs,
     recoverySkipReason: null,
-    postBaxiaReady: postBaxia !== null,
+    postBaxiaReady: true,
     second,
   };
 }

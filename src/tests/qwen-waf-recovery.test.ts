@@ -15,6 +15,17 @@ import {
   looksLikeWafChallenge,
 } from "../services/qwen-direct-transport.ts";
 
+/**
+ * Strip comments so static guards inspect CODE, not prose. Naming a legacy
+ * symbol in a doc comment ("the legacy solveChallengeOnPage path is untouched")
+ * is documentation, not a dependency.
+ */
+function codeOnly(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+}
+
 const RGV_BODY =
   '{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试"],' +
   '"data":{"url":"https://chat.qwen.ai:443//api/v2/chat/completions/_____tmd_____/punish?x5sec=abc123"}}';
@@ -55,9 +66,9 @@ test("waf: recovery runs at most once and never reuses the old chatId", async ()
   const block = src.slice(start, src.length);
   // Exactly one recovery invocation, no loop construct around it.
   assert.equal(
-    (block.match(/recoverBaxiaCaptcha\(/g) ?? []).length,
+    (block.match(/recoverWithHumanCaptcha\(/g) ?? []).length,
     1,
-    "must invoke the coordinator exactly once",
+    "must invoke the human-solve recovery exactly once",
   );
   assert.ok(!/while\s*\(/.test(block.split("export interface")[0]), "no retry loop");
   assert.ok(!/for\s*\(.*attempt/.test(block), "no attempt loop");
@@ -65,15 +76,26 @@ test("waf: recovery runs at most once and never reuses the old chatId", async ()
   // never reuse `first.create.chatId`.
   assert.ok(block.includes("const second = await runLeg("));
   assert.ok(!/chatId:\s*first\.create\.chatId/.test(block));
-  // Material is invalidated before the fresh mint.
-  const inv = block.indexOf("invalidateQwenBaxiaMaterial()");
-  const mint = block.indexOf("mintQwenBaxiaMaterial({ force: true })");
-  assert.ok(inv > 0 && mint > inv, "invalidate must precede the fresh mint");
+  // The clearance we were refused on is dropped before the solve, and the
+  // POST-solve jar (not the pre-solve one) drives the retry leg.
+  assert.ok(block.includes("invalidateX5sec("));
+  const solve = block.indexOf("recoverWithHumanCaptcha(");
+  const retry = block.indexOf("const second = await runLeg(");
+  assert.ok(solve > 0 && retry > solve, "solve must precede the retry leg");
+  assert.ok(block.includes("cookie: recoveredCookie"));
+  // The retry leg must NOT re-mint anti-bot material: the proven account flow
+  // needs the cookie jar + Bearer only.
+  const retryBlock = block.slice(retry);
+  assert.ok(
+    !/mintQwenBaxiaMaterial/.test(retryBlock),
+    "account retry must not depend on the Baxia minter",
+  );
 });
 
 test("waf: recovery is skipped when the caller disables it", async () => {
   const r = await directChatWithWafRecovery({
     cookie: "",
+    bearerToken: null,
     model: "qwen3.8-max",
     content: "Responde únicamente: OK",
     chatMode: "guest",
@@ -90,17 +112,24 @@ test("waf: recovery is skipped when the caller disables it", async () => {
   assert.equal(r.recoveryDurationMs >= 0, true);
 });
 
-test("waf: the orchestrator never adds an Authorization header", () => {
-  const src = fs.readFileSync("src/services/qwen-direct-transport.ts", "utf-8");
-  const builder = src.slice(
-    src.indexOf("export function buildDirectQwenHeaders"),
-    src.indexOf("export function looksLikeWafChallenge"),
+test("waf: Authorization is Bearer-gated and never sent for guest requests", async () => {
+  const { buildDirectQwenHeaders } = await import(
+    "../services/qwen-direct-transport.ts"
   );
-  assert.ok(!/Authorization/.test(builder), "no Authorization may be constructed");
-  assert.ok(!/authorization/.test(builder));
-  // The recovery path also must not inject one.
-  const orch = src.slice(src.indexOf("export async function directChatWithWafRecovery"));
-  assert.ok(!/Authorization/.test(orch));
+  // Account mode: the live JWT is REQUIRED (jar alone -> {"code":"Unauthorized"}).
+  const acct = buildDirectQwenHeaders({
+    cookie: "token=a; x5sec=b",
+    bearerToken: "JWT123",
+  });
+  assert.equal(acct["Authorization"], "Bearer JWT123");
+  // Guest mode: no Bearer at all.
+  const guest = buildDirectQwenHeaders({ cookie: "cna=x", chatModeGuest: true });
+  assert.equal(guest["Authorization"], undefined);
+  // A null/empty token must not produce a malformed "Bearer " header.
+  const empty = buildDirectQwenHeaders({ cookie: "token=a", bearerToken: null });
+  assert.equal(empty["Authorization"], undefined);
+  const blank = buildDirectQwenHeaders({ cookie: "token=a", bearerToken: "" });
+  assert.equal(blank["Authorization"], undefined);
 });
 
 test("waf: no secret values are returned or logged by the orchestration", () => {
@@ -133,11 +162,26 @@ test("waf: no secret values are returned or logged by the orchestration", () => 
 test("waf: browser roles stay separated", () => {
   const src = fs.readFileSync("src/services/qwen-direct-transport.ts", "utf-8");
   const orch = src.slice(src.indexOf("export async function directChatWithWafRecovery"));
-  // Recovery uses the coordinator (account browser); anti-bot comes from the
-  // dedicated minter. The account page is never used for material.
-  assert.ok(orch.includes("recoverBaxiaCaptcha("));
-  assert.ok(orch.includes("mintQwenBaxiaMaterial("));
+  // Recovery runs in the ACCOUNT browser (session + human solve only).
+  assert.ok(orch.includes("recoverWithHumanCaptcha("));
+  // The account direct path must NOT depend on the dedicated Baxia minter.
+  assert.ok(
+    !/mintQwenBaxiaMaterial/.test(orch),
+    "account recovery must not mint anti-bot material",
+  );
   const minter = fs.readFileSync("src/services/qwen-baxia-minter.ts", "utf-8");
   assert.ok(!/withAccountPage|accountPages|getAccountPageSnapshotHandles/.test(minter));
   assert.ok(!/captureQwenHeaders|composer|textarea/.test(orch + minter));
+  // The human-captcha module must never drive the slider itself.
+  const human = codeOnly(
+    fs.readFileSync("src/services/qwen-human-captcha.ts", "utf-8"),
+  );
+  assert.ok(
+    !/solveBaxiaCaptcha|solveChallengeOnPage/.test(human),
+    "human captcha path must not invoke the automatic solver",
+  );
+  // The legacy automatic solver is preserved for the legacy transport.
+  const coord = fs.readFileSync("src/services/captcha-coordinator.ts", "utf-8");
+  assert.ok(coord.includes("recoverBaxiaCaptcha"));
+  assert.ok(coord.includes("solveChallengeOnPage"));
 });

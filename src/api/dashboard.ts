@@ -806,15 +806,21 @@ dashboardApp.post("/v1/accounts/:id/probe-direct-waf", async (c) => {
     const minter = await import("../services/qwen-baxia-minter.js");
     const baxia = await direct.getBaxiaMaterial();
     let cookie = baxia?.cookie ?? "";
+    // Account mode needs BOTH the live cookie jar and the account JWT: the jar
+    // alone is the guest credential and yields {"code":"Unauthorized"}.
+    let bearerToken: string | null = null;
     if (mode === "account") {
       const { getQwenHeaders } = await import("../services/auth-playwright.js");
       const { headers } = await getQwenHeaders(false, id);
       cookie = headers["cookie"] || "";
+      const auth = headers["authorization"] || "";
+      bearerToken = auth.replace(/^Bearer\s+/i, "") || null;
     }
     const ver = version || (mode === "guest" ? "0.2.83" : await direct.getFrontendVersion());
     const r = await direct.directChatWithWafRecovery({
       accountId: id,
       cookie,
+      bearerToken,
       model,
       content: prompt,
       chatMode: mode === "guest" ? "guest" : "normal",

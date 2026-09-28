@@ -79,6 +79,11 @@ const envSchema = z
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
+    /**
+     * Direct Web Transport feature flag. Opt-in: default "false" keeps the
+     * legacy browser transport as the production chat path.
+     */
+    QWEN_DIRECT_WEB_TRANSPORT: z.string().default("false"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
     CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
@@ -384,6 +389,14 @@ export const config = {
       env.QWEN_PERSONALIZATION_FROM_REQUEST === "true",
     personalizationVerifyGet: env.QWEN_PERSONALIZATION_VERIFY_GET !== "false",
     /** "thread" (reuse upstream chat) or "temp" (new ephemeral chat per request). */
+    /**
+     * Direct Web Transport: account-mode chats/new + chat/completions issued as
+     * plain HTTP carrying the account Bearer JWT and the live cookie jar
+     * (including the `x5sec` clearance produced by a human solve). DEFAULT
+     * FALSE — the legacy browser transport remains the production path until
+     * this is explicitly enabled.
+     */
+    directWebTransport: env.QWEN_DIRECT_WEB_TRANSPORT === "true",
     /** When true, all requests (personalization, models, media, chat) route exclusively through the browser page (no direct Node fetch). */
     browserOnlyFetch: env.QWEN_BROWSER_ONLY_FETCH !== "false",
     mapOpenAiModels: env.QWEN_MAP_OPENAI_MODELS !== "false",

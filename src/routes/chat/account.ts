@@ -57,6 +57,7 @@ import {
 	syncQwenRequestPersonalization,
 	updateLogicalThreadState,
 } from "../../services/qwen.ts";
+import { createStreamForAccount } from "../../services/qwen-transport-dispatch.ts";
 import type { TokenEstimationContext } from "../../services/token-estimation-metrics.ts";
 import {
   buildContextMeterSnapshot,
@@ -1297,7 +1298,27 @@ async function tryCreateStreamWithRetry(
 					acquireDeadlineTimer.unref?.();
 				});
 				result = await Promise.race([
-					runWithLatencyRequest(params.reqId, () => createQwenStream(
+					runWithLatencyRequest(params.reqId, () => createStreamForAccount({
+						prompt: promptForUpstream,
+						isThinkingModel: params.isThinkingModel,
+						model: params.model,
+						threadParentId,
+						accountId: currentAccountId === "global" ? undefined : currentAccountId,
+						files: params.allFiles.length > 0 ? params.allFiles : undefined,
+						options: params.forceNewChat || params.useThreadNative || params.parallelEscape
+							? {
+									chatSessionId:
+										params.forceNewChat || params.parallelEscape
+											? null
+											: (params.existingThread?.chatSessionId ?? null),
+									forceNewChat: false,
+									reasoningMode: params.reasoningMode,
+									parallelEscape: params.parallelEscape,
+									chatMode: params.chatMode,
+								}
+							: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
+						signal: combinedSignal,
+					}, () => createQwenStream(
 						promptForUpstream,
 						params.isThinkingModel,
 						params.model,
@@ -1317,7 +1338,7 @@ async function tryCreateStreamWithRetry(
 								}
 							: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
 						combinedSignal,
-					)),
+					))),
 					acquireDeadline,
 				]);
 				// The acquire won: stop the deadline so it cannot fire later and
