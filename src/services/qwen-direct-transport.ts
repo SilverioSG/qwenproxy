@@ -102,9 +102,42 @@ export async function getBaxiaMaterial(
 
   const task = (async (): Promise<BaxiaMaterial | null> => {
     try {
-      const { getAccountPageSnapshotHandles } = await import("./playwright.ts");
-      const handles = getAccountPageSnapshotHandles(accountId);
+      const playwright = await import("./playwright.ts");
+      let handles = playwright.getAccountPageSnapshotHandles(accountId);
+      if (!handles) {
+        // The account page is created lazily. The browser is needed ONLY to
+        // host the real Baxia SDK (qwen2api reaches the very same
+        // window.__baxia__ object, just through its own CDP connection).
+        try {
+          const { loadAccounts } = await import("../core/accounts.ts");
+          const acct = loadAccounts().find((a) => a.id === accountId);
+          if (acct) {
+            await playwright.initPlaywrightForAccount(acct, undefined, undefined, {
+              // No UI capture: the transport no longer needs it.
+              skipHeaderCapture: true,
+            });
+          }
+        } catch {
+          // Fall through: a missing page means no anti-bot material.
+        }
+        handles = playwright.getAccountPageSnapshotHandles(accountId);
+      }
       if (!handles) return null;
+      // The SDK lives on the chat document; make sure we are on it.
+      try {
+        const pg = handles.page as { url?: () => string; goto?: unknown };
+        const current = typeof pg.url === "function" ? pg.url() : "";
+        if (!current.includes("chat.qwen.ai")) {
+          await (
+            pg as unknown as {
+              goto: (u: string, o: unknown) => Promise<unknown>;
+            }
+          ).goto(qwenUrl("/"), { waitUntil: "domcontentloaded", timeout: 30_000 });
+        }
+      } catch {
+        // Navigation problems are handled by the evaluate below returning
+        // not-ready.
+      }
       const page = handles.page as {
         evaluate: (fn: unknown, arg?: unknown) => Promise<unknown>;
       };
