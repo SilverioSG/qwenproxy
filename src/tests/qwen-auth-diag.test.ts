@@ -438,19 +438,38 @@ test("qwen-auth-diag: bisect structure present with budget and confirm sequence"
 
 test("qwen-auth-diag: personalization omits cached version header", () => {
   const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
-  const idx = src.indexOf("Bisect-proven (same context/session)");
-  assert.ok(idx >= 0);
-  const block = src.slice(idx - 400, idx + 600);
-  assert.ok(block.includes('delete requestHeaders["version"]'));
+  // The bisect-proven strip now lives in one helper, and the personalization
+  // path must go through it.
+  const helper = src.indexOf("export function buildPersonalizationRequestHeaders");
+  assert.ok(helper >= 0);
+  assert.ok(
+    src.slice(helper, helper + 600).includes('delete requestHeaders["version"]'),
+  );
+  const syncIdx = src.indexOf("export async function syncQwenRequestPersonalization");
+  const syncBlock = src.slice(syncIdx, syncIdx + 4000);
+  assert.ok(
+    syncBlock.includes("buildPersonalizationRequestHeaders("),
+    "syncQwenRequestPersonalization must build its headers via the helper",
+  );
   // Create-chat path must keep version untouched.
   const pool = fs.readFileSync("src/services/qwen-chat-pool.ts", "utf-8");
   assert.ok(!pool.includes('delete requestHeaders["version"]'));
+  assert.ok(!pool.includes("buildPersonalizationRequestHeaders"));
 });
 
 test("qwen-auth-diag: version strip is personalization-scoped", () => {
   const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
+  // Exactly one place strips it: buildPersonalizationRequestHeaders.
   const occurrences = src.split('delete requestHeaders["version"]').length - 1;
-  assert.equal(occurrences, 2);
+  assert.equal(occurrences, 1);
+  const helper = src.indexOf("export function buildPersonalizationRequestHeaders");
+  assert.ok(helper >= 0);
+  const block = src.slice(helper, helper + 600);
+  assert.ok(block.includes('delete requestHeaders["version"]'));
+  assert.ok(block.includes('delete requestHeaders["Version"]'));
+  // Both production settings/update attempts route through the helper.
+  const uses = src.split("buildPersonalizationRequestHeaders(").length - 1;
+  assert.equal(uses, 4, "definition + declaration type + 3 call sites");
 });
 
 test("qwen-auth-diag: create-chat omits version, preserves other headers", () => {
@@ -467,7 +486,7 @@ test("qwen-auth-diag: create-chat omits version, preserves other headers", () =>
   const qwen = fs.readFileSync("src/services/qwen.ts", "utf-8");
   assert.equal(
     qwen.split('delete requestHeaders["version"]').length - 1,
-    2,
+    1,
   );
 });
 

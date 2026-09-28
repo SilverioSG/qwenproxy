@@ -2484,6 +2484,175 @@ async function requestQwenPersonalizationInBrowser(
   return { status: response.status, raw, json };
 }
 
+/**
+ * DIAGNOSTIC ONLY — A/B of POST /api/v2/users/user/settings/update.
+ *
+ * variant "proxy": byte-for-byte the request syncQwenRequestPersonalization
+ *   builds today (captured anti-bot headers via buildCapturedQwenHeaders,
+ *   `version` stripped, cookie-only routing, same payload builder).
+ * variant "spa":  what the live SPA issues — the page's own patched `fetch`
+ *   adds the anti-bot header set itself, so the app code only sets
+ *   Content-Type/Accept and lets the page supply the rest.
+ *
+ * Same page, same context, same session, no re-login, no refresh, no context
+ * recreation. Sanitized output only: header NAMES/presence, body keys and a
+ * body hash. Never header or body values.
+ */
+export type SettingsUpdateVariant =
+  | "proxy"
+  | "spa"
+  | "proxy-minus-bx"
+  | "proxy-minus-secch"
+  | "proxy-minus-source"
+  | "proxy-plus-origins"
+  | "spa-plus-version"
+  | "proxy-no-body-keys";
+
+export async function probeSettingsUpdateAB(
+  accountId: string,
+  variant: SettingsUpdateVariant = "proxy",
+): Promise<{
+  variant: string;
+  status: number;
+  appSuccess: boolean | null;
+  appUnauthorized: boolean;
+  topKeys: string[];
+  errorCode: string | null;
+  request: {
+    url: string;
+    method: string;
+    bodyKeys: string[];
+    bodyHash: string;
+    contentType: string | null;
+    source: string | null;
+    timezonePresent: boolean;
+    xRequestIdPresent: boolean;
+    xRequestOrigin: string | null;
+    versionPresent: boolean;
+    authorizationPresent: boolean;
+    secChUaPresent: boolean;
+    secChUaMobilePresent: boolean;
+    secChUaPlatformPresent: boolean;
+    bxVPresent: boolean;
+    bxUaPresent: boolean;
+    bxUmidtokenPresent: boolean;
+    acceptPresent: boolean;
+    cookieMode: string;
+    referrer: string | null;
+  };
+}> {
+  const { headers } = await getQwenHeaders(false, accountId);
+  // Live settings, fetched with the proxy's own GET (also the login-valid probe).
+  const getRes = await requestQwenPersonalizationInBrowser(
+    accountId,
+    "GET",
+    "/api/v2/users/user/settings",
+    buildCapturedQwenHeaders(headers, { referer: qwenUrl("/settings/personalization") }),
+  );
+  const currentSettings = getRes.json?.data ?? null;
+  const payload = buildQwenSettingsUpdatePayload(currentSettings, "");
+  const payloadJson = JSON.stringify(payload);
+  const referer = qwenUrl("/settings/personalization");
+
+  // The proxy's request headers, then the per-variant mutation.
+  let requestHeaders: Record<string, string> =
+    buildPersonalizationRequestHeaders(headers, referer);
+  let dropBodyKeys = false;
+  switch (variant) {
+    case "proxy":
+      break;
+    case "spa":
+      // The SPA app code only declares the content type; the page's patched
+      // fetch injects accept/source/bx-*/sec-ch-*/version itself.
+      requestHeaders = { "Content-Type": "application/json" };
+      break;
+    case "spa-plus-version":
+      requestHeaders = { "Content-Type": "application/json", version: headers["version"] || "" };
+      break;
+    case "proxy-minus-bx":
+      delete requestHeaders["bx-ua"];
+      delete requestHeaders["bx-umidtoken"];
+      delete requestHeaders["bx-v"];
+      break;
+    case "proxy-minus-secch":
+      delete requestHeaders["sec-ch-ua"];
+      delete requestHeaders["sec-ch-ua-mobile"];
+      delete requestHeaders["sec-ch-ua-platform"];
+      break;
+    case "proxy-minus-source":
+      delete requestHeaders["source"];
+      break;
+    case "proxy-plus-origins":
+      requestHeaders["x-request-origin"] = "web";
+      requestHeaders["x-request-id"] = crypto.randomUUID();
+      requestHeaders["timezone"] = "UTC";
+      break;
+    case "proxy-no-body-keys":
+      dropBodyKeys = true;
+      break;
+  }
+
+  const bodyJson = dropBodyKeys ? JSON.stringify({}) : payloadJson;
+  const res = await requestQwenTextInBrowser(
+    accountId,
+    "POST",
+    "/api/v2/users/user/settings/update",
+    requestHeaders,
+    bodyJson,
+    { settingsPage: true, referrer: referer },
+  );
+  const raw = await res.text();
+  let json: any = null;
+  try {
+    json = raw ? JSON.parse(raw) : null;
+  } catch {
+    json = null;
+  }
+  const eff = getBrowserFetchHeaders(requestHeaders);
+  const appSuccess =
+    json && typeof json === "object" ? json.success === true : null;
+  const code = json?.data?.code ?? json?.code ?? null;
+  return {
+    variant,
+    status: res.status,
+    appSuccess,
+    appUnauthorized: isAppUnauthorized(res.status, raw),
+    topKeys: json && typeof json === "object" ? Object.keys(json).slice(0, 10) : [],
+    errorCode: code === null ? null : String(code),
+    request: {
+      url: qwenUrl("/api/v2/users/user/settings/update"),
+      method: "POST",
+      bodyKeys: Object.keys(dropBodyKeys ? {} : payload),
+      bodyHash: traceBodyHash(bodyJson),
+      contentType: eff["content-type"] ?? eff["Content-Type"] ?? null,
+      source: eff["source"] ?? null,
+      timezonePresent: Boolean(eff["timezone"]),
+      xRequestIdPresent: Boolean(eff["x-request-id"]),
+      xRequestOrigin: eff["x-request-origin"] ?? null,
+      versionPresent: Boolean(eff["version"] ?? eff["Version"]),
+      authorizationPresent: Boolean(eff["authorization"] ?? eff["Authorization"]),
+      secChUaPresent: Boolean(eff["sec-ch-ua"]),
+      secChUaMobilePresent: Boolean(eff["sec-ch-ua-mobile"]),
+      secChUaPlatformPresent: Boolean(eff["sec-ch-ua-platform"]),
+      bxVPresent: Boolean(eff["bx-v"]),
+      bxUaPresent: Boolean(eff["bx-ua"]),
+      bxUmidtokenPresent: Boolean(eff["bx-umidtoken"]),
+      acceptPresent: Boolean(eff["accept"]),
+      cookieMode: "include",
+      referrer: referer,
+    },
+  };
+}
+
+/** Stable short hash of a JSON body (values never logged). */
+function traceBodyHash(v: string): string {
+  try {
+    return crypto.createHash("sha256").update(v, "utf8").digest("hex").slice(0, 12);
+  } catch {
+    return "hash-error";
+  }
+}
+
 async function cancelQwenBrowserStream(
   accountId: string,
   requestId: string,
@@ -2881,6 +3050,23 @@ async function createQwenBrowserResponse(
   }
 }
 
+/**
+ * Personalization / settings request headers.
+ *
+ * Bisect-proven on an identical session: the cached `version` header turns
+ * settings/personalization into appUnauthorized, so it is stripped here and
+ * ONLY here. Chat requests keep their own path (qwen-chat-pool.ts) untouched.
+ */
+export function buildPersonalizationRequestHeaders(
+  headers: Record<string, string>,
+  referer: string,
+): Record<string, string> {
+  const requestHeaders = buildCapturedQwenHeaders(headers, { referer });
+  delete requestHeaders["version"];
+  delete requestHeaders["Version"];
+  return requestHeaders;
+}
+
 export async function syncQwenRequestPersonalization(
   instruction: string,
   accountId?: string,
@@ -2919,13 +3105,10 @@ export async function syncQwenRequestPersonalization(
   }
 
   const { headers } = await getQwenHeaders(forceRefresh, accountId);
-  let requestHeaders = buildCapturedQwenHeaders(headers, {
-    referer: qwenUrl("/settings/personalization"),
-  });
-  // Bisect-proven (same context/session): the cached `version` header turns
-  // settings/personalization into appUnauthorized; omit it here only.
-  delete requestHeaders["version"];
-  delete requestHeaders["Version"];
+  let requestHeaders = buildPersonalizationRequestHeaders(
+    headers,
+    qwenUrl("/settings/personalization"),
+  );
   let currentSettings: any = null;
   let payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
 
@@ -3103,11 +3286,10 @@ export async function syncQwenRequestPersonalization(
     try {
       currentSettings = null;
       const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
-      requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
-        referer: qwenUrl("/settings/personalization"),
-      });
-      delete requestHeaders["version"];
-      delete requestHeaders["Version"];
+      requestHeaders = buildPersonalizationRequestHeaders(
+        freshHeaders,
+        qwenUrl("/settings/personalization"),
+      );
       ({ raw, json } = await attemptPost(requestHeaders));
     } catch (retryErr) {
       // Layer 3: Retry failed → non-fatal, continue without personalization

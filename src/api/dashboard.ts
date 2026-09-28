@@ -689,6 +689,46 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
   }
 });
 
+dashboardApp.post("/v1/accounts/:id/probe-settings-update", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: A/B of POST /api/v2/users/user/settings/update in
+  // ONE already-authenticated page/context. No re-login, no refresh, no context
+  // recreation, no /v1 traffic, no cooldown or rotation changes. Sanitized only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const variants = (c.req.query("variants") ?? "proxy,spa")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  try {
+    const { probeSettingsUpdateAB } = await import("../services/qwen.js");
+    const results = [];
+    for (const v of variants) {
+      try {
+        results.push(await probeSettingsUpdateAB(id, v as never));
+      } catch (err) {
+        results.push({
+          variant: v,
+          status: 0,
+          appSuccess: null,
+          appUnauthorized: false,
+          topKeys: [],
+          errorCode: null,
+          request: null,
+          error: err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160),
+        });
+      }
+    }
+    return c.json({ ok: true, accountId: id, results });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
 dashboardApp.post("/v1/accounts/:id/probe-chat-shaping", async (c) => {
   // EXPERIMENTAL DIAGNOSTIC: fresh loginViaApi, then baseline minimal
   // create-chat, single-header additions (stop at first failure), group
