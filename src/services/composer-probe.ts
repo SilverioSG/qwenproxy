@@ -94,6 +94,12 @@ export interface ComposerProbeResult {
 /** In-page install: state probe + event recorder. Array-literal helpers only
  *  (esbuild keepNames wraps named function expressions in __name, which the
  *  page does not have — regression d3c7140). */
+/**
+ * Installed with `page.addInitScript`, so it re-runs on EVERY document. The
+ * capture navigates to chat.qwen.ai after the probe starts, which destroys the
+ * JS context; a probe installed once on the previous document is wiped along
+ * with its listeners, which is why the first two runs recorded nothing.
+ */
 export const COMPOSER_INSTALL_FN = `
 (args) => {
   const COMPOSER_SEL = args.selectors[0];
@@ -379,9 +385,16 @@ export async function probeComposerDuringCapture(
       // Observer must never break the capture.
     }
   };
-  let installRaw: unknown = null;
+  const page2 = handles.page as {
+    addInitScript?: (fn: unknown, arg?: unknown) => Promise<void>;
+  };
   try {
-    installRaw = await page.evaluate(
+    const initScript = page2.addInitScript;
+    if (typeof initScript !== "function") {
+      return { ...empty, error: "addInitScript-unavailable" };
+    }
+    await initScript.call(
+      handles.page,
       compileInPage(COMPOSER_INSTALL_FN),
       {
         selectors: [
@@ -408,8 +421,8 @@ export async function probeComposerDuringCapture(
       return null;
     }
   };
+  const pre = await snap("pre");
 
-  const pre = toComposerState(installRaw);
   let captureError: string | null = null;
   try {
     await runCapture();

@@ -211,6 +211,22 @@ test("composer-probe: compiled in-page closures actually run", () => {
   assert.equal(win.__qwenComposerProbe, undefined);
 });
 
+test("composer-probe: the collector is installed with addInitScript, not once", () => {
+  // Regression guard: the capture navigates to chat.qwen.ai, which destroys the
+  // JS context. A one-shot evaluate install is wiped along with its listeners.
+  const src = fs.readFileSync("src/services/composer-probe.ts", "utf-8");
+  assert.ok(src.includes("addInitScript"), "must install via addInitScript");
+  assert.ok(
+    !/installRaw = await page\.evaluate/.test(src),
+    "no one-shot evaluate install",
+  );
+  assert.ok(COMPOSER_INSTALL_FN.includes("COMPOSER_SEL = args.selectors[0]"));
+  assert.ok(
+    COMPOSER_INSTALL_FN.includes("window.__qwenComposerProbe = {"),
+    "collector is re-created per document",
+  );
+});
+
 test("composer-probe: the collector is persisted on window, not per-evaluate state", () => {
   // Regression guard: page.evaluate serializes its argument per call, so an
   // object handed in from Node is a fresh copy and nothing would ever persist.
