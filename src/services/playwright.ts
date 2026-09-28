@@ -2562,6 +2562,16 @@ export async function probeLoginOnce(accountId: string): Promise<{
   const { snapshotSessionState: snapState } = await import(
     "./session-tracer.ts"
   ).catch(() => ({ snapshotSessionState: null as never }));
+  // Observational only: bracket each minimal reading so the exact operation
+  // that drops localStorage.token is attributable. Never gates, never writes.
+  const lsMark = async (label: string): Promise<void> => {
+    try {
+      const { traceLsCheckpoint } = await import("./session-tracer.ts");
+      await traceLsCheckpoint(accountId, label).catch(() => {});
+    } catch {
+      // Tracing must never break the probe.
+    }
+  };
   const takeSnap = async () => {
     try {
       if (!snapState) return null;
@@ -2573,18 +2583,26 @@ export async function probeLoginOnce(accountId: string): Promise<{
       return null;
     }
   };
+  await lsMark("probe-post-login");
   const snap0 = await takeSnap();
+  await lsMark("probe-models-pre");
   const m = await runFetch("GET", qwenUrl("/api/models"));
   result.models = { status: m.status, appFail: m.appFail };
+  await lsMark("probe-models-post");
+  await lsMark("probe-settings-pre");
   const s = await runFetch("GET", qwenUrl("/api/v2/users/user/settings"));
   result.settings = { status: s.status, appFail: s.appFail };
+  await lsMark("probe-settings-post");
+  await lsMark("probe-create-chat-pre");
   const cc = await runFetch(
     "POST",
     qwenUrl("/api/v2/chats/new"),
     JSON.stringify({ chatId: "", models: ["qwen3.8-max"], project_id: "", timestamp: Date.now() }),
   );
   result.createChat = cc;
+  await lsMark("probe-create-chat-post");
   const snap1 = await takeSnap();
+  await lsMark("probe-after-minimal");
   // B: same page, full pipeline header set from the live runtime cache
   // (minus cookie/Authorization values, which stay server-side; only names
   // and outcomes are reported).

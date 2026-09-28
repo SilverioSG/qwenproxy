@@ -492,3 +492,43 @@ test("qwen-auth-diag: login trace carries phase fields, never secrets", async ()
   }
 });
 
+
+test("qwen-auth-diag: probeLoginOnce brackets every minimal reading", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("export async function probeLoginOnce");
+  assert.ok(start >= 0);
+  const end = src.indexOf("\n}\n", src.indexOf("snapAfterFull", start));
+  assert.ok(end > start);
+  const block = src.slice(start, end);
+  const expected = [
+    "probe-post-login",
+    "probe-models-pre",
+    "probe-models-post",
+    "probe-settings-pre",
+    "probe-settings-post",
+    "probe-create-chat-pre",
+    "probe-create-chat-post",
+    "probe-after-minimal",
+  ];
+  let cursor = -1;
+  for (const label of expected) {
+    const idx = block.indexOf(`"${label}"`);
+    assert.ok(idx >= 0, `missing checkpoint ${label}`);
+    assert.ok(idx > cursor, `checkpoint ${label} is out of order`);
+    cursor = idx;
+    const callIdx = block.lastIndexOf("await lsMark(", idx);
+    assert.ok(callIdx >= 0, `${label} is not emitted via lsMark`);
+  }
+  // The A/B full-header and bisect phases must stay after probe-after-minimal.
+  assert.ok(block.indexOf("fullExtra") > block.indexOf('"probe-after-minimal"'));
+});
+
+test("qwen-auth-diag: probe LS marks are observational (no functional gate)", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("const lsMark = async (label: string)");
+  assert.ok(start >= 0);
+  const block = src.slice(start, start + 400);
+  assert.ok(block.includes(".catch(() => {})"));
+  // No early return / throw: a checkpoint must never abort the probe.
+  assert.ok(!/return false|throw /.test(block));
+});
