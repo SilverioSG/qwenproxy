@@ -431,6 +431,74 @@ interface InPageSubResult {
   lsWriteObserved: boolean | null;
 }
 
+export interface PageLoginProbeOptions {
+  /**
+   * Post-login validation mode. `/api/v1/auths/` and the cross-origin
+   * `auth.qwen.ai/api/v2/auths/refresh` both mint/rotate the session cookie;
+   * calling them right after installing a token makes the SPA drop
+   * `localStorage.token` and set `qwen_token_logged_out_marker`, i.e. the probe
+   * invalidates the state it is verifying. In this mode the probe performs the
+   * single non-mutating read (`/api/v2/users/user/settings`) only.
+   */
+  nonMutating?: boolean;
+}
+
+/** Sanitized session presence (hashed forms only). */
+interface SessionPresence {
+  lsPresent: boolean;
+  lsHash: string | null;
+  cookiePresent: boolean;
+  cookieHash: string | null;
+  marker: boolean;
+}
+
+/**
+ * Read localStorage.token presence, the context `token` cookie (httpOnly-safe,
+ * read from the jar) and the logged-out marker. Never mutates anything.
+ */
+async function readSessionPresence(page: Page): Promise<SessionPresence> {
+  const out: SessionPresence = {
+    lsPresent: false,
+    lsHash: null,
+    cookiePresent: false,
+    cookieHash: null,
+    marker: false,
+  };
+  try {
+    const v = (await page
+      .evaluate((): unknown => {
+        try {
+          const t = localStorage.getItem("token");
+          return {
+            token: typeof t === "string" && t.length > 0 ? t : null,
+            marker: Boolean(localStorage.getItem("qwen_token_logged_out_marker")),
+          };
+        } catch {
+          return null;
+        }
+      })
+      .catch(() => null)) as { token: string | null; marker: boolean } | null;
+    if (v && typeof v.token === "string" && v.token.length > 0) {
+      out.lsPresent = true;
+      out.lsHash = traceHashStr(v.token);
+    }
+    out.marker = v?.marker === true;
+  } catch {
+    // Best effort.
+  }
+  try {
+    const cookies = await page.context().cookies().catch(() => []);
+    const tok = cookies.find((c: { name: string; value: string }) => c.name === "token");
+    if (tok && tok.value) {
+      out.cookiePresent = true;
+      out.cookieHash = traceHashStr(tok.value);
+    }
+  } catch {
+    // Best effort.
+  }
+  return out;
+}
+
 interface PageLoginProbeOutcome {
   reason: PageLoginProbeReason;
   obs: InPageObservation[];
@@ -457,7 +525,9 @@ function accountIdForPage(page: unknown): string | null {
 export async function probePageLoggedIn(
   page: Page,
   timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+  options: PageLoginProbeOptions = {},
 ): Promise<PageLoginProbe> {
+  const nonMutating = options.nonMutating === true;
   if (!page) return { ok: false, reason: "no-page" };
   if (typeof page.isClosed === "function" && page.isClosed()) {
     return { ok: false, reason: "page-closed" };
@@ -478,10 +548,17 @@ export async function probePageLoggedIn(
     const isTraced = traceAccount !== null;
     const probe = page
       .evaluate(
-        async (args: { trace: boolean }): Promise<PageLoginProbeOutcome> => {
+        async (args: {
+          trace: boolean;
+          nonMutating: boolean;
+        }): Promise<PageLoginProbeOutcome> => {
           const OBS: InPageObservation[] = [];
           const RES: InPageSubResult[] = [];
           const TRACE = args.trace === true;
+          // Post-login validation mode: /api/v1/auths/ and the cross-origin
+          // refresh both rotate the session cookie (see PageLoginProbeOptions),
+          // so they are skipped and settings becomes the only read.
+          const NON_MUTATING = args.nonMutating === true;
           // NOTE: these helpers live in array literals on purpose. esbuild with
           // keepNames rewrites named function expressions AND declarations to
           // __name(f, "f"), and __name does not exist in the page (regression
@@ -556,8 +633,10 @@ export async function probePageLoggedIn(
             }
 
             SNAP[0]("auths-pre");
-            const res = await fetch("/api/v1/auths/", { method: "GET" });
-            if (TRACE) {
+            const res = NON_MUTATING
+              ? null
+              : await fetch("/api/v1/auths/", { method: "GET" });
+            if (TRACE && res !== null) {
               RES.push({
                 step: "auths",
                 httpStatus: res.status,
@@ -574,8 +653,13 @@ export async function probePageLoggedIn(
             SNAP[0]("auths-post-50ms");
             await WAIT[0](200);
             SNAP[0]("auths-post-250ms");
-            if (res.status !== 200) return { reason: "auths-status", obs: OBS, res: RES };
-            const json: any = await res.json().catch(() => null);
+            if (res === null) {
+              // Non-mutating mode: skip the schema checks (there is no auths
+              // payload) and go straight to the single settings read below.
+            } else if (res.status !== 200) {
+              return { reason: "auths-status", obs: OBS, res: RES };
+            }
+            const json: any = res === null ? null : await res.json().catch(() => null);
             if (TRACE) {
               const last = RES[RES.length - 1];
               if (last) {
@@ -589,10 +673,13 @@ export async function probePageLoggedIn(
                     : null;
               }
             }
-            if (!json) return { reason: "auths-schema", obs: OBS, res: RES };
-            if (json.success === false) return { reason: "auths-schema", obs: OBS, res: RES };
+            if (res !== null && !json) return { reason: "auths-schema", obs: OBS, res: RES };
+            if (res !== null && json.success === false) {
+              return { reason: "auths-schema", obs: OBS, res: RES };
+            }
             if (
-              json.code &&
+              res !== null &&
+              json &&
               json.code !== 200 &&
               json.code !== "200" &&
               json.code !== 0 &&
@@ -600,22 +687,26 @@ export async function probePageLoggedIn(
             ) {
               return { reason: "auths-schema", obs: OBS, res: RES };
             }
-            const user = json.data?.user || json.data || json;
-            if (!user || typeof user !== "object") return { reason: "auths-schema", obs: OBS, res: RES };
-            if (user.is_guest === true || user.is_login === false) {
-              return { reason: "auths-schema", obs: OBS, res: RES };
+            if (res !== null) {
+              const user = json.data?.user || json.data || json;
+              if (!user || typeof user !== "object") {
+                return { reason: "auths-schema", obs: OBS, res: RES };
+              }
+              if (user.is_guest === true || user.is_login === false) {
+                return { reason: "auths-schema", obs: OBS, res: RES };
+              }
+              const hasIdentity = Boolean(
+                user.id ||
+                  user.user_id ||
+                  user.userId ||
+                  user.email ||
+                  user.name ||
+                  json.data?.token ||
+                  json.token ||
+                  user.token,
+              );
+              if (!hasIdentity) return { reason: "auths-schema", obs: OBS, res: RES };
             }
-            const hasIdentity = Boolean(
-              user.id ||
-                user.user_id ||
-                user.userId ||
-                user.email ||
-                user.name ||
-                json.data?.token ||
-                json.token ||
-                user.token,
-            );
-            if (!hasIdentity) return { reason: "auths-schema", obs: OBS, res: RES };
 
             // Check if Alibaba revoked the session upstream via same-origin settings
             try {
@@ -676,8 +767,13 @@ export async function probePageLoggedIn(
               }
             } catch {}
 
-            // Fallback cross-origin refresh probe
+            // Fallback cross-origin refresh probe (skipped in non-mutating
+            // mode: this endpoint mints a new session token).
             try {
+              if (NON_MUTATING) {
+                SNAP[0]("isloggedin-exit");
+                return { reason: "ok", obs: OBS, res: RES };
+              }
               SNAP[0]("refresh-pre");
               const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
                 method: "GET",
@@ -759,7 +855,7 @@ export async function probePageLoggedIn(
             return { reason: "evaluate-error", obs: OBS, res: RES };
           }
         },
-        { trace: isTraced },
+        { trace: isTraced, nonMutating },
       )
       .catch(
         (): PageLoginProbeOutcome => ({ reason: "evaluate-error", obs: [], res: [] }),
@@ -813,8 +909,9 @@ export async function probePageLoggedIn(
 export async function isPageLoggedIn(
   page: Page,
   timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+  options: PageLoginProbeOptions = {},
 ): Promise<boolean> {
-  return (await probePageLoggedIn(page, timeoutMs)).ok;
+  return (await probePageLoggedIn(page, timeoutMs, options)).ok;
 }
 
 export async function getOrLaunchSharedBrowser(
@@ -2696,6 +2793,18 @@ export interface LoginAttemptTrace {
   tokenHashAfter: string | null;
   tokenChanged: boolean | null;
   challengeSignals: string[];
+  postValidationReason: string;
+  postValidation: {
+    nonMutating: boolean;
+    settingsStatus: number;
+    settingsAppFail: boolean;
+    before: { lsPresent: boolean; cookiePresent: boolean; marker: boolean };
+    after: { lsPresent: boolean; cookiePresent: boolean; marker: boolean };
+    cookieRotated: boolean;
+    lsRemoved: boolean;
+    markerCreated: boolean;
+    invariant: "OK" | "VIOLATED";
+  };
 }
 
 const lastLoginTraces = new Map<string, LoginAttemptTrace>();
@@ -3162,6 +3271,18 @@ async function loginViaApi(
     tokenHashAfter: null,
     tokenChanged: null,
     challengeSignals: [],
+    postValidationReason: "",
+    postValidation: {
+      nonMutating: true,
+      settingsStatus: 0,
+      settingsAppFail: false,
+      before: { lsPresent: false, cookiePresent: false, marker: false },
+      after: { lsPresent: false, cookiePresent: false, marker: false },
+      cookieRotated: false,
+      lsRemoved: false,
+      markerCreated: false,
+      invariant: "OK",
+    },
   };
   const storeTrace = (): void => {
     if (accountId) lastLoginTraces.set(accountId, trace);
@@ -3422,10 +3543,67 @@ async function loginViaApi(
         } catch {
           // Tracing must never break login.
         }
+        // Post-login validation MUST be non-mutating: the full probe calls
+        // /api/v1/auths/ and auth.qwen.ai/api/v2/auths/refresh, both of which
+        // rotate the session cookie, which makes the SPA drop
+        // localStorage.token and set qwen_token_logged_out_marker right after
+        // we installed it. The single settings read is enough to confirm the
+        // session and does not rotate anything.
+        const pvBefore = await readSessionPresence(page);
         try {
-          trace.validated = await isPageLoggedIn(page, 3000);
+          // probePageLoggedIn (what isPageLoggedIn delegates to) is called
+          // directly so the validation reason is available for telemetry.
+          const pvRes = await probePageLoggedIn(page, 3000, {
+            nonMutating: true,
+          });
+          trace.validated = pvRes.ok;
+          const pv0 = trace.postValidation;
+          pv0.settingsStatus = pvRes.reason.startsWith("settings-")
+            ? pvRes.reason === "settings-401"
+              ? 401
+              : pvRes.reason === "settings-403"
+                ? 403
+                : 200
+            : pvRes.reason === "ok"
+              ? 200
+              : 0;
+          pv0.settingsAppFail = !pvRes.ok;
+          trace.postValidationReason = pvRes.reason;
         } catch {
           trace.validated = false;
+        }
+        try {
+          const pvAfter = await readSessionPresence(page);
+          const pv = trace.postValidation;
+          pv.before = {
+            lsPresent: pvBefore.lsPresent,
+            cookiePresent: pvBefore.cookiePresent,
+            marker: pvBefore.marker,
+          };
+          pv.after = {
+            lsPresent: pvAfter.lsPresent,
+            cookiePresent: pvAfter.cookiePresent,
+            marker: pvAfter.marker,
+          };
+          pv.cookieRotated =
+            pvBefore.cookiePresent && pvAfter.cookiePresent
+              ? pvBefore.cookieHash !== pvAfter.cookieHash
+              : pvBefore.cookiePresent !== pvAfter.cookiePresent;
+          pv.lsRemoved = pvBefore.lsPresent && !pvAfter.lsPresent;
+          pv.markerCreated = !pvBefore.marker && pvAfter.marker;
+          pv.invariant =
+            pv.cookieRotated || pv.lsRemoved || pv.markerCreated
+              ? "VIOLATED"
+              : "OK";
+          if (pv.invariant === "VIOLATED") {
+            console.warn(
+              `[Playwright] post-login validation invariant VIOLATED for ` +
+                `${accountId?.slice(0, 8)}: cookieRotated=${pv.cookieRotated} ` +
+                `lsRemoved=${pv.lsRemoved} markerCreated=${pv.markerCreated}`,
+            );
+          }
+        } catch {
+          // Best effort: the invariant is a tripwire, never a gate.
         }
         try {
           const { snapshotSessionState, traceSessionEvent } = await import(

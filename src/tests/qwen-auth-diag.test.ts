@@ -615,7 +615,10 @@ test("qwen-auth-diag: probePageLoggedIn external contract is unchanged", () => {
   const start = src.indexOf("export async function isPageLoggedIn");
   const end = src.indexOf("export function getOrLaunchSharedBrowser", start);
   const block = src.slice(start, end);
-  assert.ok(block.includes("probePageLoggedIn(page, timeoutMs)).ok"));
+  assert.ok(
+    block.includes("probePageLoggedIn(page, timeoutMs, options)).ok"),
+    "isPageLoggedIn must forward its options to probePageLoggedIn",
+  );
   const probeStart = src.indexOf("export async function probePageLoggedIn");
   const probeEnd = src.indexOf("export async function isPageLoggedIn");
   const probe = src.slice(probeStart, probeEnd);
