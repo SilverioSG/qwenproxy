@@ -1016,10 +1016,13 @@ export function classifyIsLoggedInRotation(
     ]) {
       const post = byLabel(postLabel);
       if (!post) continue;
-      const cookieRotated =
-        pre.cookiePresent && post.cookiePresent
-          ? pre.cookieHash !== post.cookieHash
-          : pre.cookiePresent !== post.cookiePresent;
+      // In-page document.cookie cannot see httpOnly cookies, so a presence flip
+      // is NOT evidence of a rotation. Only a differing value observed on both
+      // sides counts; a flip yields unknown and the scan continues.
+      const cookieComparable = pre.cookiePresent && post.cookiePresent;
+      const cookieRotated: boolean | null = cookieComparable
+        ? pre.cookieHash !== post.cookieHash
+        : null;
       const lsRemoved = pre.lsPresent && !post.lsPresent;
       const lsRotated = pre.lsPresent && post.lsPresent && pre.lsHash !== post.lsHash;
       const markerAdded = !pre.marker && post.marker;

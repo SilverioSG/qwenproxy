@@ -708,3 +708,79 @@ test("session-tracer: rotation trace carries no secret values", () => {
   const blob = JSON.stringify(r);
   assert.ok(!/eyJ|Bearer |password|token=/i.test(blob));
 });
+
+test("session-tracer: httpOnly cookie flip is unknown, scan continues to the real step", () => {
+  const m = lsTracer;
+  // Reproduces the live capture: the token cookie becomes httpOnly at
+  // auths-post (so document.cookie stops seeing it) and the SPA drops
+  // localStorage.token ~250ms after the settings response.
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("auths-pre", { ts: 1_010 }),
+    obs("auths-post", {
+      ts: 1_020,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+    obs("auths-post-50ms", {
+      ts: 1_070,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+    obs("auths-post-250ms", {
+      ts: 1_220,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+    obs("settings-pre", {
+      ts: 1_230,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+    obs("settings-post", {
+      ts: 1_480,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+    obs("settings-post-50ms", {
+      ts: 1_530,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+    obs("settings-post-250ms", {
+      ts: 1_730,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+      cookiePresent: false,
+      cookieHash: null,
+      cookieLength: 0,
+    }),
+  ]);
+  assert.equal(r.step, "async-after-settings");
+  assert.equal(r.rotationCase, "C");
+  // The in-page view cannot prove a rotation: the cookie simply went invisible.
+  assert.equal(r.cookieRotated, null);
+  assert.equal(r.lsRemoved, true);
+  assert.equal(r.markerAdded, true);
+  assert.equal(r.ts, 1_730);
+});
+
+test("session-tracer: a comparable cookie value change still counts as a rotation", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("refresh-pre", { ts: 1_010 }),
+    obs("refresh-post", { ts: 1_020, cookieHash: "bbbb2222", cookieLength: 210 }),
+  ]);
+  assert.equal(r.step, "refresh");
+  assert.equal(r.rotationCase, "A");
+  assert.equal(r.cookieRotated, true);
+});
