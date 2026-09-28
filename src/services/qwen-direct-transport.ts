@@ -47,6 +47,10 @@ import {
   updateQwenWebVersion,
 } from "./qwen-headers.ts";
 import { qwenUrl, qwenOrigin } from "./qwen-url.ts";
+import {
+  getLastBaxiaMintDiagnostics,
+  mintQwenBaxiaMaterial,
+} from "./qwen-baxia-minter.ts";
 
 export const QWEN_DIRECT_WEB_TRANSPORT_ENABLED =
   process.env.QWEN_DIRECT_WEB_TRANSPORT !== "false";
@@ -101,201 +105,67 @@ export interface BaxiaMaterial {
   bxUmidToken: string;
   /** fyObj.ver when the SDK reports it, else the 2.5.37 constant. */
   bxV: string;
+  /** document.cookie from the minting browser (guest flow: no token=). */
+  cookie?: string;
   /** Whether the values came from the real SDK (vs a degraded fallback). */
   fromSdk: boolean;
   fetchedAt: number;
 }
 
-const baxiaCache = new Map<string, BaxiaMaterial>();
-type BaxiaDiag = NonNullable<BaxiaProbe["diag"]>;
-let lastBaxiaProbe: BaxiaDiag | null = null;
+/**
+ * Anti-bot material now comes exclusively from the DEDICATED minter
+ * (src/services/qwen-baxia-minter.ts): a fresh, empty-profile, non-stealth
+ * headless Chromium. The account page is never used — it does not expose
+ * window.__baxia__ (verified), so the SDK cannot be harvested there.
+ */
+let lastBaxiaProbe: { reason: string } | null = null;
 
-/** Sanitized readiness diagnostics for the last Baxia probe. */
-export function getLastBaxiaProbe(): BaxiaDiag | null {
+function toBaxiaMaterial(m: {
+  bxUa: string;
+  bxUmidtoken: string;
+  bxV: string;
+}): { bxUa: string; bxUmidToken: string; bxV: string; fromSdk: boolean; fetchedAt: number } {
+  return {
+    bxUa: m.bxUa,
+    bxUmidToken: m.bxUmidtoken,
+    bxV: m.bxV,
+    fromSdk: true,
+    fetchedAt: Date.now(),
+  };
+}
+
+/** Sanitized readiness info for the last mint attempt. */
+export function getLastBaxiaProbe(): { reason: string } | null {
   return lastBaxiaProbe;
 }
-let baxiaInflight = new Map<string, Promise<BaxiaMaterial | null>>();
 
 export function _resetDirectTransportCachesForTests(): void {
-  baxiaCache.clear();
-  baxiaInflight = new Map();
-  lastBaxiaProbe = null;
   versionCache = null;
   versionFetchedAt = 0;
   versionInflight = null;
+  lastBaxiaProbe = null;
 }
 
 /**
- * Read the real Baxia anti-bot material from the account's live page.
- *
- * The page is already on chat.qwen.ai for the account, which means the Baxia
- * SDK (`window.__baxia__`) is already loaded — the same object qwen2api
- * reaches for via CDP. No typing, no clicking, no request interception.
+ * Anti-bot material for the direct transport: the guest cookie and the
+ * bx-* triple minted together by the dedicated browser. Cached by the minter.
  */
 export async function getBaxiaMaterial(
-  accountId: string,
-  opts: { force?: boolean; baxiaWaitMs?: number } = {},
+  _accountId?: string,
+  opts: { force?: boolean } = {},
 ): Promise<BaxiaMaterial | null> {
-  const cached = baxiaCache.get(accountId);
-  const now = Date.now();
-  if (!opts.force && cached && now - cached.fetchedAt < BAXIA_CACHE_TTL_MS) {
-    return cached;
+  const m = await mintQwenBaxiaMaterial({ force: opts.force === true });
+  if (!m) {
+    const d = getLastBaxiaMintDiagnostics();
+    lastBaxiaProbe = { reason: d?.reason || "unknown" };
+    return null;
   }
-  const inflight = baxiaInflight.get(accountId);
-  if (inflight && !opts.force) return inflight;
-
-  const task = (async (): Promise<BaxiaMaterial | null> => {
-    try {
-      const playwright = await import("./playwright.ts");
-      let handles = playwright.getAccountPageSnapshotHandles(accountId);
-      if (!handles) {
-        // The account page is created lazily. The browser is needed ONLY to
-        // host the real Baxia SDK (qwen2api reaches the very same
-        // window.__baxia__ object, just through its own CDP connection).
-        try {
-          const { loadAccounts } = await import("../core/accounts.ts");
-          const acct = loadAccounts().find((a) => a.id === accountId);
-          if (acct) {
-            await playwright.initPlaywrightForAccount(acct, undefined, undefined, {
-              // No UI capture: the transport no longer needs it.
-              skipHeaderCapture: true,
-            });
-          }
-        } catch {
-          // Fall through: a missing page means no anti-bot material.
-        }
-        handles = playwright.getAccountPageSnapshotHandles(accountId);
-      }
-      if (!handles) return null;
-      // The SDK lives on the chat document; make sure we are on it.
-      try {
-        const pg = handles.page as { url?: () => string; goto?: unknown };
-        const current = typeof pg.url === "function" ? pg.url() : "";
-        if (!current.includes("chat.qwen.ai")) {
-          await (
-            pg as unknown as {
-              goto: (u: string, o: unknown) => Promise<unknown>;
-            }
-          ).goto(qwenUrl("/"), { waitUntil: "domcontentloaded", timeout: 30_000 });
-        }
-      } catch {
-        // Navigation problems are handled by the evaluate below returning
-        // not-ready.
-      }
-      const page = handles.page as {
-        evaluate: (fn: unknown, arg?: unknown) => Promise<unknown>;
-      };
-      // The SDK needs time: qwen2api polls up to 60 x 500ms waiting for
-      // getFYModule().fyObj and a T2gA uid token. Same wait, same shape.
-      let raw: BaxiaProbe | null = null;
-      const deadline = Date.now() + (opts.baxiaWaitMs ?? 25_000);
-      while (Date.now() < deadline) {
-        const attempt = (await page
-          .evaluate(compileInPage<BaxiaProbe>(BAXIA_EXTRACT_FN))
-          .catch(() => null)) as BaxiaProbe | null;
-        if (attempt) lastBaxiaProbe = attempt.diag ?? lastBaxiaProbe;
-        if (attempt && attempt.ready) {
-          const uidNow = typeof attempt.uid === "string" ? attempt.uid : "";
-          if (/^T2gA/i.test(uidNow) && uidNow.length > 20) {
-            raw = attempt;
-            break;
-          }
-        }
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      if (!raw || !raw.ready) return null;
-      const uid = typeof raw.uid === "string" ? raw.uid : "";
-      if (!/^T2gA/i.test(uid) || uid.length <= 20) return null;
-      const fy = typeof raw.fy === "string" && raw.fy.length > 0 ? raw.fy : `231!${uid}`;
-      const ver =
-        typeof raw.ver === "string" && /^\d+\.\d+\.\d+/.test(raw.ver)
-          ? raw.ver
-          : BAXIA_VERSION_FALLBACK;
-      const material: BaxiaMaterial = {
-        bxUa: fy,
-        bxUmidToken: uid,
-        bxV: ver,
-        fromSdk: true,
-        fetchedAt: Date.now(),
-      };
-      baxiaCache.set(accountId, material);
-      return material;
-    } catch {
-      return null;
-    } finally {
-      baxiaInflight.delete(accountId);
-    }
-  })();
-  baxiaInflight.set(accountId, task);
-  return task;
-}
-
-/**
- * In-page Baxia extraction. Array-literal helpers only: esbuild with keepNames
- * rewrites named function expressions to __name(f, "f"), and __name does not
- * exist in the page (regression d3c7140).
- */
-export const BAXIA_EXTRACT_FN = `
-() => {
-  const DIAG = {
-    hasBaxia: false,
-    baxiaKeys: "",
-    hasGetFYModule: false,
-    hasFyObj: false,
-    getFYModuleErr: "",
-    uidLen: 0,
-    uidPrefix: "",
-    fyLen: 0,
-    verValue: "",
-    href: "",
-    scriptHosts: "",
+  lastBaxiaProbe = { reason: "ok" };
+  return {
+    ...toBaxiaMaterial(m),
+    cookie: m.cookie,
   };
-  try { DIAG.href = String(location.href).slice(0, 100); } catch (e) {}
-  try {
-    const b = window.__baxia__;
-    DIAG.hasBaxia = !!b;
-    if (b) {
-      try { DIAG.baxiaKeys = Object.keys(b).slice(0, 12).join(","); } catch (e) {}
-    }
-    // CRITICAL (verified against sfiorini/pi-stef @f0adb33, which works today):
-    // getFYModule is a FUNCTION-OBJECT. Its getUidToken/getFYToken methods and
-    // the fyObj property are attached by the SDK once ready. Calling
-    // getFYModule() returns something else and fyObj is always undefined, so
-    // the SDK looks permanently uninitialised. Read it as a property.
-    const fm = b ? b.getFYModule : null;
-    DIAG.hasGetFYModule = !!fm;
-    if (typeof fm === "function") {
-      DIAG.getFYModuleErr = "called-by-mistake";
-      return { ready: false, diag: DIAG };
-    }
-    if (!fm) {
-      DIAG.getFYModuleErr = "no-module";
-      return { ready: false, diag: DIAG };
-    }
-    DIAG.hasFyObj = !!fm.fyObj;
-    let uid = "";
-    let fy = "";
-    try { uid = String(fm.getUidToken()); } catch (e) { DIAG.getFYModuleErr = "uid:" + e.message; }
-    try { fy = String(fm.getFYToken()); } catch (e) {}
-    DIAG.uidLen = uid.length;
-    DIAG.uidPrefix = uid.slice(0, 5);
-    DIAG.fyLen = fy.length;
-    try { DIAG.verValue = (fm.fyObj && fm.fyObj.ver) ? String(fm.fyObj.ver) : ""; } catch (e) {}
-    if (!fm.fyObj) {
-      return { ready: false, diag: DIAG };
-    }
-    return {
-      ready: true,
-      uid: uid,
-      fy: fy,
-      ver: DIAG.verValue,
-      diag: DIAG,
-    };
-  } catch (e) {
-    return { ready: false, diag: DIAG, err: String(e && e.message ? e.message : e).slice(0, 120) };
-  }
 }
-`;
 
 let versionCache: string | null = null;
 let versionFetchedAt = 0;
@@ -368,13 +238,17 @@ export interface DirectHeaderInput {
   chatSessionId?: string | null;
   referer?: string;
   acceptLanguage?: string;
+  /** Guest flow: /c/guest referer and the reference's accept-language. */
+  chatModeGuest?: boolean;
   extra?: Record<string, string>;
 }
 
 export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
-    "Accept-Language": input.acceptLanguage || "en-US,en;q=0.9",
+    "Accept-Language":
+      input.acceptLanguage ||
+      (input.chatModeGuest ? "zh-CN,zh;q=0.9,en;q=0.8" : "en-US,en;q=0.9"),
     "Content-Type": "application/json",
     // Auth is the token COOKIE. A Bearer header is what triggers the Aliyun WAF
     // punish page (verified in Qwen-Free-Api), so it is never added here.
@@ -383,8 +257,12 @@ export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string,
     Referer:
       input.referer ||
       (input.chatSessionId
-        ? qwenUrl(`/c/${encodeURIComponent(input.chatSessionId)}`)
-        : qwenUrl("/")),
+        ? input.chatModeGuest
+          ? qwenUrl("/c/guest")
+          : qwenUrl(`/c/${encodeURIComponent(input.chatSessionId)}`)
+        : input.chatModeGuest
+          ? qwenUrl("/c/guest")
+          : qwenUrl("/")),
     "User-Agent": input.userAgent || getDirectUserAgent(),
     "X-Request-Id": crypto.randomUUID(),
     "bx-v": input.bxV || BAXIA_VERSION_FALLBACK,
@@ -442,6 +320,9 @@ export async function directCreateChat(input: {
   version?: string | null;
   timeoutMs?: number;
 }): Promise<DirectCreateChatResult> {
+  // The guest cookie is minted together with the anti-bot material; when the
+  // caller supplies one, use it instead of the account cookie.
+  const effectiveCookie = input.cookie || input.baxia?.cookie || "";
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
@@ -451,13 +332,14 @@ export async function directCreateChat(input: {
     const res = await fetch(qwenUrl("/api/v2/chats/new"), {
       method: "POST",
       headers: buildDirectQwenHeaders({
-        cookie: input.cookie,
+        cookie: effectiveCookie,
         userAgent: input.userAgent,
         bxUa: input.baxia?.bxUa,
         bxUmidToken: input.baxia?.bxUmidToken,
         bxV: input.baxia?.bxV,
         version: input.version,
-        referer: qwenUrl("/"),
+        referer: qwenUrl("/c/guest"),
+        chatModeGuest: true,
       }),
       body: JSON.stringify({
         title: "",
@@ -585,6 +467,7 @@ export async function directCompletion(input: {
     timestamp: Date.now(),
   });
 
+  const effectiveCookie = input.cookie || input.baxia?.cookie || "";
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
@@ -596,13 +479,14 @@ export async function directCompletion(input: {
       {
         method: "POST",
         headers: buildDirectQwenHeaders({
-          cookie: input.cookie,
+          cookie: effectiveCookie,
           userAgent: input.userAgent,
           bxUa: input.baxia?.bxUa,
           bxUmidToken: input.baxia?.bxUmidToken,
           bxV: input.baxia?.bxV,
           version: input.version,
           chatSessionId: input.chatId,
+          chatModeGuest: true,
           extra: { "x-accel-buffering": "no" },
         }),
         body,

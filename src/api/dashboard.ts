@@ -689,6 +689,107 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
   }
 });
 
+dashboardApp.post("/v1/accounts/:id/probe-direct-guest", async (c) => {
+  // GUEST smoke: dedicated Baxia minter -> guest cookie -> chats/new ->
+  // chat/completions. No account cookie, no login, no Authorization, no UI.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const model = c.req.query("model") || "qwen3.8-max";
+  const prompt = c.req.query("prompt") || "Responde únicamente: OK";
+  try {
+    const direct = await import("../services/qwen-direct-transport.js");
+    const minter = await import("../services/qwen-baxia-minter.js");
+    const runOnce = async (baxia: unknown): Promise<Record<string, unknown>> => {
+      const created = await direct.directCreateChat({
+        cookie: "",
+        model,
+        chatMode: "guest",
+        chatType: "t2t",
+        baxia: baxia as never,
+        version: "0.2.83",
+      });
+      let completion: Record<string, unknown> | null = null;
+      if (created.ok && created.chatId) {
+        completion = { ...(await direct.directCompletion({
+          cookie: "",
+          chatId: created.chatId,
+          model,
+          content: prompt,
+          chatMode: "guest",
+          chatType: "t2t",
+          baxia: baxia as never,
+          version: "0.2.83",
+          timeoutMs: 90_000,
+        })) };
+      }
+      return {
+        create: {
+          http: created.httpStatus,
+          appSuccess: created.appSuccess,
+          ok: created.ok,
+          chatId: created.chatId,
+          waf: created.waf,
+          riskControlled: created.riskControlled,
+          errorCode: created.errorCode,
+          preview: created.bodyPreview,
+        },
+        completion: completion
+          ? {
+              ok: completion.ok,
+              http: completion.httpStatus,
+              ct: completion.contentType,
+              waf: completion.waf,
+              rgv587: /RGV587|FAIL_SYS_USER_VALIDATE|tmd_____\/punish|x5sec/i.test(
+                String(completion.bodyPreview ?? ""),
+              ),
+              sseStarted: completion.sseStarted,
+              sseDone: completion.sseDone,
+              outputLength: completion.outputLength,
+              text: String(completion.text ?? "").slice(0, 120),
+              preview: completion.bodyPreview,
+            }
+          : null,
+      };
+    };
+    const baxia = await direct.getBaxiaMaterial();
+    const diag = minter.getLastBaxiaMintDiagnostics();
+    const first = await runOnce(baxia);
+    // Exactly one WAF retry with fresh material. No loops.
+    let retryAttempted = false;
+    let retryWithFresh = false;
+    let retryResult: unknown = null;
+    const comp0 = first.completion as Record<string, unknown> | null;
+    if (comp0 && (comp0.waf === true || comp0.rgv587 === true)) {
+      retryAttempted = true;
+      minter.invalidateQwenBaxiaMaterial();
+      const fresh = await direct.getBaxiaMaterial(undefined, { force: true });
+      retryWithFresh = fresh !== null;
+      retryResult = await runOnce(fresh);
+    }
+    return c.json({
+      ok: Boolean((first.create as Record<string, unknown>)?.ok),
+      baxiaReady: Boolean(baxia && baxia.fromSdk),
+      baxiaUidLen: baxia?.bxUmidToken?.length ?? 0,
+      baxiaFyLen: baxia?.bxUa?.length ?? 0,
+      baxiaV: baxia?.bxV ?? null,
+      baxiaCookieLen: baxia?.cookie?.length ?? 0,
+      baxiaHasTokenCookie: /(?:^|;\s*)token=/.test(String(baxia?.cookie ?? "")),
+      baxiaMintMs: diag?.mintMs ?? null,
+      baxiaReason: diag?.reason ?? null,
+      version: "0.2.83",
+      first,
+      retryAttempted,
+      retryWithFresh,
+      retryResult,
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) },
+      500,
+    );
+  }
+});
+
 dashboardApp.post("/v1/accounts/:id/probe-direct-transport", async (c) => {
   // DIAGNOSTIC: isolated direct-web smoke on ONE account. Reads the real Baxia
   // anti-bot material from the live page, then does create-chat + completion as
