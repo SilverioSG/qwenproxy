@@ -4319,7 +4319,14 @@ export async function captureQwenHeaders(
       // immediately without waiting for repeated silent timeouts.
       const currentUrl = typeof page.url === "function" ? page.url() : "";
       const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
-      const isSuspectedGuest = isAuthUrl || (attempt >= 2 && !(await isPageLoggedIn(page, 5000)));
+      // Non-mutating on attempt 2+: the full probe reads /api/v1/auths/ and
+      // auth.qwen.ai/api/v2/auths/refresh (both rotate the session cookie) and
+      // fails closed on qwen_token_logged_out_marker, which our own login
+      // sequence sets asynchronously. Using it here turned a healthy page into
+      // "re-login after session expiry did not succeed".
+      const isSuspectedGuest =
+        isAuthUrl ||
+        (attempt >= 2 && !(await isPageLoggedIn(page, 5000, { nonMutating: true })));
       if (isSuspectedGuest) {
         const { getAccountCredentials } = await import("../core/accounts.ts");
         const creds = getAccountCredentials(accountId);
@@ -4338,7 +4345,7 @@ export async function captureQwenHeaders(
             });
             await sleep(2000);
           }
-          if (!ok || !(await isPageLoggedIn(page, 6000))) {
+          if (!ok || !(await isPageLoggedIn(page, 6000, { nonMutating: true }))) {
             settle(
               new Error(
                 `Header capture failed for ${accountId}: re-login after session expiry did not succeed`,

@@ -130,15 +130,22 @@ test("capture RCA: executeReauth confirms with the non-mutating probe", () => {
   assert.ok(block.includes("if (!confirmed) {"));
 });
 
-/** No other post-login confirmation regressed to the full probe. */
-test("capture RCA: the other full-probe gates are untouched", () => {
+/** Every post-login confirmation inside captureQwenHeaders is non-mutating. */
+test("capture RCA: captureQwenHeaders confirmations are non-mutating", () => {
   const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
-  // captureQwenHeaders' guest detection still uses the full probe on attempt 2+.
-  assert.ok(
-    src.includes("attempt >= 2 && !(await isPageLoggedIn(page, 5000))"),
-    "capture guest detection must keep the full probe",
-  );
-  assert.ok(src.includes("await isPageLoggedIn(page, 6000)"));
+  // Every post-login confirmation passes the option (whitespace-insensitive).
+  const confirmations = [
+    ...src.matchAll(
+      /isPageLoggedIn\(page,\s*[\d_]+,\s*\{\s*nonMutating:\s*true,?\s*\}\)/g,
+    ),
+  ].map((m) => m[0].replace(/\s+/g, " "));
+  assert.equal(confirmations.length, 3, confirmations.join(" | "));
+  assert.ok(confirmations.some((c) => c.includes("5000")));
+  assert.ok(confirmations.some((c) => c.includes("6000")));
+  assert.ok(confirmations.some((c) => c.includes("5_000")));
+  // The unrelated full-probe gates (init, SPA login path) are untouched.
+  assert.ok(src.includes("await isPageLoggedIn(acctPage)"));
+  assert.ok(src.includes("(await isPageLoggedIn(page, 3000))"));
 });
 
 /** The probe reason is now observable in the tracer log. */

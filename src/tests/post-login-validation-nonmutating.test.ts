@@ -216,14 +216,19 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   // Only the two post-login confirmations may pass an options object, and both
   // must be non-mutating: loginViaApi's post-install validation and the
   // executeReauth confirmation in refreshHeadersInternal.
-  const withOptions = [...prod.matchAll(/isPageLoggedIn\([^)]*\{/g)];
+  // Only post-login confirmations may pass options: executeReauth plus the two
+  // captureQwenHeaders gates. Counted by the option itself, not by "{" (the
+  // isPageLoggedIn signature itself also takes an options object).
+  const withOptions = [
+    ...prod.matchAll(
+      /isPageLoggedIn\(page,\s*[\d_]+,\s*\{\s*nonMutating:\s*true,?\s*\}\)/g,
+    ),
+  ];
   assert.equal(
     withOptions.length,
-    2,
-    "only the two post-login confirmations may pass options",
+    3,
+    "only the post-login confirmations may pass options",
   );
-  // One trace initializer + the two confirmation call sites.
-  assert.equal([...prod.matchAll(/nonMutating: true/g)].length, 3);
   // And the full probe still calls auths + refresh.
   const start = prod.indexOf("export async function probePageLoggedIn");
   const end = prod.indexOf("export async function isPageLoggedIn", start);
