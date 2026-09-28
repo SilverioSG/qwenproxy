@@ -689,6 +689,82 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
   }
 });
 
+dashboardApp.post("/v1/accounts/:id/probe-direct-transport", async (c) => {
+  // DIAGNOSTIC: isolated direct-web smoke on ONE account. Reads the real Baxia
+  // anti-bot material from the live page, then does create-chat + completion as
+  // plain HTTP. No composer, no captureQwenHeaders, no /v1 traffic.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const model = c.req.query("model") || "qwen3.8-max";
+  const prompt = c.req.query("prompt") || "Responde únicamente: OK";
+  try {
+    const direct = await import("../services/qwen-direct-transport.js");
+    const { getQwenHeaders } = await import("../services/auth-playwright.js");
+    const { headers } = await getQwenHeaders(false, id);
+    const cookie = headers["cookie"] || "";
+    const baxia = await direct.getBaxiaMaterial(id);
+    const version = await direct.getFrontendVersion();
+    const created = await direct.directCreateChat({
+      cookie,
+      model,
+      baxia,
+      version,
+    });
+    let completion: Record<string, unknown> | null = null;
+    if (created.ok && created.chatId) {
+      completion = { ...(await direct.directCompletion({
+        cookie,
+        chatId: created.chatId,
+        model,
+        content: prompt,
+        baxia,
+        version,
+        timeoutMs: 90_000,
+      })) };
+    }
+    return c.json({
+      ok: Boolean(completion && completion.ok),
+      accountId: id,
+      model,
+      authReady: Boolean(cookie && /(?:^|;\s*)token=/.test(cookie)),
+      baxiaReady: Boolean(baxia && baxia.fromSdk),
+      baxiaFromSdk: baxia ? baxia.fromSdk : false,
+      baxiaV: baxia ? baxia.bxV : null,
+      version,
+      createChat: {
+        httpStatus: created.httpStatus,
+        appSuccess: created.appSuccess,
+        ok: created.ok,
+        chatId: created.chatId,
+        waf: created.waf,
+        riskControlled: created.riskControlled,
+        contentType: created.contentType,
+        errorCode: created.errorCode,
+        bodyPreview: created.bodyPreview,
+      },
+      completion: completion
+        ? {
+            ok: completion.ok,
+            httpStatus: completion.httpStatus,
+            contentType: completion.contentType,
+            waf: completion.waf,
+            sseStarted: completion.sseStarted,
+            sseDone: completion.sseDone,
+            outputLength: completion.outputLength,
+            text: completion.text,
+            bodyPreview: completion.bodyPreview,
+          }
+        : null,
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) },
+      500,
+    );
+  }
+});
+
 dashboardApp.post("/v1/accounts/:id/probe-composer", async (c) => {
   // EXPERIMENTAL DIAGNOSTIC: runs ONE real captureQwenHeaders while passively
   // observing the composer (DOM events + generic request observer). It does not
