@@ -2328,13 +2328,25 @@ export async function requestQwenTextInBrowser(
           (d.refreshErrorClass ? ` errClass=${d.refreshErrorClass}` : ""),
       );
       try {
-        const { traceSessionEvent } = await import("./session-tracer.ts");
+        const { traceSessionEvent, traceLsCheckpoint } = await import(
+          "./session-tracer.ts"
+        );
         traceSessionEvent(accountId, "REFRESH_START", `path=${path}`);
+        void traceLsCheckpoint(accountId, "refresh-start").catch(() => {});
         traceSessionEvent(
           accountId,
           "REFRESH_END",
           `status=${d.refreshStatus} usable=${d.refreshUsable} retry=${d.retried ? d.retryStatus : "none"}`,
         );
+        // The in-page refresh wrote localStorage.token + the cookie; sample the
+        // result from Node so the change is attributable to REFRESH.
+        if (d.refreshUpdatedLs || d.refreshUpdatedCookie) {
+          void traceLsCheckpoint(accountId, "refresh-end-ls-written").catch(
+            () => {},
+          );
+        } else {
+          void traceLsCheckpoint(accountId, "refresh-end").catch(() => {});
+        }
       } catch {
         // Tracing must never break requests.
       }

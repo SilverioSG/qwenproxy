@@ -438,6 +438,7 @@ export function noteUpstreamAuthResult(
   if (httpStatus === 401 || appFail) {
     markFirstFailure(accountId, ev, snapshot);
   }
+  void traceLsCheckpoint(accountId, `upstream-${kind}`).catch(() => {});
 }
 
 /** Snapshot the live handles of an account without creating anything. */
@@ -666,6 +667,9 @@ export function markFirstFailure(
   if (firstFailureTs !== null) return;
   firstFailureTs = Date.now();
   firstFailureRef = { event, snapshot };
+  // PRE-recovery LS/cookie state for the first auth failure. Sampled
+  // fire-and-forget so recovery work is never delayed by tracing.
+  void traceLsCheckpoint(accountId, "first-auth-failure").catch(() => {});
   if (!windowDumpScheduled) {
     windowDumpScheduled = true;
     setTimeout(() => {
@@ -700,6 +704,421 @@ export function getFirstFailureTs(): number | null {
   return firstFailureTs;
 }
 
+/** LocalStorage.token lifecycle tracking (target account only). */
+export interface LsCheckpoint {
+  ts: number;
+  label: string;
+  present: boolean;
+  hash: string | null;
+  length: number;
+  cookiePresent: boolean;
+  cookieHash: string | null;
+  cookieLength: number;
+  match: boolean | null;
+  handleAlive: boolean;
+  contextId: string | null;
+  pageId: string | null;
+  url: string | null;
+}
+
+export interface LsChangeRecord {
+  ts: number;
+  event: string;
+  caller: string;
+  before: LsState;
+  after: LsState;
+  handleAlive: boolean;
+  contextId: string | null;
+  pageId: string | null;
+}
+
+export interface LsState {
+  present: boolean;
+  hash: string | null;
+  length: number;
+}
+
+let lsBaseline: LsState | null = null;
+let baseContextId: string | null = null;
+let basePageId: string | null = null;
+let firstLsChange: LsChangeRecord | null = null;
+/** Per-login-generation outcomes, so a re-login cannot erase a prior finding. */
+const lsGenerations: Array<{
+  baseline: LsState;
+  contextId: string | null;
+  pageId: string | null;
+  firstChange: LsChangeRecord | null;
+  closedAt: number;
+}> = [];
+const lsHistory: LsCheckpoint[] = [];
+
+function hashStrLocal(v: string): string {
+  let h1 = 0x811c9dc5;
+  for (let i = 0; i < v.length; i++) {
+    h1 ^= v.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
+  }
+  return (h1 >>> 0).toString(16);
+}
+
+export function setLsBaseline(state: LsState): void {
+  lsBaseline = { present: state.present, hash: state.hash, length: state.length };
+  baseContextId = null;
+  basePageId = null;
+  firstLsChange = null;
+}
+
+export function getLsBaseline(): LsState | null {
+  return lsBaseline;
+}
+
+export function getLsBaselineHandles(): {
+  contextId: string | null;
+  pageId: string | null;
+} {
+  return { contextId: baseContextId, pageId: basePageId };
+}
+
+export function getFirstLsChange(): LsChangeRecord | null {
+  return firstLsChange;
+}
+
+/** Labels that represent a page/context (re)creation or teardown boundary. */
+const RECREATE_LABELS = new Set([
+  "context-close",
+  "sessionkeeper-close",
+  "init-success",
+]);
+
+/**
+ * Classify the frozen first LS change (CASO A/B/C/D).
+ * Pure: no state mutation, safe to call from the dashboard.
+ */
+export function classifyLsChange(): {
+  case: "A_REMOVED" | "B_ROTATED" | "C_RECREATE_LOSS" | "D_STABLE" | "NO_BASELINE";
+  cause: string;
+  removed: boolean;
+  rotated: boolean;
+  recreateLoss: boolean;
+  stableUntilFailure: boolean;
+  hypothesisRefuted: boolean;
+  cookieLsDivergenceCreated: boolean | null;
+  afterChangeCookieLsMatch: boolean | null;
+  secondsToFailure: number | null;
+  changedBeforeAuthFailure: boolean;
+  sequence: string[];
+} {
+  if (!lsBaseline) {
+    return {
+      case: "NO_BASELINE",
+      cause: "no-baseline",
+      removed: false,
+      rotated: false,
+      recreateLoss: false,
+      stableUntilFailure: false,
+      hypothesisRefuted: false,
+      cookieLsDivergenceCreated: null,
+      afterChangeCookieLsMatch: null,
+      secondsToFailure: null,
+      changedBeforeAuthFailure: false,
+      sequence: [],
+    };
+  }
+  const failTs = firstFailureTs;
+  const last = lsHistory[lsHistory.length - 1] ?? null;
+  const beforeFailure = last
+    ? lsHistory.filter((e) => e.ts <= (failTs ?? Number.MAX_SAFE_INTEGER))
+    : [];
+  const stable =
+    beforeFailure.length > 0 &&
+    beforeFailure.every(
+      (e) => e.present === lsBaseline!.present && e.hash === lsBaseline!.hash,
+    );
+  if (!firstLsChange) {
+    return {
+      case: "D_STABLE",
+      cause: stable ? "no-change-observed" : "no-baseline-match-window",
+      removed: false,
+      rotated: false,
+      recreateLoss: false,
+      stableUntilFailure: stable && failTs !== null,
+      hypothesisRefuted: stable && failTs !== null,
+      cookieLsDivergenceCreated: null,
+      afterChangeCookieLsMatch: last?.match ?? null,
+      secondsToFailure: null,
+      changedBeforeAuthFailure: false,
+      sequence: buildSequence(null, failTs),
+    };
+  }
+  const fc = firstLsChange;
+  const rawRemoved = fc.before.present && !fc.after.present;
+  const rawRotated =
+    fc.before.present && fc.after.present && fc.before.hash !== fc.after.hash;
+  // A teardown/recreation boundary legitimately drops the old page's storage,
+  // so it is never counted as an in-page removal or rotation.
+  const recreate = RECREATE_LABELS.has(fc.event) || !fc.handleAlive;
+  const removed = rawRemoved && !recreate;
+  const rotated = rawRotated && !recreate;
+  const afterCp = lsHistory.find((e) => e.ts >= fc.ts) ?? null;
+  const sequence = buildSequence(fc.ts, failTs);
+  return {
+    case: recreate ? "C_RECREATE_LOSS" : removed ? "A_REMOVED" : "B_ROTATED",
+    cause: recreate
+      ? fc.handleAlive
+        ? "context-or-page-recreated"
+        : "handle-gone-context-closed"
+      : removed
+        ? "explicit-remove-clear-or-navigation"
+        : "token-rotated-by-upstream-or-refresh",
+    removed,
+    rotated,
+    recreateLoss: recreate,
+    stableUntilFailure: false,
+    hypothesisRefuted: false,
+    cookieLsDivergenceCreated:
+      afterCp && afterCp.cookieHash !== null && afterCp.hash !== afterCp.cookieHash
+        ? true
+        : afterCp && afterCp.cookieHash !== null
+          ? false
+          : null,
+    afterChangeCookieLsMatch: afterCp?.match ?? null,
+    secondsToFailure:
+      failTs !== null ? Math.max(0, Math.round((failTs - fc.ts) / 1000)) : null,
+    changedBeforeAuthFailure: failTs === null ? false : fc.ts <= failTs,
+    sequence,
+  };
+}
+
+function buildSequence(changeTs: number | null, failTs: number | null): string[] {
+  const seq: string[] = [];
+  for (const e of lsHistory) {
+    if (changeTs !== null && e.ts < changeTs) continue;
+    seq.push(`${new Date(e.ts).toISOString().slice(11, 19)} ${e.label} present=${e.present} hash=${e.hash} cookie=${e.cookiePresent} match=${e.match} alive=${e.handleAlive}`);
+  }
+  if (failTs !== null) {
+    seq.push(`${new Date(failTs).toISOString().slice(11, 19)} AUTH_FAILURE`);
+  }
+  return seq.slice(-40);
+}
+
+export function getLsHistory(): LsCheckpoint[] {
+  return [...lsHistory];
+}
+
+/** Pure LS-state change detector (before/after). Null = no change. */
+export function detectLsChange(
+  before: LsState | null,
+  after: LsState,
+): { before: LsState; after: LsState } | null {
+  if (!before) return null;
+  const changed =
+    before.present !== after.present ||
+    (before.present && after.present && before.hash !== after.hash);
+  if (!changed) return null;
+  return {
+    before: { present: before.present, hash: before.hash, length: before.length },
+    after: { present: after.present, hash: after.hash, length: after.length },
+  };
+}
+
+/** Test-only reset for LS tracking state. */
+export function _resetLsTrackingForTests(): void {
+  lsBaseline = null;
+  baseContextId = null;
+  basePageId = null;
+  firstLsChange = null;
+  firstFailureTs = null;
+  firstFailureRef = null;
+  lsHistory.length = 0;
+  lsGenerations.length = 0;
+}
+
+/** Test-only seeding of a synthetic checkpoint (bypasses live page reads). */
+export function _seedLsCheckpointForTests(cp: LsCheckpoint): void {
+  recordLsCheckpoint("test0000", cp);
+}
+
+function mkCp(
+  over: Partial<LsCheckpoint> & { label: string },
+): LsCheckpoint {
+  return {
+    ts: over.ts ?? Date.now(),
+    label: over.label,
+    present: over.present ?? false,
+    hash: over.hash ?? null,
+    length: over.length ?? 0,
+    cookiePresent: over.cookiePresent ?? false,
+    cookieHash: over.cookieHash ?? null,
+    cookieLength: over.cookieLength ?? 0,
+    match: over.match ?? null,
+    handleAlive: over.handleAlive ?? true,
+    contextId: over.contextId ?? "ctxTest",
+    pageId: over.pageId ?? "pgTest",
+    url: over.url ?? null,
+  };
+}
+
+export { mkCp as _mkCpForTests };
+
+/**
+ * Record a checkpoint: append history, (re)establish the post-install baseline
+ * for a new login generation, and freeze the first change of the generation.
+ */
+function recordLsCheckpoint(
+  accountId8: string,
+  cp: LsCheckpoint,
+): { isBaseline: boolean; changed: boolean } {
+  const after: LsState = { present: cp.present, hash: cp.hash, length: cp.length };
+  lsHistory.push(cp);
+  if (lsHistory.length > 120) lsHistory.splice(0, lsHistory.length - 120);
+  // A successful install is the mandatory post-login baseline. The value is
+  // read back from the live page, never assumed from install intent. Each
+  // install opens a new generation so a later re-login cannot erase what was
+  // already observed for the previous session.
+  const isBaseline = cp.label === "post-install" && cp.present && !!cp.hash;
+  if (isBaseline) {
+    if (lsBaseline) {
+      lsGenerations.push({
+        baseline: lsBaseline,
+        contextId: baseContextId,
+        pageId: basePageId,
+        firstChange: firstLsChange,
+        closedAt: cp.ts,
+      });
+      if (lsGenerations.length > 20) {
+        lsGenerations.splice(0, lsGenerations.length - 20);
+      }
+    }
+    lsBaseline = after;
+    baseContextId = cp.contextId;
+    basePageId = cp.pageId;
+    firstLsChange = null;
+  }
+  const delta = detectLsChange(lsBaseline, after);
+  if (delta && !firstLsChange) {
+    firstLsChange = {
+      ts: cp.ts,
+      event: cp.label,
+      caller: cp.label,
+      before: delta.before,
+      after: delta.after,
+      handleAlive: cp.handleAlive,
+      contextId: cp.contextId,
+      pageId: cp.pageId,
+    };
+    try {
+      console.log(
+        `[SessTrace ${accountId8}] LS_CHANGE label=${cp.label} ` +
+          `before=${delta.before.present}/${delta.before.hash} ` +
+          `after=${delta.after.present}/${delta.after.hash} ` +
+          `handleAlive=${cp.handleAlive} ctx=${cp.contextId} page=${cp.pageId}`,
+      );
+    } catch {}
+  }
+  try {
+    console.log(
+      `[SessTrace ${accountId8}] LS_CHECK label=${cp.label} ` +
+        `present=${cp.present} len=${cp.length} cookie=${cp.cookiePresent} ` +
+        `match=${cp.match} handleAlive=${cp.handleAlive} ` +
+        `ctx=${cp.contextId} page=${cp.pageId}`,
+    );
+  } catch {}
+  return { isBaseline, changed: !!delta };
+}
+
+/** Sample LS + cookie token state; freeze the first change vs baseline. */
+export async function traceLsCheckpoint(
+  accountId: string | undefined,
+  label: string,
+): Promise<void> {
+  if (!isTarget(accountId)) return;
+  try {
+    const { getAccountPageSnapshotHandles } = await import("./playwright.ts");
+    const h = getAccountPageSnapshotHandles(accountId!);
+    let present = false;
+    let hash: string | null = null;
+    let length = 0;
+    let cookiePresent = false;
+    let cookieHash: string | null = null;
+    let cookieLength = 0;
+    let contextId: string | null = null;
+    let pageId: string | null = null;
+    let url: string | null = null;
+    if (h) {
+      contextId = traceContextId(h.context as object | null);
+      pageId = tracePageId(h.page as object | null);
+      try {
+        url =
+          typeof (h.page as { url?: () => string }).url === "function"
+            ? (h.page as { url: () => string }).url()
+            : null;
+      } catch {
+        url = null;
+      }
+      try {
+        const pg = h.page as unknown as {
+          evaluate?: (fn: () => unknown) => Promise<unknown>;
+        };
+        if (pg && typeof pg.evaluate === "function") {
+          const v = (await pg
+            .evaluate((): unknown => {
+              try {
+                const t = localStorage.getItem("token");
+                return typeof t === "string" && t.length > 0 ? t : null;
+              } catch {
+                return null;
+              }
+            })
+            .catch(() => null)) as string | null;
+          if (typeof v === "string" && v.length > 0) {
+            present = true;
+            hash = hashStrLocal(v);
+            length = v.length;
+          }
+        }
+      } catch {
+        // Best effort.
+      }
+      try {
+        const ctx = h.context as unknown as {
+          cookies?: () => Promise<Array<{ name: string; value: string }>>;
+        };
+        if (ctx && typeof ctx.cookies === "function") {
+          const cookies = await ctx.cookies().catch(() => []);
+          const tok = cookies.find((c) => c.name === "token");
+          if (tok && tok.value) {
+            cookiePresent = true;
+            cookieHash = hashStrLocal(tok.value);
+            cookieLength = tok.value.length;
+          }
+        }
+      } catch {
+        // Best effort.
+      }
+    }
+    const match =
+      hash !== null && cookieHash !== null ? hash === cookieHash : null;
+    const cp: LsCheckpoint = {
+      ts: Date.now(),
+      label,
+      present,
+      hash,
+      length,
+      cookiePresent,
+      cookieHash,
+      cookieLength,
+      match,
+      handleAlive: h !== null,
+      contextId,
+      pageId,
+      url,
+    };
+    recordLsCheckpoint(accountId!, cp);
+  } catch {
+    // Tracing must never break flows.
+  }
+}
+
 export function getSessionTrace(): {
   target: string;
   baseline: SessionTraceEntry | null;
@@ -708,6 +1127,18 @@ export function getSessionTrace(): {
   classification: TransitionClassification | null;
   generation: number;
   loginOverlap: boolean;
+  lsBaseline: LsState | null;
+  lsBaselineHandles: { contextId: string | null; pageId: string | null };
+  firstLsChange: LsChangeRecord | null;
+  lsClassification: ReturnType<typeof classifyLsChange>;
+  lsGenerations: Array<{
+    baseline: LsState;
+    contextId: string | null;
+    pageId: string | null;
+    firstChange: LsChangeRecord | null;
+    closedAt: number;
+  }>;
+  lsHistory: LsCheckpoint[];
   window: SessionTraceEntry[];
 } {
   const okEvents = ring.filter(
@@ -746,6 +1177,18 @@ export function getSessionTrace(): {
     classification,
     generation: currentGeneration(TRACE_TARGET_ACCOUNT),
     loginOverlap: loginOverlapDetected(TRACE_TARGET_ACCOUNT),
+    lsBaseline,
+    lsBaselineHandles: { contextId: baseContextId, pageId: basePageId },
+    firstLsChange,
+    lsClassification: classifyLsChange(),
+    lsGenerations: lsGenerations.map((g) => ({
+      baseline: g.baseline,
+      contextId: g.contextId,
+      pageId: g.pageId,
+      firstChange: g.firstChange,
+      closedAt: g.closedAt,
+    })),
+    lsHistory: lsHistory.slice(-30),
     window,
   };
 }

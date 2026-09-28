@@ -334,11 +334,17 @@ export async function saveStorageState(
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "storagestate-save-pre").catch(() => {}))
+      .catch(() => {});
     await withTimeout(
       context.storageState({ path: stateFile }),
       timeoutMs,
       `storageState timed out after ${timeoutMs}ms`,
     );
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "storagestate-save-post").catch(() => {}))
+      .catch(() => {});
   } catch (error) {
     if (!isPlaywrightAlreadyClosedError(error)) {
       console.warn(
@@ -1526,12 +1532,18 @@ export async function getBasicHeaders(accountId: string): Promise<{
                 const tokenMatch = restoredHeaders.cookie.match(/(?:^|;\s*)token=([^;]+)/);
                 if (tokenMatch) {
                   const tok = decodeURIComponent(tokenMatch[1].trim());
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(accountId, "db-restore-write-pre").catch(() => {}))
+                    .catch(() => {});
                   await page.evaluate((t) => {
                     try {
                       localStorage.setItem("token", t);
                       document.cookie = `token=${encodeURIComponent(t)}; path=/; domain=.qwen.ai; max-age=31536000`;
                     } catch {}
                   }, tok).catch(() => {});
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(accountId, "db-restore-write-post").catch(() => {}))
+                    .catch(() => {});
                 }
               } catch {}
             }
@@ -1805,6 +1817,9 @@ export async function initPlaywrightForAccount(
       } catch {
         // Tracing must never break init.
       }
+      void import("./session-tracer.ts").then((m) =>
+        m.traceLsCheckpoint(account.id, "init-success").catch(() => {}),
+      ).catch(() => {});
       touchAccountActivity(account.id);
 
       // 1. Fast boot: if a valid session exists in SQLite, restore headers and cookies instantly.
@@ -1836,12 +1851,18 @@ export async function initPlaywrightForAccount(
                 const tokenMatch = restoredHeaders.cookie.match(/(?:^|;\s*)token=([^;]+)/);
                 if (tokenMatch && !acctPage.isClosed()) {
                   const tok = decodeURIComponent(tokenMatch[1].trim());
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(account.id, "db-restore-write-pre").catch(() => {}))
+                    .catch(() => {});
                   await acctPage.evaluate((t) => {
                     try {
                       localStorage.setItem("token", t);
                       document.cookie = `token=${encodeURIComponent(t)}; path=/; domain=.qwen.ai; max-age=31536000`;
                     } catch {}
                   }, tok).catch(() => {});
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(account.id, "db-restore-write-post").catch(() => {}))
+                    .catch(() => {});
                 }
 
                 // Read live cookies from browser context
@@ -2197,16 +2218,25 @@ async function loginToQwen(
   try {
     traceSessionEvent(accountId, "LOGIN_START", `caller=${caller}`);
   } catch {}
+  void import("./session-tracer.ts")
+    .then((m) => m.traceLsCheckpoint(accountId, "login-start").catch(() => {}))
+    .catch(() => {});
   try {
     const ok = await loginToQwenInner(accountId, email, password);
     try {
       traceSessionEvent(accountId, "LOGIN_END", ok ? "ok" : "failed");
     } catch {}
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "login-end").catch(() => {}))
+      .catch(() => {});
     return ok;
   } catch (err) {
     try {
       traceSessionEvent(accountId, "LOGIN_END", "error");
     } catch {}
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "login-end-error").catch(() => {}))
+      .catch(() => {});
     throw err;
   }
 }
@@ -3046,6 +3076,9 @@ async function loginViaApi(
         } catch {
           trace.lsWriteOk = false;
         }
+        void import("./session-tracer.ts")
+          .then((m) => m.traceLsCheckpoint(accountId, "pre-reload").catch(() => {}))
+          .catch(() => {});
         try {
           await page
             .reload({ waitUntil: "domcontentloaded" })
@@ -3056,6 +3089,9 @@ async function loginViaApi(
         } catch {
           trace.reloadOk = false;
         }
+        void import("./session-tracer.ts")
+          .then((m) => m.traceLsCheckpoint(accountId, "post-reload").catch(() => {}))
+          .catch(() => {});
         try {
           const postCookies = await page.context().cookies().catch(() => []);
           const snap = cookieNamesOf(postCookies);
@@ -3095,6 +3131,12 @@ async function loginViaApi(
           // Best effort.
         }
         trace.installed = true;
+        try {
+          const { traceLsCheckpoint } = await import("./session-tracer.ts");
+          await traceLsCheckpoint(accountId, "post-install").catch(() => {});
+        } catch {
+          // Tracing must never break login.
+        }
         try {
           trace.validated = await isPageLoggedIn(page, 3000);
         } catch {
@@ -3494,6 +3536,9 @@ export async function captureQwenHeaders(
   if (!page || page.isClosed()) {
     throw new Error(`Playwright page unavailable for header capture: ${accountId}`);
   }
+  void import("./session-tracer.ts").then((m) =>
+    m.traceLsCheckpoint(accountId, "capture-entry").catch(() => {}),
+  ).catch(() => {});
   try {
     traceSessionEvent(accountId, "CAPTURE_START");
   } catch {}
@@ -3702,6 +3747,9 @@ export async function captureQwenHeaders(
       }
 
       headersCaptured = true;
+      void import("./session-tracer.ts").then((m) =>
+        m.traceLsCheckpoint(accountId, "capture-success").catch(() => {}),
+      ).catch(() => {});
       try {
         const { snapshotSessionState, traceSessionEvent } = await import(
           "./session-tracer.ts"
@@ -4248,6 +4296,9 @@ async function refreshHeadersInternal(
         try {
           traceSessionEvent(accountId, "REAUTH_START");
         } catch {}
+        void import("./session-tracer.ts").then((m) =>
+          m.traceLsCheckpoint(accountId, "reauth-start").catch(() => {}),
+        ).catch(() => {});
         console.warn(
           `⚠️  [Playwright] Session expired or forced re-auth for ${accountId}, re-authenticating...`,
         );
@@ -4831,6 +4882,9 @@ export async function closeIdlePlaywrightAccounts(
     try {
       traceSessionEvent(candidate.accountId, "SESSIONKEEPER_CLOSE");
     } catch {}
+    void import("./session-tracer.ts").then((m) =>
+      m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
+    ).catch(() => {});
     await closePlaywrightForAccount(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
@@ -4872,6 +4926,9 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
     try {
       traceSessionEvent(candidate.accountId, "SESSIONKEEPER_CLOSE");
     } catch {}
+    void import("./session-tracer.ts").then((m) =>
+      m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
+    ).catch(() => {});
     await closePlaywrightForAccount(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
@@ -4975,6 +5032,9 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   try {
     traceSessionEvent(accountId, "CONTEXT_CLOSE");
   } catch {}
+  void import("./session-tracer.ts")
+    .then((m) => m.traceLsCheckpoint(accountId, "context-close").catch(() => {}))
+    .catch(() => {});
   accountContexts.delete(accountId);
   accountPages.delete(accountId);
   headerCaches.delete(accountId);

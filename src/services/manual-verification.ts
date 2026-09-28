@@ -1050,6 +1050,8 @@ async function completeSuccess(
     session: NonNullable<Awaited<ReturnType<typeof deps.snapshotVisible>>>;
   } | null,
 ): Promise<boolean> {
+  const { traceLsCheckpoint } = await import("./session-tracer.ts");
+  void traceLsCheckpoint(accountId, "manual-verify-success-start").catch(() => {});
   const before = await deps.readPersistedMeta(accountId).catch(() => ({
     exists: false,
     capturedAt: 0,
@@ -1234,6 +1236,7 @@ async function completeSuccess(
   }
   // 7. Cooldown cleared ONLY after validated fresh auth.
   await deps.clearCooldown(accountId);
+  void traceLsCheckpoint(accountId, "manual-verify-success-end").catch(() => {});
   finishOnEntry(
     entry,
     "verified",

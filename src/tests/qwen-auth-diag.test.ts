@@ -59,28 +59,84 @@ test("qwen-auth-diag: refresh exception → sanitized class only", () => {
   assert.ok(!cls.includes("secret"));
 });
 
-test("qwen-auth-diag: in-page evaluate closure is __name-free (no bundler helpers)", () => {
-  const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
-  const start = src.indexOf("const evaluateRequest = (page: Page)");
-  assert.ok(start >= 0);
-  // End of requestQwenTextInBrowser: the `return new Response(response.raw`
-  // that follows the withQwenBrowserPage call.
-  const end = src.indexOf("return new Response(response.raw", start);
-  assert.ok(end > start);
-  const block = src.slice(start, end);
-  // Nested arrow-function declarations inside page.evaluate would be wrapped
-  // with __name() by the bundler and throw ReferenceError in the page
-  // (regression covered: d3c7140 family). Only direct parameter arrows and
-  // method calls are allowed. Start inside the evaluate callback itself so
-  // the outer Node-side wrapper is not counted.
-  const innerStart = block.indexOf("page.evaluate(");
-  assert.ok(innerStart >= 0);
-  const inner = block.slice(innerStart);
-  const nested = [...inner.matchAll(/const \w+ ?= ?(?:async )?\(.*?\) ?=>/gs)];
-  assert.deepEqual(
-    nested.map((m) => m[0].slice(0, 40)),
-    [],
+/**
+ * Extract every `.evaluate(` call text via paren matching so the assertions
+ * only inspect the real in-page closure (not surrounding Node-side code).
+ */
+function evaluateClosures(src: string): Array<{ line: number; text: string }> {
+  const out: Array<{ line: number; text: string }> = [];
+  const re = /\.evaluate\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    let i = m.index + m[0].length;
+    let depth = 1;
+    let quote: string | null = null;
+    let start = i;
+    while (i < src.length && depth > 0) {
+      const ch = src[i];
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = null;
+      } else if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+      } else if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      i++;
+    }
+    const text = src.slice(start, i - 1);
+    out.push({ line: src.slice(0, start).split("\n").length, text });
+  }
+  return out;
+}
+
+const IN_PAGE_FILES = ["src/services/qwen.ts", "src/services/playwright.ts"];
+
+/** Function expression assigned to a const inside an in-page closure. */
+const NESTED_FN_DECL =
+  /(?:^|[\s;{])const\s+\w+\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>/g;
+
+test("qwen-auth-diag: in-page evaluate closures are __name-free (no bundler helpers)", () => {
+  let found = 0;
+  for (const f of IN_PAGE_FILES) {
+    for (const cl of evaluateClosures(fs.readFileSync(f, "utf-8"))) {
+      found++;
+      // Nested arrow-function declarations inside page.evaluate would be wrapped
+      // with __name() by the bundler and throw ReferenceError in the page
+      // (regression covered: d3c7140 family).
+      const nested = [...cl.text.matchAll(NESTED_FN_DECL)];
+      assert.deepEqual(
+        nested.map((m) => m[0].slice(0, 40)),
+        [],
+        `${f}:${cl.line} in-page closure has a nested function declaration`,
+      );
+    }
+  }
+  assert.ok(found > 0, "no evaluate closures scanned");
+});
+
+test("qwen-auth-diag: nested-function guard is not vacuous", () => {
+  const positive = `const go = () => {\n  const helper = (a, b) => a + b;\n  return helper(1, 2);\n};`;
+  const matches = [...positive.matchAll(NESTED_FN_DECL)];
+  assert.ok(matches.length > 0, "guard must detect a nested arrow const");
+  // Sanity: a bare expression assignment is not flagged.
+  const negative = `const go = (a) => {\n  const total = a + 1 * 2;\n  return total;\n};`.replace(
+    "const go = (a) => {",
+    "const go = function (a) {",
   );
+  assert.equal([...negative.matchAll(NESTED_FN_DECL)].length, 0);
+});
+
+test("qwen-auth-diag: no dynamic import() inside a page.evaluate closure", () => {
+  // Regression guard: `import()` in an in-page closure runs in the browser and
+  // cannot resolve TS module specifiers (breaks the heal retry path).
+  for (const f of IN_PAGE_FILES) {
+    for (const cl of evaluateClosures(fs.readFileSync(f, "utf-8"))) {
+      assert.ok(
+        !/import\(["'`]/.test(cl.text),
+        `${f}:${cl.line} has a dynamic import() inside a page.evaluate closure`,
+      );
+    }
+  }
 });
 
 test("qwen-auth-diag: no secret values in new instrumentation", () => {
@@ -435,3 +491,4 @@ test("qwen-auth-diag: login trace carries phase fields, never secrets", async ()
     assert.ok(block.includes(f), `trace missing ${f}`);
   }
 });
+

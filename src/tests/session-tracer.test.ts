@@ -282,3 +282,234 @@ test("session-tracer: snapshot carries url/origin/storage keys without values", 
   const blob = JSON.stringify(snap);
   assert.ok(!blob.includes("abc123?x=1"));
 });
+
+import * as lsTracer from "../services/session-tracer.ts";
+
+const LS_A = { present: true, hash: "aaaa1111", length: 40 };
+const LS_B = { present: true, hash: "bbbb2222", length: 40 };
+const LS_ABSENT = { present: false, hash: null, length: 0 };
+
+test("session-tracer: detectLsChange flags true->false removal", () => {
+  const mod = lsTracer;
+  const d = mod.detectLsChange(LS_A, LS_ABSENT);
+  assert.ok(d);
+  assert.deepEqual(d.before, LS_A);
+  assert.deepEqual(d.after, LS_ABSENT);
+});
+
+test("session-tracer: detectLsChange flags hash rotation", () => {
+  const mod = lsTracer;
+  const d = mod.detectLsChange(LS_A, LS_B);
+  assert.ok(d);
+  assert.equal(d.before.hash, "aaaa1111");
+  assert.equal(d.after.hash, "bbbb2222");
+});
+
+test("session-tracer: detectLsChange returns null when stable", () => {
+  const mod = lsTracer;
+  assert.equal(mod.detectLsChange(LS_A, { ...LS_A }), null);
+  assert.equal(mod.detectLsChange(LS_ABSENT, { ...LS_ABSENT }), null);
+});
+
+test("session-tracer: detectLsChange needs a baseline", () => {
+  const mod = lsTracer;
+  assert.equal(mod.detectLsChange(null, LS_ABSENT), null);
+});
+
+test("session-tracer: first LS change is frozen, not overwritten", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 1_000_000;
+  m.setLsBaseline({ present: true, hash: "aaaa1111", length: 40 });
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "page-goto", present: false, hash: null, length: 0, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: false, ts: t0 + 1000 }),
+  );
+  const first = m.getFirstLsChange();
+  assert.ok(first);
+  assert.equal(first.event, "page-goto");
+  assert.equal(first.before.hash, "aaaa1111");
+  assert.equal(first.after.present, false);
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "sessionkeeper-close", present: true, hash: "dddd4444", length: 40, cookiePresent: true, cookieHash: "dddd4444", cookieLength: 40, match: true, ts: t0 + 2000 }),
+  );
+  assert.equal(m.getFirstLsChange(), first);
+});
+
+test("session-tracer: stable LS produces CASO D classification", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 1_000_000;
+  m.setLsBaseline({ present: true, hash: "aaaa1111", length: 40 });
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 }),
+  );
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "capture-success", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 + 1000 }),
+  );
+  const cls = m.classifyLsChange();
+  assert.equal(cls.case, "D_STABLE");
+  assert.equal(cls.removed, false);
+  assert.equal(cls.rotated, false);
+  assert.equal(m.getFirstLsChange(), null);
+});
+
+test("session-tracer: classify needs a baseline before judging", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const cls = m.classifyLsChange();
+  assert.equal(cls.case, "NO_BASELINE");
+  assert.equal(cls.hypothesisRefuted, false);
+});
+
+test("session-tracer: removal classifies as CASO A with cookie divergence", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 2_000_000;
+  m.setLsBaseline({ present: true, hash: "aaaa1111", length: 40 });
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 }),
+  );
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "page-goto", present: false, hash: null, length: 0, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: false, ts: t0 + 2000 }),
+  );
+  const cls = m.classifyLsChange();
+  assert.equal(cls.case, "A_REMOVED");
+  assert.equal(cls.removed, true);
+  assert.equal(cls.rotated, false);
+  assert.equal(cls.cookieLsDivergenceCreated, true);
+  assert.equal(cls.afterChangeCookieLsMatch, false);
+  assert.equal(m.getFirstLsChange()?.event, "page-goto");
+});
+
+test("session-tracer: rotation classifies as CASO B", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 3_000_000;
+  m.setLsBaseline({ present: true, hash: "aaaa1111", length: 40 });
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 }),
+  );
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "refresh-ls-write-post", present: true, hash: "bbbb2222", length: 40, cookiePresent: true, cookieHash: "bbbb2222", cookieLength: 40, match: true, ts: t0 + 500 }),
+  );
+  const cls = m.classifyLsChange();
+  assert.equal(cls.case, "B_ROTATED");
+  assert.equal(cls.rotated, true);
+  assert.equal(cls.removed, false);
+  assert.equal(cls.cookieLsDivergenceCreated, false);
+  assert.equal(cls.afterChangeCookieLsMatch, true);
+});
+
+test("session-tracer: dead handle classifies as CASO C (recreate loss)", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 4_000_000;
+  m.setLsBaseline({ present: true, hash: "aaaa1111", length: 40 });
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 }),
+  );
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "context-close", present: false, hash: null, length: 0, cookiePresent: false, cookieHash: null, cookieLength: 0, match: null, handleAlive: false, ts: t0 + 3000 }),
+  );
+  const cls = m.classifyLsChange();
+  assert.equal(cls.case, "C_RECREATE_LOSS");
+  assert.equal(cls.recreateLoss, true);
+});
+
+test("session-tracer: a new post-install baseline archives the prior generation", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 6_000_000;
+  // Generation 1: install, then the token disappears.
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 }),
+  );
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "upstream-settings", present: false, hash: null, length: 0, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: false, ts: t0 + 1000 }),
+  );
+  assert.equal(m.classifyLsChange().case, "A_REMOVED");
+  // Generation 2: re-login installs a new token, which is a NEW baseline and
+  // must not be reported as a rotation of generation 1.
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "eeee5555", length: 41, cookiePresent: true, cookieHash: "eeee5555", cookieLength: 41, match: true, ts: t0 + 5000 }),
+  );
+  assert.equal(m.getLsBaseline()?.hash, "eeee5555");
+  assert.equal(m.getFirstLsChange(), null);
+  assert.equal(m.classifyLsChange().case, "D_STABLE");
+  const t = m.getSessionTrace();
+  assert.equal(t.lsGenerations.length, 1);
+  assert.equal(t.lsGenerations[0].baseline.hash, "aaaa1111");
+  assert.equal(t.lsGenerations[0].firstChange?.event, "upstream-settings");
+});
+
+test("session-tracer: proactive context teardown is CASO C, not CASO A", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const t0 = 5_000_000;
+  m.setLsBaseline({ present: true, hash: "aaaa1111", length: 40 });
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true, ts: t0 }),
+  );
+  // Teardown observed while the handle is still alive: storage is expected to
+  // be gone on the next page, so it must not be reported as an in-page removal.
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "context-close", present: false, hash: null, length: 0, cookiePresent: false, cookieHash: null, cookieLength: 0, match: null, handleAlive: true, ts: t0 + 1000 }),
+  );
+  const cls = m.classifyLsChange();
+  assert.equal(cls.case, "C_RECREATE_LOSS");
+  assert.equal(cls.recreateLoss, true);
+  assert.equal(cls.removed, false);
+  assert.equal(cls.rotated, false);
+});
+
+test("session-tracer: cookie-vs-LS mismatch is surfaced per checkpoint", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "x", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "cccc3333", cookieLength: 40, match: false }),
+  );
+  const cp = m.getLsHistory().at(-1);
+  assert.ok(cp);
+  assert.equal(cp.match, false);
+  assert.equal(typeof cp.cookiePresent, "boolean");
+  assert.equal(cp.cookieHash, "cccc3333");
+});
+
+test("session-tracer: checkpoints are target-account only", async () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  await m.traceLsCheckpoint("some-other-account-id", "should-be-ignored");
+  assert.equal(m.getLsHistory().length, 0);
+});
+
+test("session-tracer: LS trace output carries no secret values", async () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  m._seedLsCheckpointForTests(
+    m._mkCpForTests({ label: "post-install", present: true, hash: "aaaa1111", length: 40, cookiePresent: true, cookieHash: "aaaa1111", cookieLength: 40, match: true }),
+  );
+  const t = m.getSessionTrace();
+  const blob = JSON.stringify({
+    b: t.lsBaseline,
+    h: t.lsBaselineHandles,
+    f: t.firstLsChange,
+    k: t.lsClassification,
+    l: t.lsHistory,
+  });
+  assert.ok(!/token=|Bearer |password|eyJ/i.test(blob));
+  assert.ok(t.lsHistory.length > 0);
+  assert.ok(t.lsHistory.every((e) => typeof e.present === "boolean"));
+  assert.ok(t.lsHistory.every((e) => typeof e.handleAlive === "boolean"));
+});
+
+test("session-tracer: failure snapshot is taken before recovery", () => {
+  const src = fs.readFileSync("src/services/session-tracer.ts", "utf-8");
+  const markIdx = src.indexOf("export function markFirstFailure");
+  assert.ok(markIdx >= 0);
+  const block = src.slice(markIdx, markIdx + 900);
+  const snapIdx = block.indexOf('traceLsCheckpoint(accountId, "first-auth-failure")');
+  const dumpIdx = block.indexOf("dumpFailureWindow()");
+  assert.ok(snapIdx >= 0, "failure LS snapshot missing");
+  assert.ok(dumpIdx >= 0);
+  assert.ok(snapIdx < dumpIdx, "failure snapshot must precede recovery dump");
+});
