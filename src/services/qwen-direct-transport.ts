@@ -90,7 +90,7 @@ export function _resetDirectTransportCachesForTests(): void {
  */
 export async function getBaxiaMaterial(
   accountId: string,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; baxiaWaitMs?: number } = {},
 ): Promise<BaxiaMaterial | null> {
   const cached = baxiaCache.get(accountId);
   const now = Date.now();
@@ -141,14 +141,28 @@ export async function getBaxiaMaterial(
       const page = handles.page as {
         evaluate: (fn: unknown, arg?: unknown) => Promise<unknown>;
       };
-      const raw = (await page.evaluate(BAXIA_EXTRACT_FN as unknown as () => unknown)) as
-        | {
-            ready: boolean;
-            uid?: string;
-            fy?: string;
-            ver?: string;
+      // The SDK needs time: qwen2api polls up to 60 x 500ms waiting for
+      // getFYModule().fyObj and a T2gA uid token. Same wait, same shape.
+      let raw: {
+        ready: boolean;
+        uid?: string;
+        fy?: string;
+        ver?: string;
+      } | null = null;
+      const deadline = Date.now() + (opts.baxiaWaitMs ?? 25_000);
+      while (Date.now() < deadline) {
+        const attempt = (await page
+          .evaluate(BAXIA_EXTRACT_FN as unknown as () => unknown)
+          .catch(() => null)) as typeof raw;
+        if (attempt && attempt.ready) {
+          const uidNow = typeof attempt.uid === "string" ? attempt.uid : "";
+          if (/^T2gA/i.test(uidNow) && uidNow.length > 20) {
+            raw = attempt;
+            break;
           }
-        | null;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
       if (!raw || !raw.ready) return null;
       const uid = typeof raw.uid === "string" ? raw.uid : "";
       if (!/^T2gA/i.test(uid) || uid.length <= 20) return null;
