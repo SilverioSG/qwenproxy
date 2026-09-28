@@ -631,6 +631,7 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
   const id = c.req.param("id");
+  const mode = c.req.query("mode") === "capture" ? "capture" : "refresh";
   const timeoutMs = Math.max(
     5_000,
     Math.min(120_000, Number.parseInt(c.req.query("timeoutMs") ?? "45000", 10) || 45_000),
@@ -643,9 +644,23 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
     let ok = false;
     let errorClass: string | null = null;
     let errorMessage: string | null = null;
+    let loginOk: boolean | null = null;
     try {
-      const { refreshHeaders } = await import("../services/playwright.js");
-      await refreshHeaders(id, timeoutMs, true);
+      if (mode === "capture") {
+        // Exercise the UI capture itself: one login, then captureQwenHeaders.
+        const { captureQwenHeaders, loginToQwen } = await import(
+          "../services/playwright.js"
+        );
+        const { getAccountCredentials } = await import("../core/accounts.js");
+        const creds = getAccountCredentials(id);
+        if (creds?.email && creds?.password) {
+          loginOk = await loginToQwen(id, creds.email, creds.password, "capture-probe");
+        }
+        await captureQwenHeaders(id, undefined, timeoutMs);
+      } else {
+        const { refreshHeaders } = await import("../services/playwright.js");
+        await refreshHeaders(id, timeoutMs, true);
+      }
       ok = true;
     } catch (err) {
       errorClass =
@@ -657,7 +672,9 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
     const stages = events.map((e) => String(e.stage));
     return c.json({
       ok,
+      mode,
       accountId: id,
+      loginOk,
       durationMs: Date.now() - startedAt,
       errorClass,
       errorMessage,
