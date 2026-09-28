@@ -52,7 +52,7 @@ test("composer-probe: in-page listeners cover the required event types", () => {
   assert.ok(COMPOSER_INSTALL_FN.includes("__qwenComposerProbe = {"));
   assert.ok(COMPOSER_DRAIN_FN.includes("P.dispose[0]()"));
   assert.ok(COMPOSER_DRAIN_FN.includes("delete window.__qwenComposerProbe"));
-  assert.ok(COMPOSER_SNAPSHOT_FN.includes("P.snap(args.label)"));
+  assert.ok(COMPOSER_SNAPSHOT_FN.includes("at: args.label"));
   // The event type list must be complete (quoted, in one array).
   const list = COMPOSER_INSTALL_FN.match(/const TYPES = \[(.*?)\];/);
   assert.ok(list, "TYPES array missing");
@@ -205,6 +205,7 @@ test("composer-probe: compiled in-page closures actually run", () => {
   const post = snap({ label: "after-100ms" });
   assert.equal(post.at, "after-100ms");
   assert.equal(post.composerFound, true);
+  assert.equal(post.composerValueLength, 7);
   const drain = mk(COMPOSER_DRAIN_FN) as () => unknown[];
   assert.deepEqual(drain(), []);
   assert.equal(removed.length, 8);
@@ -242,10 +243,13 @@ test("composer-probe: the collector is persisted on window, not per-evaluate sta
   // Regression guard: page.evaluate serializes its argument per call, so an
   // object handed in from Node is a fresh copy and nothing would ever persist.
   assert.ok(COMPOSER_INSTALL_FN.includes("window.__qwenComposerProbe = {"));
-  assert.ok(COMPOSER_SNAPSHOT_FN.includes("window.__qwenComposerProbe"));
   assert.ok(COMPOSER_DRAIN_FN.includes("window.__qwenComposerProbe"));
   assert.ok(COMPOSER_INSTALL_FN.includes("P.events") === false);
   assert.ok(COMPOSER_DRAIN_FN.includes("P.events"));
+  // The state probe is self-contained: it must not depend on the collector,
+  // so it keeps working on documents created by a capture navigation.
+  assert.ok(!/window\.__qwenComposerProbe/.test(COMPOSER_SNAPSHOT_FN));
+  assert.ok(COMPOSER_SNAPSHOT_FN.includes("document.querySelector(sel)"));
   const src = fs.readFileSync("src/services/composer-probe.ts", "utf-8");
   assert.ok(!/const out = \{ events/.test(src), "no per-call out object");
 });

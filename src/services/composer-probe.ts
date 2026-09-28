@@ -227,11 +227,63 @@ export const COMPOSER_BOOT_DIAG_FN = `
 }
 `;
 
+/**
+ * Self-contained state probe: queries the DOM itself and does NOT depend on the
+ * window collector, so it keeps working on any document (including one created
+ * by a navigation the capture performed).
+ */
 export const COMPOSER_SNAPSHOT_FN = `
 (args) => {
-  const P = window.__qwenComposerProbe;
-  if (!P || typeof P.snap !== "function") return null;
-  return P.snap(args.label);
+  const COMPOSER_SEL = ${JSON.stringify(COMPOSER_SELECTORS.join(", "))};
+  const SEND_SEL = ${JSON.stringify(SEND_BUTTON_SELECTORS.join(", "))};
+  const Q = [
+    (sel) => {
+      try { return document.querySelector(sel); } catch (e) { return null; }
+    },
+  ];
+  const VIS = [
+    (el) => {
+      if (!el) return false;
+      try {
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el);
+        return (
+          r.width > 0 && r.height > 0 &&
+          st.visibility !== "hidden" && st.display !== "none" &&
+          st.opacity !== "0"
+        );
+      } catch (e) { return false; }
+    },
+  ];
+  const ta = Q[0](COMPOSER_SEL);
+  const btn = Q[0](SEND_SEL);
+  const bclass = btn && btn.className && typeof btn.className === "string"
+    ? btn.className.slice(0, 160) : "";
+  return {
+    at: args.label,
+    composerFound: !!ta,
+    composerVisible: VIS[0](ta),
+    composerEnabled: ta ? !ta.disabled : false,
+    composerDisabledAttr: ta ? !!ta.disabled : false,
+    composerAriaDisabled: ta ? ta.getAttribute("aria-disabled") : null,
+    composerReadonly: ta ? !!ta.readOnly : false,
+    composerValueLength: ta && typeof ta.value === "string" ? ta.value.length : 0,
+    sendButtonFound: !!btn,
+    sendButtonVisible: VIS[0](btn),
+    sendButtonEnabled: btn ? !btn.disabled && !/disabled/.test(bclass) : false,
+    sendButtonDisabledAttr: btn ? !!btn.disabled : false,
+    sendButtonAriaDisabled: btn ? btn.getAttribute("aria-disabled") : null,
+    sendButtonClass: bclass,
+    sendButtonTag: btn ? btn.tagName : null,
+    messageEchoVisible: !!Q[0]("[data-message-author='user'], .user-message, [class*='user-message']"),
+    stopButtonVisible: !!Q[0]("button[aria-label*='Stop' i], .stop-button, [class*='stop-button']"),
+    loadingIndicatorVisible: !!Q[0]("[class*='loading'], [class*='spinner'], [aria-busy='true']"),
+    generatingMarkerVisible: !!Q[0]("[class*='generating'], [data-generating='true'], [class*='streaming']"),
+    errorBannerVisible: !!Q[0]("[class*='error-banner'], [role='alert'], [class*='error-message']"),
+    challengeMarkerVisible: !!Q[0]("[class*='captcha'], [id*='captcha'], [class*='punish'], [class*='challenge']"),
+    url: (() => { try { return location.href.slice(0, 120); } catch (e) { return "n/a"; } })(),
+    title: (() => { try { return (document.title || "").slice(0, 80); } catch (e) { return ""; } })(),
+  };
 }
 `;
 
