@@ -101,9 +101,12 @@ export interface ComposerProbeResult {
  * with its listeners, which is why the first two runs recorded nothing.
  */
 export const COMPOSER_INSTALL_FN = `
-(args) => {
-  const COMPOSER_SEL = args.selectors[0];
-  const SEND_SEL = args.selectors[1];
+() => {
+  // Selectors are baked in: relying on an init-script argument made the whole
+  // boot throw in the page (silently) whenever the argument was not delivered,
+  // which left the collector missing and every snapshot null.
+  const COMPOSER_SEL = ${JSON.stringify(COMPOSER_SELECTORS.join(", "))};
+  const SEND_SEL = ${JSON.stringify(SEND_BUTTON_SELECTORS.join(", "))};
   // Array literals, not consts: esbuild keepNames rewrites named function
   // expressions to __name(f, "f") and __name does not exist in the page.
   const VIS = [
@@ -393,16 +396,7 @@ export async function probeComposerDuringCapture(
     if (typeof initScript !== "function") {
       return { ...empty, error: "addInitScript-unavailable" };
     }
-    await initScript.call(
-      handles.page,
-      compileInPage(COMPOSER_INSTALL_FN),
-      {
-        selectors: [
-          COMPOSER_SELECTORS.join(", "),
-          SEND_BUTTON_SELECTORS.join(", "),
-        ],
-      } as unknown,
-    );
+    await initScript.call(handles.page, compileInPage(COMPOSER_INSTALL_FN));
   } catch (err) {
     return {
       ...empty,

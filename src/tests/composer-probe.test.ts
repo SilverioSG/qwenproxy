@@ -181,8 +181,8 @@ test("composer-probe: compiled in-page closures actually run", () => {
       "location",
       `return (${source});`,
     )(doc, win, { href: "https://chat.qwen.ai/" }) as (a?: unknown) => unknown;
-  const install = mk(COMPOSER_INSTALL_FN) as (a: unknown) => Record<string, unknown>;
-  const pre = install({ selectors: ["textarea", "button.send-button"] });
+  const install = mk(COMPOSER_INSTALL_FN) as () => Record<string, unknown>;
+  const pre = install();
   assert.equal(pre.composerFound, true);
   assert.equal(pre.composerVisible, true);
   assert.equal(pre.composerEnabled, true);
@@ -211,6 +211,12 @@ test("composer-probe: compiled in-page closures actually run", () => {
   assert.equal(win.__qwenComposerProbe, undefined);
 });
 
+test("composer-probe: the init script must not depend on an argument", () => {
+  // Regression guard: an init script that throws in the page installs nothing.
+  assert.ok(!/args\./.test(COMPOSER_INSTALL_FN), "init script must take no arg");
+  assert.ok(/^\s*\(\)\s*=>\s*\{/.test(COMPOSER_INSTALL_FN));
+});
+
 test("composer-probe: the collector is installed with addInitScript, not once", () => {
   // Regression guard: the capture navigates to chat.qwen.ai, which destroys the
   // JS context. A one-shot evaluate install is wiped along with its listeners.
@@ -220,7 +226,12 @@ test("composer-probe: the collector is installed with addInitScript, not once", 
     !/installRaw = await page\.evaluate/.test(src),
     "no one-shot evaluate install",
   );
-  assert.ok(COMPOSER_INSTALL_FN.includes("COMPOSER_SEL = args.selectors[0]"));
+  assert.ok(
+    COMPOSER_INSTALL_FN.includes(
+      `const COMPOSER_SEL = ${JSON.stringify(COMPOSER_SELECTORS.join(", "))}`,
+    ),
+    "selectors must be baked into the init script, not passed as an argument",
+  );
   assert.ok(
     COMPOSER_INSTALL_FN.includes("window.__qwenComposerProbe = {"),
     "collector is re-created per document",
