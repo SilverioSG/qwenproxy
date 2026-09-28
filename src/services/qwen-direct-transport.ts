@@ -423,6 +423,12 @@ export interface DirectCompletionResult {
   waf: boolean;
   /** The WAF punish/challenge URL to hand to the recovery coordinator. */
   punishUrl: string | null;
+  /**
+   * Full upstream body. The coordinator extracts the challenge URL from it, and
+   * the 200-char `bodyPreview` TRUNCATES the x5secdata parameter, so the
+   * orchestrator must pass this instead. Never logged.
+   */
+  challengeBody: string | null;
   sseStarted: boolean;
   sseDone: boolean;
   outputLength: number;
@@ -529,6 +535,7 @@ export async function directCompletion(input: {
         contentType,
         waf: looksLikeWafChallenge(raw, contentType),
         punishUrl: extractPunishUrl(raw),
+        challengeBody: raw,
         sseStarted: false,
         sseDone: false,
         outputLength: 0,
@@ -541,6 +548,7 @@ export async function directCompletion(input: {
       const raw = await res.text().catch(() => "");
       const waf = looksLikeWafChallenge(raw, contentType);
       const punishUrl = extractPunishUrl(raw);
+      const challengeBody = raw;
       let json: any = null;
       try {
         json = raw ? JSON.parse(raw) : null;
@@ -554,6 +562,7 @@ export async function directCompletion(input: {
           contentType,
           waf,
           punishUrl,
+          challengeBody,
           sseStarted: false,
           sseDone: false,
           outputLength: 0,
@@ -571,6 +580,7 @@ export async function directCompletion(input: {
         contentType,
         waf,
         punishUrl,
+        challengeBody,
         sseStarted: false,
         sseDone: Boolean(text),
         outputLength: typeof text === "string" ? text.length : 0,
@@ -588,6 +598,7 @@ export async function directCompletion(input: {
         contentType,
         waf: false,
         punishUrl: null,
+        challengeBody: null,
         sseStarted: false,
         sseDone: false,
         outputLength: 0,
@@ -651,6 +662,7 @@ export async function directCompletion(input: {
       contentType,
       waf: false,
       punishUrl: null,
+      challengeBody: null,
       sseStarted,
       sseDone,
       outputLength: text.length,
@@ -664,6 +676,7 @@ export async function directCompletion(input: {
       contentType: "",
       waf: false,
       punishUrl: null,
+      challengeBody: null,
       sseStarted: false,
       sseDone: false,
       outputLength: 0,
@@ -853,7 +866,7 @@ export async function directChatWithWafRecovery(args: {
     recoverySuccess = await recoverBaxiaCaptcha(
       args.accountId,
       "direct-transport",
-      { challengeBody: comp?.bodyPreview ?? "" },
+      { challengeBody: comp?.challengeBody ?? "" },
     );
   } catch (e) {
     recoverySkipReason =

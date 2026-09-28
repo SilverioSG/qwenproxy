@@ -108,7 +108,13 @@ test("waf: no secret values are returned or logged by the orchestration", () => 
   const orch = src.slice(src.indexOf("export async function directChatWithWafRecovery"));
   // Only pass the challenge BODY (which the coordinator parses and validates);
   // never the token/cookie values.
-  assert.ok(orch.includes("challengeBody: comp?.bodyPreview ?? \"\""));
+  // The FULL body must be passed: the 200-char preview truncates x5secdata.
+  assert.ok(orch.includes("challengeBody: comp?.challengeBody ?? \"\""));
+  assert.ok(!orch.includes("challengeBody: comp?.bodyPreview"));
+  assert.ok(
+    /challengeBody: string \| null/.test(src),
+    "the result must carry the full body for the coordinator",
+  );
   assert.ok(!/challengeBody:[^}]*cookie/.test(orch));
   assert.ok(!/challengeBody:[^}]*bxUa/.test(orch));
   // Logs are limited to the punish URL host/shape at most; assert no console
@@ -117,7 +123,10 @@ test("waf: no secret values are returned or logged by the orchestration", () => 
     (m) => m[2],
   );
   for (const l of logs) {
-    assert.ok(!/\.bxUa\b|\.bxUmidToken\b|\.cookie\b/.test(l), `log leaks material: ${l.slice(0, 80)}`);
+    assert.ok(
+      !/\.bxUa\b|\.bxUmidToken\b|\.cookie\b|challengeBody\b/.test(l),
+      `log leaks material: ${l.slice(0, 80)}`,
+    );
   }
 });
 
