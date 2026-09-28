@@ -689,6 +689,32 @@ dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
   }
 });
 
+dashboardApp.post("/v1/accounts/:id/probe-composer", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: runs ONE real captureQwenHeaders while passively
+  // observing the composer (DOM events + generic request observer). It does not
+  // modify the capture path. No /v1 traffic, no rotation, no cooldown changes.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const timeoutMs = Math.max(
+    5_000,
+    Math.min(120_000, Number.parseInt(c.req.query("timeoutMs") ?? "60000", 10) || 60_000),
+  );
+  try {
+    const { probeComposerDuringCapture } = await import("../services/composer-probe.js");
+    const { captureQwenHeaders } = await import("../services/playwright.js");
+    const result = await probeComposerDuringCapture(id, () =>
+      captureQwenHeaders(id, undefined, timeoutMs),
+    );
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
 dashboardApp.post("/v1/accounts/:id/probe-settings-update", async (c) => {
   // EXPERIMENTAL DIAGNOSTIC: A/B of POST /api/v2/users/user/settings/update in
   // ONE already-authenticated page/context. No re-login, no refresh, no context
