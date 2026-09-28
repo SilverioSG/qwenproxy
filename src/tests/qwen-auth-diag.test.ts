@@ -532,3 +532,184 @@ test("qwen-auth-diag: probe LS marks are observational (no functional gate)", ()
   // No early return / throw: a checkpoint must never abort the probe.
   assert.ok(!/return false|throw /.test(block));
 });
+
+test("qwen-auth-diag: isPageLoggedIn emits all subrequest LS checkpoints", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("export async function probePageLoggedIn");
+  assert.ok(start >= 0);
+  const end = src.indexOf("export async function isPageLoggedIn", start);
+  const block = src.slice(start, end);
+  const expected = [
+    "isloggedin-entry",
+    "auths-pre",
+    "auths-post",
+    "auths-post-50ms",
+    "auths-post-250ms",
+    "settings-pre",
+    "settings-post",
+    "settings-post-50ms",
+    "settings-post-250ms",
+    "refresh-pre",
+    "refresh-post",
+    "refresh-post-50ms",
+    "refresh-post-250ms",
+    "isloggedin-exit",
+    "isloggedin-exit-50ms",
+    "isloggedin-exit-250ms",
+  ];
+  for (const label of expected) {
+    assert.ok(block.includes(`"${label}"`), `missing checkpoint ${label}`);
+  }
+  // The subrequest order must be preserved: auths -> settings -> refresh.
+  const iA = block.indexOf('SNAP[0]("auths-pre")');
+  const iS = block.indexOf('SNAP[0]("settings-pre")');
+  const iR = block.indexOf('SNAP[0]("refresh-pre")');
+  assert.ok(iA >= 0 && iA < iS && iS < iR, "subrequest order changed");
+  // Endpoints unchanged.
+  assert.ok(block.includes('fetch("/api/v1/auths/", { method: "GET" })'));
+  assert.ok(block.includes('fetch("/api/v2/users/user/settings"'));
+  assert.ok(block.includes('fetch("https://auth.qwen.ai/api/v2/auths/refresh"'));
+});
+
+test("qwen-auth-diag: in-page helpers avoid __name by living in array literals", () => {
+  // esbuild keepNames rewrites named function expressions/declarations to
+  // __name(f, "f"); array-literal elements are emitted verbatim. Verified
+  // against the real esbuild transform.
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("export async function probePageLoggedIn");
+  const end = src.indexOf("export async function isPageLoggedIn", start);
+  const block = src.slice(start, end);
+  for (const helper of ["SNAP", "WAIT"]) {
+    assert.ok(
+      block.includes(`const ${helper} = [`),
+      `${helper} must be an array literal to stay __name-free`,
+    );
+  }
+  // No `const f = (...) =>` outside the array literals.
+  const namedArrows = [...block.matchAll(NESTED_FN_DECL)].filter((m) => {
+    const at = m.index ?? 0;
+    const before = block.slice(Math.max(0, at - 60), at);
+    return !/const\s+(SNAP|WAIT)\s*=\s*\[$/.test(before.replace(/\n/g, ""));
+  });
+  assert.deepEqual(namedArrows.map((m) => m[0].slice(0, 40)), []);
+});
+
+test("qwen-auth-diag: deferred waits are gated on the trace flag", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("export async function probePageLoggedIn");
+  const end = src.indexOf("export async function isPageLoggedIn", start);
+  const block = src.slice(start, end);
+  // WAIT returns immediately when the probe is not traced.
+  const waitIdx = block.indexOf("const WAIT = [");
+  const waitBlock = block.slice(waitIdx, waitIdx + 220);
+  assert.ok(waitBlock.includes("if (!TRACE) return;"));
+  assert.ok(waitBlock.includes("setTimeout"));
+  // The timeout budget is only widened for the traced account.
+  assert.ok(block.includes("isTraced ? ISLOGGEDIN_TRACE_OVERHEAD_MS : 0"));
+  // Untraced accounts get no extra budget and no samples.
+  assert.ok(block.includes("accountIdForPage(page)"));
+});
+
+test("qwen-auth-diag: probePageLoggedIn external contract is unchanged", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("export async function isPageLoggedIn");
+  const end = src.indexOf("export function getOrLaunchSharedBrowser", start);
+  const block = src.slice(start, end);
+  assert.ok(block.includes("probePageLoggedIn(page, timeoutMs)).ok"));
+  const probeStart = src.indexOf("export async function probePageLoggedIn");
+  const probeEnd = src.indexOf("export async function isPageLoggedIn");
+  const probe = src.slice(probeStart, probeEnd);
+  // Guard clauses keep their original reasons.
+  for (const r of [
+    '"no-page"',
+    '"page-closed"',
+    '"auth-url"',
+    '"auths-status"',
+    '"auths-schema"',
+    '"settings-401"',
+    '"settings-403"',
+    '"settings-revoked"',
+    '"refresh-401"',
+    '"refresh-403"',
+    '"refresh-revoked"',
+    '"logged-out-marker"',
+    '"context-destroyed"',
+    '"evaluate-error"',
+    '"ok"',
+  ]) {
+    assert.ok(probe.includes(r), `lost reason ${r}`);
+  }
+});
+
+test("qwen-auth-diag: rotation ingestion stores no secret values", async () => {
+  const mod = await import("../services/session-tracer.ts");
+  mod._resetLsTrackingForTests();
+  mod.ingestIsLoggedInTrace(
+    mod.TRACE_TARGET_ACCOUNT,
+    [
+      {
+        label: "isloggedin-entry",
+        ts: 1_000,
+        lsPresent: true,
+        lsHash: "aaaa1111",
+        lsLength: 209,
+        marker: false,
+        cookiePresent: true,
+        cookieHash: "aaaa1111",
+        cookieLength: 209,
+      },
+      {
+        label: "auths-pre",
+        ts: 1_010,
+        lsPresent: true,
+        lsHash: "aaaa1111",
+        lsLength: 209,
+        marker: false,
+        cookiePresent: true,
+        cookieHash: "aaaa1111",
+        cookieLength: 209,
+      },
+      {
+        label: "auths-post",
+        ts: 1_020,
+        lsPresent: false,
+        lsHash: null,
+        lsLength: 0,
+        marker: true,
+        cookiePresent: true,
+        cookieHash: "bbbb2222",
+        cookieLength: 210,
+      },
+    ],
+    [
+      {
+        step: "auths",
+        httpStatus: 200,
+        appState: "http-200",
+        appSuccess: true,
+        usable: null,
+        responseKeys: ["success", "data"],
+        setCookieObserved: null,
+        lsWriteObserved: null,
+      },
+    ],
+    { context: null, page: null, url: "https://chat.qwen.ai/" },
+  );
+  const t = mod.getIsLoggedInTrace();
+  assert.equal(t.results.length, 1);
+  assert.equal(t.results[0].step, "auths");
+  assert.deepEqual(t.results[0].responseKeys, ["success", "data"]);
+  const blob = JSON.stringify(t);
+  assert.ok(!/eyJ|Bearer |password|token=/i.test(blob));
+});
+
+test("qwen-auth-diag: accountIdForPage is a reverse lookup with no side effects", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const start = src.indexOf("function accountIdForPage");
+  assert.ok(start >= 0);
+  const block = src.slice(start, start + 260);
+  assert.ok(block.includes("for (const [id, p] of accountPages)"));
+  assert.ok(block.includes("if (p === page) return id;"));
+  assert.ok(block.includes("return null;"));
+  assert.ok(!/accountPages\.(delete|clear|set)/.test(block));
+});

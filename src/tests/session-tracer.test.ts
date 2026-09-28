@@ -513,3 +513,198 @@ test("session-tracer: failure snapshot is taken before recovery", () => {
   assert.ok(dumpIdx >= 0);
   assert.ok(snapIdx < dumpIdx, "failure snapshot must precede recovery dump");
 });
+
+function obs(
+  label: string,
+  over: Partial<lsTracer.LsObservation> & { ts?: number } = {},
+): lsTracer.LsObservation {
+  return {
+    label,
+    ts: over.ts ?? 1_000,
+    lsPresent: over.lsPresent ?? true,
+    lsHash: over.lsHash ?? "aaaa1111",
+    lsLength: over.lsLength ?? 209,
+    marker: over.marker ?? false,
+    cookiePresent: over.cookiePresent ?? true,
+    cookieHash: over.cookieHash ?? "aaaa1111",
+    cookieLength: over.cookieLength ?? 209,
+  };
+}
+
+test("session-tracer: auths subrequest rotation -> CASO B (frozen first step)", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("auths-pre", { ts: 1_010 }),
+    obs("auths-post", {
+      ts: 1_020,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+      cookieHash: "bbbb2222",
+      cookieLength: 210,
+    }),
+    obs("auths-post-50ms", {
+      ts: 1_070,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+      cookieHash: "bbbb2222",
+      cookieLength: 210,
+    }),
+    obs("settings-pre", {
+      ts: 1_100,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+      cookieHash: "bbbb2222",
+      cookieLength: 210,
+    }),
+    obs("refresh-pre", {
+      ts: 1_200,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+      cookieHash: "bbbb2222",
+      cookieLength: 210,
+    }),
+  ]);
+  assert.equal(r.step, "auths");
+  assert.equal(r.rotationCase, "B");
+  assert.equal(r.cookieRotated, true);
+  assert.equal(r.lsRemoved, true);
+  assert.equal(r.markerAdded, true);
+  assert.equal(r.cookieBefore, "aaaa1111");
+  assert.equal(r.cookieAfter, "bbbb2222");
+  assert.equal(r.lsBefore, true);
+  assert.equal(r.lsAfter, false);
+  assert.equal(r.markerBefore, false);
+  assert.equal(r.markerAfter, true);
+  assert.equal(r.ts, 1_020);
+});
+
+test("session-tracer: cookie rotation without LS loss -> CASO A", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("settings-pre", { ts: 1_010 }),
+    obs("settings-post", { ts: 1_020, cookieHash: "bbbb2222", cookieLength: 210 }),
+  ]);
+  assert.equal(r.step, "settings");
+  assert.equal(r.rotationCase, "A");
+  assert.equal(r.cookieRotated, true);
+  assert.equal(r.lsRemoved, false);
+  assert.equal(r.markerAdded, false);
+});
+
+test("session-tracer: LS loss without cookie rotation -> CASO C", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("refresh-pre", { ts: 1_010 }),
+    obs("refresh-post", {
+      ts: 1_020,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+    }),
+  ]);
+  assert.equal(r.step, "refresh");
+  assert.equal(r.rotationCase, "C");
+  assert.equal(r.cookieRotated, false);
+  assert.equal(r.lsRemoved, true);
+  assert.equal(r.markerAdded, true);
+});
+
+test("session-tracer: async reaction is attributed to async-after-<step>", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("auths-pre", { ts: 1_010 }),
+    obs("auths-post", { ts: 1_020 }),
+    obs("auths-post-50ms", {
+      ts: 1_070,
+      lsPresent: false,
+      lsHash: null,
+      lsLength: 0,
+      marker: true,
+      cookieHash: "bbbb2222",
+      cookieLength: 210,
+    }),
+  ]);
+  assert.equal(r.step, "async-after-auths");
+  assert.equal(r.rotationCase, "B");
+  assert.equal(r.ts, 1_070);
+});
+
+test("session-tracer: no change across the three subrequests -> CASO D", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("auths-pre", { ts: 1_010 }),
+    obs("auths-post", { ts: 1_020 }),
+    obs("settings-pre", { ts: 1_030 }),
+    obs("settings-post", { ts: 1_040 }),
+    obs("refresh-pre", { ts: 1_050 }),
+    obs("refresh-post", { ts: 1_060 }),
+  ]);
+  assert.equal(r.step, "none");
+  assert.equal(r.rotationCase, "D");
+  assert.equal(r.reason, "no-change-across-subrequests");
+});
+
+test("session-tracer: empty observation set never claims a rotation", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([]);
+  assert.equal(r.step, "none");
+  assert.equal(r.rotationCase, "D");
+  assert.equal(r.reason, "no-entry-observation");
+});
+
+test("session-tracer: firstRotation is frozen on ingestion", () => {
+  const m = lsTracer;
+  m._resetLsTrackingForTests();
+  const mk = (cookieHash: string, lsPresent: boolean, ts: number) => ({
+    label: "auths-post",
+    ts,
+    lsPresent,
+    lsHash: lsPresent ? "aaaa1111" : null,
+    lsLength: lsPresent ? 209 : 0,
+    marker: !lsPresent,
+    cookiePresent: true,
+    cookieHash,
+    cookieLength: 209,
+  });
+  m.ingestIsLoggedInTrace(
+    m.TRACE_TARGET_ACCOUNT,
+    [obs("isloggedin-entry", { ts: 1_000 }), obs("auths-pre", { ts: 1_010 }), mk("bbbb2222", false, 1_020)],
+    [],
+  );
+  const first = m.getIsLoggedInTrace().firstRotation;
+  assert.ok(first);
+  assert.equal(first.step, "auths");
+  assert.equal(first.cookieBefore, "aaaa1111");
+  assert.equal(first.cookieAfter, "bbbb2222");
+  // A second probe with a different outcome must not rewrite it.
+  m.ingestIsLoggedInTrace(
+    m.TRACE_TARGET_ACCOUNT,
+    [obs("isloggedin-entry", { ts: 2_000 }), obs("auths-pre", { ts: 2_010 }), mk("cccc3333", true, 2_020)],
+    [],
+  );
+  assert.equal(m.getIsLoggedInTrace().firstRotation, first);
+});
+
+test("session-tracer: rotation trace carries no secret values", () => {
+  const m = lsTracer;
+  const r = m.classifyIsLoggedInRotation([
+    obs("isloggedin-entry", { ts: 1_000 }),
+    obs("auths-post", { ts: 1_020, cookieHash: "bbbb2222", marker: true }),
+  ]);
+  const blob = JSON.stringify(r);
+  assert.ok(!/eyJ|Bearer |password|token=/i.test(blob));
+});

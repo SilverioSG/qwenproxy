@@ -406,6 +406,49 @@ export interface PageLoginProbe {
   reason: PageLoginProbeReason;
 }
 
+/** In-page sanitized sample (hashed forms only; never a raw token). */
+interface InPageObservation {
+  label: string;
+  ts: number;
+  lsPresent: boolean;
+  lsHash: string | null;
+  lsLength: number;
+  marker: boolean;
+  cookiePresent: boolean;
+  cookieHash: string | null;
+  cookieLength: number;
+}
+
+/** In-page per-subrequest outcome (status/keys/booleans only). */
+interface InPageSubResult {
+  step: "auths" | "settings" | "refresh";
+  httpStatus: number;
+  appState: string;
+  appSuccess: boolean | null;
+  usable: boolean | null;
+  responseKeys: string[];
+  setCookieObserved: boolean | null;
+  lsWriteObserved: boolean | null;
+}
+
+interface PageLoginProbeOutcome {
+  reason: PageLoginProbeReason;
+  obs: InPageObservation[];
+  res: InPageSubResult[];
+}
+
+/** Budget added to the probe timeout by the traced deferred samples. */
+const ISLOGGEDIN_TRACE_OVERHEAD_MS = 1_500;
+
+/** Reverse lookup: which account owns this page (null when untracked). */
+function accountIdForPage(page: unknown): string | null {
+  if (!page) return null;
+  for (const [id, p] of accountPages) {
+    if (p === page) return id;
+  }
+  return null;
+}
+
 /**
  * Authoritative login probe with a sanitized classification reason (no
  * secrets, URLs, or bodies). Powers manual-verification diagnostics;
@@ -426,118 +469,342 @@ export async function probePageLoggedIn(
     }
     if (typeof page.evaluate !== "function") return { ok: true, reason: "ok" };
 
+    // Observational instrumentation for the trace-target account only: samples
+    // the live page before/after each of the three subrequests (plus deferred
+    // +50ms/+250ms samples) so the post-login token rotation can be attributed
+    // to exactly one subrequest. Control flow is unchanged and every sample is
+    // gated on TRACE, so untraced accounts pay nothing.
+    const traceAccount = accountIdForPage(page);
+    const isTraced = traceAccount !== null;
     const probe = page
-      .evaluate(async (): Promise<PageLoginProbeReason> => {
-        try {
-          if (localStorage.getItem("qwen_token_logged_out_marker")) {
-            return "logged-out-marker";
-          }
-
-          const res = await fetch("/api/v1/auths/", { method: "GET" });
-          if (res.status !== 200) return "auths-status";
-          const json: any = await res.json().catch(() => null);
-          if (!json) return "auths-schema";
-          if (json.success === false) return "auths-schema";
-          if (
-            json.code &&
-            json.code !== 200 &&
-            json.code !== "200" &&
-            json.code !== 0 &&
-            json.code !== "0"
-          ) {
-            return "auths-schema";
-          }
-          const user = json.data?.user || json.data || json;
-          if (!user || typeof user !== "object") return "auths-schema";
-          if (user.is_guest === true || user.is_login === false) {
-            return "auths-schema";
-          }
-          const hasIdentity = Boolean(
-            user.id ||
-              user.user_id ||
-              user.userId ||
-              user.email ||
-              user.name ||
-              json.data?.token ||
-              json.token ||
-              user.token,
-          );
-          if (!hasIdentity) return "auths-schema";
-
-          // Check if Alibaba revoked the session upstream via same-origin settings
+      .evaluate(
+        async (args: { trace: boolean }): Promise<PageLoginProbeOutcome> => {
+          const OBS: InPageObservation[] = [];
+          const RES: InPageSubResult[] = [];
+          const TRACE = args.trace === true;
+          // NOTE: these helpers live in array literals on purpose. esbuild with
+          // keepNames rewrites named function expressions AND declarations to
+          // __name(f, "f"), and __name does not exist in the page (regression
+          // d3c7140). Array-literal elements are emitted verbatim.
+          const WAIT = [
+            async (ms: number): Promise<void> => {
+              if (!TRACE) return;
+              await new Promise((r) => setTimeout(r, ms));
+            },
+          ];
+          const SNAP = [
+            (label: string): void => {
+              if (!TRACE) return;
+              let tok: string | null = null;
+              try {
+                tok = localStorage.getItem("token");
+              } catch {}
+              let lsPresent = false;
+              let lsHash: string | null = null;
+              let lsLength = 0;
+              if (typeof tok === "string" && tok.length > 0) {
+                lsPresent = true;
+                lsLength = tok.length;
+                let h = 0x811c9dc5;
+                for (let i = 0; i < tok.length; i++) {
+                  h ^= tok.charCodeAt(i);
+                  h = Math.imul(h, 0x01000193);
+                }
+                lsHash = (h >>> 0).toString(16);
+              }
+              let marker = false;
+              try {
+                marker = Boolean(localStorage.getItem("qwen_token_logged_out_marker"));
+              } catch {}
+              let cookieValue = "";
+              try {
+                const parts = document.cookie ? document.cookie.split(";") : [];
+                for (let i = 0; i < parts.length; i++) {
+                  const kv = parts[i].trim();
+                  if (kv.indexOf("token=") === 0) {
+                    cookieValue = kv.slice(6);
+                    break;
+                  }
+                }
+              } catch {}
+              let cookieHash: string | null = null;
+              if (cookieValue.length > 0) {
+                let h = 0x811c9dc5;
+                for (let i = 0; i < cookieValue.length; i++) {
+                  h ^= cookieValue.charCodeAt(i);
+                  h = Math.imul(h, 0x01000193);
+                }
+                cookieHash = (h >>> 0).toString(16);
+              }
+              OBS.push({
+                label,
+                ts: Date.now(),
+                lsPresent,
+                lsHash,
+                lsLength,
+                marker,
+                cookiePresent: cookieHash !== null,
+                cookieHash,
+                cookieLength: cookieValue.length,
+              });
+            },
+          ];
           try {
-            const settingsRes = await fetch("/api/v2/users/user/settings", {
-              method: "GET",
-              credentials: "include",
-              signal: AbortSignal.timeout(3000),
-            });
-            if (settingsRes.status === 401) {
-              return "settings-401";
+            SNAP[0]("isloggedin-entry");
+            if (localStorage.getItem("qwen_token_logged_out_marker")) {
+              return { reason: "logged-out-marker", obs: OBS, res: RES };
             }
-            if (settingsRes.status === 403) {
-              return "settings-403";
+
+            SNAP[0]("auths-pre");
+            const res = await fetch("/api/v1/auths/", { method: "GET" });
+            if (TRACE) {
+              RES.push({
+                step: "auths",
+                httpStatus: res.status,
+                appState: res.status === 200 ? "http-200" : "http-non-200",
+                appSuccess: null,
+                usable: null,
+                responseKeys: [],
+                setCookieObserved: null,
+                lsWriteObserved: null,
+              });
             }
-            const settingsJson: any = await settingsRes.json().catch(() => null);
-            if (settingsJson && settingsJson.success === false) {
-              const code = String(settingsJson.data?.code || settingsJson.code || "").toLowerCase();
-              const details = String(settingsJson.data?.details || settingsJson.details || "").toLowerCase();
-              if (
-                code.includes("unauthorized") ||
-                details.includes("401") ||
-                details.includes("revogado") ||
-                details.includes("revoked")
-              ) {
-                return "settings-revoked";
+            SNAP[0]("auths-post");
+            await WAIT[0](50);
+            SNAP[0]("auths-post-50ms");
+            await WAIT[0](200);
+            SNAP[0]("auths-post-250ms");
+            if (res.status !== 200) return { reason: "auths-status", obs: OBS, res: RES };
+            const json: any = await res.json().catch(() => null);
+            if (TRACE) {
+              const last = RES[RES.length - 1];
+              if (last) {
+                last.responseKeys =
+                  json && typeof json === "object"
+                    ? Object.keys(json).slice(0, 12)
+                    : [];
+                last.appSuccess =
+                  json && typeof json === "object"
+                    ? json.success !== false
+                    : null;
               }
             }
-          } catch {}
+            if (!json) return { reason: "auths-schema", obs: OBS, res: RES };
+            if (json.success === false) return { reason: "auths-schema", obs: OBS, res: RES };
+            if (
+              json.code &&
+              json.code !== 200 &&
+              json.code !== "200" &&
+              json.code !== 0 &&
+              json.code !== "0"
+            ) {
+              return { reason: "auths-schema", obs: OBS, res: RES };
+            }
+            const user = json.data?.user || json.data || json;
+            if (!user || typeof user !== "object") return { reason: "auths-schema", obs: OBS, res: RES };
+            if (user.is_guest === true || user.is_login === false) {
+              return { reason: "auths-schema", obs: OBS, res: RES };
+            }
+            const hasIdentity = Boolean(
+              user.id ||
+                user.user_id ||
+                user.userId ||
+                user.email ||
+                user.name ||
+                json.data?.token ||
+                json.token ||
+                user.token,
+            );
+            if (!hasIdentity) return { reason: "auths-schema", obs: OBS, res: RES };
 
-          // Fallback cross-origin refresh probe
-          try {
-            const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
-              method: "GET",
-              credentials: "include",
-              signal: AbortSignal.timeout(3000),
-            });
-            if (refreshRes.status === 200) {
-              const refreshJson: any = await refreshRes.json().catch(() => null);
-              if (refreshJson && refreshJson.success === false) {
-                const code = refreshJson.data?.code || refreshJson.code;
-                const details = String(refreshJson.data?.details || "");
-                if (code === "Unauthorized" || details.includes("revogado") || details.includes("revoked")) {
-                  return "refresh-revoked";
+            // Check if Alibaba revoked the session upstream via same-origin settings
+            try {
+              SNAP[0]("settings-pre");
+              const settingsRes = await fetch("/api/v2/users/user/settings", {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(3000),
+              });
+              if (TRACE) {
+                RES.push({
+                  step: "settings",
+                  httpStatus: settingsRes.status,
+                  appState: settingsRes.status === 200 ? "http-200" : "http-non-200",
+                  appSuccess: null,
+                  usable: null,
+                  responseKeys: [],
+                  setCookieObserved: null,
+                  lsWriteObserved: null,
+                });
+              }
+              SNAP[0]("settings-post");
+              await WAIT[0](50);
+              SNAP[0]("settings-post-50ms");
+              await WAIT[0](200);
+              SNAP[0]("settings-post-250ms");
+              if (settingsRes.status === 401) {
+                return { reason: "settings-401", obs: OBS, res: RES };
+              }
+              if (settingsRes.status === 403) {
+                return { reason: "settings-403", obs: OBS, res: RES };
+              }
+              const settingsJson: any = await settingsRes.json().catch(() => null);
+              if (TRACE) {
+                const last = RES[RES.length - 1];
+                if (last) {
+                  last.responseKeys =
+                    settingsJson && typeof settingsJson === "object"
+                      ? Object.keys(settingsJson).slice(0, 12)
+                      : [];
+                  last.appSuccess =
+                    settingsJson && typeof settingsJson === "object"
+                      ? settingsJson.success !== false
+                      : null;
                 }
               }
-            } else if (refreshRes.status === 401) {
-              return "refresh-401";
-            } else if (refreshRes.status === 403) {
-              return "refresh-403";
+              if (settingsJson && settingsJson.success === false) {
+                const code = String(settingsJson.data?.code || settingsJson.code || "").toLowerCase();
+                const details = String(settingsJson.data?.details || settingsJson.details || "").toLowerCase();
+                if (
+                  code.includes("unauthorized") ||
+                  details.includes("401") ||
+                  details.includes("revogado") ||
+                  details.includes("revoked")
+                ) {
+                  return { reason: "settings-revoked", obs: OBS, res: RES };
+                }
+              }
+            } catch {}
+
+            // Fallback cross-origin refresh probe
+            try {
+              SNAP[0]("refresh-pre");
+              const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(3000),
+              });
+              if (TRACE) {
+                RES.push({
+                  step: "refresh",
+                  httpStatus: refreshRes.status,
+                  appState: refreshRes.status === 200 ? "http-200" : "http-non-200",
+                  appSuccess: null,
+                  usable: null,
+                  responseKeys: [],
+                  setCookieObserved: null,
+                  lsWriteObserved: null,
+                });
+              }
+              SNAP[0]("refresh-post");
+              await WAIT[0](50);
+              SNAP[0]("refresh-post-50ms");
+              await WAIT[0](200);
+              SNAP[0]("refresh-post-250ms");
+              if (refreshRes.status === 200) {
+                const refreshJson: any = await refreshRes.json().catch(() => null);
+                if (TRACE) {
+                  const last = RES[RES.length - 1];
+                  if (last) {
+                    last.responseKeys =
+                      refreshJson && typeof refreshJson === "object"
+                        ? Object.keys(refreshJson).slice(0, 12)
+                        : [];
+                    last.appSuccess =
+                      refreshJson && typeof refreshJson === "object"
+                        ? refreshJson.success === true
+                        : null;
+                    const rd = refreshJson && refreshJson.data;
+                    last.usable = Boolean(
+                      refreshJson &&
+                        refreshJson.success === true &&
+                        rd &&
+                        typeof rd === "object" &&
+                        (typeof rd.access_token === "string" ||
+                          typeof rd.token === "string"),
+                    );
+                  }
+                }
+                if (refreshJson && refreshJson.success === false) {
+                  const code = refreshJson.data?.code || refreshJson.code;
+                  const details = String(refreshJson.data?.details || "");
+                  if (code === "Unauthorized" || details.includes("revogado") || details.includes("revoked")) {
+                    return { reason: "refresh-revoked", obs: OBS, res: RES };
+                  }
+                }
+              } else if (refreshRes.status === 401) {
+                return { reason: "refresh-401", obs: OBS, res: RES };
+              } else if (refreshRes.status === 403) {
+                return { reason: "refresh-403", obs: OBS, res: RES };
+              }
+            } catch {}
+
+            SNAP[0]("isloggedin-exit");
+            await WAIT[0](50);
+            SNAP[0]("isloggedin-exit-50ms");
+            await WAIT[0](200);
+            SNAP[0]("isloggedin-exit-250ms");
+            // If an authenticated user object is confirmed with a real user identity,
+            // the session is 100% valid and verified by upstream.
+            return { reason: "ok", obs: OBS, res: RES };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (
+              msg.includes("destroyed") ||
+              msg.includes("closed") ||
+              msg.includes("crashed")
+            ) {
+              return { reason: "context-destroyed", obs: OBS, res: RES };
             }
-          } catch {}
-
-          // If an authenticated user object is confirmed with a real user identity,
-          // the session is 100% valid and verified by upstream.
-          return "ok";
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (
-            msg.includes("destroyed") ||
-            msg.includes("closed") ||
-            msg.includes("crashed")
-          ) {
-            return "context-destroyed";
+            return { reason: "evaluate-error", obs: OBS, res: RES };
           }
-          return "evaluate-error";
-        }
-      })
-      .catch((): PageLoginProbeReason => "evaluate-error");
+        },
+        { trace: isTraced },
+      )
+      .catch(
+        (): PageLoginProbeOutcome => ({ reason: "evaluate-error", obs: [], res: [] }),
+      )
+      // Tolerate a bare reason string (the pre-instrumentation in-page payload)
+      // so the previous internal contract keeps working unchanged.
+      .then(
+        (r: PageLoginProbeOutcome | PageLoginProbeReason): PageLoginProbeOutcome =>
+          typeof r === "string" ? { reason: r, obs: [], res: [] } : r,
+      );
 
-    const reason = await withTimeout(
+    const outcome = await withTimeout(
       probe,
-      Math.max(1_000, timeoutMs),
+      Math.max(1_000, timeoutMs) + (isTraced ? ISLOGGEDIN_TRACE_OVERHEAD_MS : 0),
       `session probe timed out after ${timeoutMs}ms`,
-    ).catch((): PageLoginProbeReason => "timeout");
-    return { ok: reason === "ok", reason };
+    ).catch(
+      (): PageLoginProbeOutcome => ({ reason: "timeout", obs: [], res: [] }),
+    );
+    if (isTraced) {
+      try {
+        const { ingestIsLoggedInTrace } = await import("./session-tracer.ts");
+        let currentUrl: string | null = null;
+        try {
+          currentUrl = typeof page.url === "function" ? page.url() : null;
+        } catch {
+          currentUrl = null;
+        }
+        let ctx: object | null = null;
+        try {
+          ctx =
+            (page as { context?: () => unknown }).context?.() as object | null ??
+            null;
+        } catch {
+          ctx = null;
+        }
+        ingestIsLoggedInTrace(traceAccount, outcome.obs, outcome.res, {
+          context: ctx,
+          page: page as unknown as object,
+          url: currentUrl,
+        });
+      } catch {
+        // Tracing must never break the login probe.
+      }
+    }
+    return { ok: outcome.reason === "ok", reason: outcome.reason };
   } catch {
     return { ok: false, reason: "evaluate-error" };
   }

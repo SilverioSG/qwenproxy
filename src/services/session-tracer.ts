@@ -715,6 +715,7 @@ export interface LsCheckpoint {
   cookieHash: string | null;
   cookieLength: number;
   match: boolean | null;
+  marker: boolean;
   handleAlive: boolean;
   contextId: string | null;
   pageId: string | null;
@@ -905,6 +906,211 @@ export function getLsHistory(): LsCheckpoint[] {
   return [...lsHistory];
 }
 
+/** One in-page observation captured between two subrequests. */
+export interface LsObservation {
+  label: string;
+  ts: number;
+  lsPresent: boolean;
+  lsHash: string | null;
+  lsLength: number;
+  marker: boolean;
+  cookiePresent: boolean;
+  cookieHash: string | null;
+  cookieLength: number;
+}
+
+export interface IsLoggedInSubResult {
+  step: "auths" | "settings" | "refresh";
+  httpStatus: number;
+  appState: string;
+  appSuccess: boolean | null;
+  usable: boolean | null;
+  responseKeys: string[];
+  setCookieObserved: boolean | null;
+  lsWriteObserved: boolean | null;
+}
+
+/** Ordered in-page observations from the most recent traced probe. */
+let isLoggedInObs: LsObservation[] = [];
+/** Per-subrequest results from the most recent traced probe. */
+let isLoggedInResults: IsLoggedInSubResult[] = [];
+/** First rotation across auths / settings / refresh, frozen. */
+let firstRotation: {
+  step: string;
+  ts: number;
+  cookieBefore: string | null;
+  cookieAfter: string | null;
+  lsBefore: boolean;
+  lsAfter: boolean;
+  markerBefore: boolean;
+  markerAfter: boolean;
+} | null = null;
+
+export function getIsLoggedInTrace(): {
+  observations: LsObservation[];
+  results: IsLoggedInSubResult[];
+  firstRotation: typeof firstRotation;
+  classification: IsLoggedInRotation;
+} {
+  return {
+    observations: [...isLoggedInObs],
+    results: [...isLoggedInResults],
+    firstRotation,
+    classification: classifyIsLoggedInRotation(),
+  };
+}
+
+export interface IsLoggedInRotation {
+  step: "auths" | "settings" | "refresh" | "async-after-auths" | "async-after-settings" | "async-after-refresh" | "none";
+  rotationCase: "A" | "B" | "C" | "D" | "UNKNOWN";
+  cookieRotated: boolean | null;
+  lsRemoved: boolean | null;
+  markerAdded: boolean | null;
+  cookieBefore: string | null;
+  cookieAfter: string | null;
+  lsBefore: boolean | null;
+  lsAfter: boolean | null;
+  markerBefore: boolean | null;
+  markerAfter: boolean | null;
+  ts: number | null;
+  reason: string;
+}
+
+/** Pure classifier: which subrequest rotated the cookie and dropped LS. */
+export function classifyIsLoggedInRotation(
+  obs: LsObservation[] = isLoggedInObs,
+): IsLoggedInRotation {
+  const none = (reason: string): IsLoggedInRotation => ({
+    step: "none",
+    rotationCase: "D",
+    cookieRotated: null,
+    lsRemoved: null,
+    markerAdded: null,
+    cookieBefore: null,
+    cookieAfter: null,
+    lsBefore: null,
+    lsAfter: null,
+    markerBefore: null,
+    markerAfter: null,
+    ts: null,
+    reason,
+  });
+  const byLabel = (label: string): LsObservation | undefined =>
+    obs.find((o) => o.label === label);
+  const entry = byLabel("isloggedin-entry") ?? obs[0];
+  if (!entry) return none("no-entry-observation");
+
+  const steps: Array<"auths" | "settings" | "refresh"> = [
+    "auths",
+    "settings",
+    "refresh",
+  ];
+  // A change is attributed to the first pre/post pair (or its deferred
+  // samples) that differs from the state the step started with.
+  for (const step of steps) {
+    const pre = byLabel(`${step}-pre`) ?? entry;
+    for (const postLabel of [
+      `${step}-post`,
+      `${step}-post-50ms`,
+      `${step}-post-250ms`,
+    ]) {
+      const post = byLabel(postLabel);
+      if (!post) continue;
+      const cookieRotated =
+        pre.cookiePresent && post.cookiePresent
+          ? pre.cookieHash !== post.cookieHash
+          : pre.cookiePresent !== post.cookiePresent;
+      const lsRemoved = pre.lsPresent && !post.lsPresent;
+      const lsRotated = pre.lsPresent && post.lsPresent && pre.lsHash !== post.lsHash;
+      const markerAdded = !pre.marker && post.marker;
+      if (!cookieRotated && !lsRemoved && !lsRotated && !markerAdded) continue;
+      const rotationCase: "A" | "B" | "C" =
+        cookieRotated && (lsRemoved || lsRotated)
+          ? "B"
+          : cookieRotated
+            ? "A"
+            : "C";
+      const asyncLabel = postLabel !== `${step}-post`;
+      return {
+        step: asyncLabel ? (`async-after-${step}` as IsLoggedInRotation["step"]) : step,
+        rotationCase,
+        cookieRotated,
+        lsRemoved,
+        markerAdded,
+        cookieBefore: pre.cookieHash,
+        cookieAfter: post.cookieHash,
+        lsBefore: pre.lsPresent,
+        lsAfter: post.lsPresent,
+        markerBefore: pre.marker,
+        markerAfter: post.marker,
+        ts: post.ts,
+        reason: `${postLabel}:${rotationCase}`,
+      };
+    }
+  }
+  return none("no-change-across-subrequests");
+}
+
+/** Node-side ingestion of the in-page observations (hashed forms only). */
+export function ingestIsLoggedInTrace(
+  accountId: string | undefined,
+  obs: LsObservation[],
+  results: IsLoggedInSubResult[],
+  handles: { context: object | null; page: object | null; url: string | null } = {
+    context: null,
+    page: null,
+    url: null,
+  },
+): void {
+  if (!isTarget(accountId)) return;
+  isLoggedInObs = obs.map((o) => ({ ...o }));
+  if (isLoggedInObs.length > 40) {
+    isLoggedInObs = isLoggedInObs.slice(0, 40);
+  }
+  isLoggedInResults = results.map((r) => ({ ...r, responseKeys: [...r.responseKeys] }));
+  const contextId = traceContextId(handles.context);
+  const pageId = tracePageId(handles.page);
+  for (const o of isLoggedInObs) {
+    recordLsCheckpoint(accountId!.slice(0, 8), {
+      ts: o.ts,
+      label: o.label,
+      present: o.lsPresent,
+      hash: o.lsHash,
+      length: o.lsLength,
+      cookiePresent: o.cookiePresent,
+      cookieHash: o.cookieHash,
+      cookieLength: o.cookieLength,
+      match:
+        o.lsHash !== null && o.cookieHash !== null ? o.lsHash === o.cookieHash : null,
+      marker: o.marker,
+      handleAlive: true,
+      contextId,
+      pageId,
+      url: handles.url,
+    });
+  }
+  const cls = classifyIsLoggedInRotation(isLoggedInObs);
+  if (cls.step !== "none" && !firstRotation) {
+    firstRotation = {
+      step: cls.step,
+      ts: cls.ts ?? Date.now(),
+      cookieBefore: cls.cookieBefore,
+      cookieAfter: cls.cookieAfter,
+      lsBefore: cls.lsBefore === true,
+      lsAfter: cls.lsAfter === true,
+      markerBefore: cls.markerBefore === true,
+      markerAfter: cls.markerAfter === true,
+    };
+  }
+  try {
+    console.log(
+      `[SessTrace ${accountId!.slice(0, 8)}] ISLOGGEDIN steps=${isLoggedInResults.length} ` +
+        `firstRotation=${firstRotation ? firstRotation.step : "none"} ` +
+        `case=${cls.rotationCase}`,
+    );
+  } catch {}
+}
+
 /** Pure LS-state change detector (before/after). Null = no change. */
 export function detectLsChange(
   before: LsState | null,
@@ -931,6 +1137,9 @@ export function _resetLsTrackingForTests(): void {
   firstFailureRef = null;
   lsHistory.length = 0;
   lsGenerations.length = 0;
+  isLoggedInObs = [];
+  isLoggedInResults = [];
+  firstRotation = null;
 }
 
 /** Test-only seeding of a synthetic checkpoint (bypasses live page reads). */
@@ -951,6 +1160,7 @@ function mkCp(
     cookieHash: over.cookieHash ?? null,
     cookieLength: over.cookieLength ?? 0,
     match: over.match ?? null,
+    marker: over.marker ?? false,
     handleAlive: over.handleAlive ?? true,
     contextId: over.contextId ?? "ctxTest",
     pageId: over.pageId ?? "pgTest",
@@ -1041,6 +1251,7 @@ export async function traceLsCheckpoint(
     let cookiePresent = false;
     let cookieHash: string | null = null;
     let cookieLength = 0;
+    let marker = false;
     let contextId: string | null = null;
     let pageId: string | null = null;
     let url: string | null = null;
@@ -1064,17 +1275,23 @@ export async function traceLsCheckpoint(
             .evaluate((): unknown => {
               try {
                 const t = localStorage.getItem("token");
-                return typeof t === "string" && t.length > 0 ? t : null;
+                return {
+                  token: typeof t === "string" && t.length > 0 ? t : null,
+                  marker: Boolean(localStorage.getItem("qwen_token_logged_out_marker")),
+                };
               } catch {
                 return null;
               }
             })
-            .catch(() => null)) as string | null;
-          if (typeof v === "string" && v.length > 0) {
+            .catch(() => null)) as
+            | { token: string | null; marker: boolean }
+            | null;
+          if (v && typeof v.token === "string" && v.token.length > 0) {
             present = true;
-            hash = hashStrLocal(v);
-            length = v.length;
+            hash = hashStrLocal(v.token);
+            length = v.token.length;
           }
+          marker = v?.marker === true;
         }
       } catch {
         // Best effort.
@@ -1108,6 +1325,7 @@ export async function traceLsCheckpoint(
       cookieHash,
       cookieLength,
       match,
+      marker,
       handleAlive: h !== null,
       contextId,
       pageId,
@@ -1131,6 +1349,12 @@ export function getSessionTrace(): {
   lsBaselineHandles: { contextId: string | null; pageId: string | null };
   firstLsChange: LsChangeRecord | null;
   lsClassification: ReturnType<typeof classifyLsChange>;
+  isLoggedIn: {
+    observations: LsObservation[];
+    results: IsLoggedInSubResult[];
+    firstRotation: typeof firstRotation;
+    classification: IsLoggedInRotation;
+  };
   lsGenerations: Array<{
     baseline: LsState;
     contextId: string | null;
@@ -1181,6 +1405,12 @@ export function getSessionTrace(): {
     lsBaselineHandles: { contextId: baseContextId, pageId: basePageId },
     firstLsChange,
     lsClassification: classifyLsChange(),
+    isLoggedIn: {
+      observations: isLoggedInObs,
+      results: isLoggedInResults,
+      firstRotation,
+      classification: classifyIsLoggedInRotation(),
+    },
     lsGenerations: lsGenerations.map((g) => ({
       baseline: g.baseline,
       contextId: g.contextId,
