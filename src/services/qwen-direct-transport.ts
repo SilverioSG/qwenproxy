@@ -292,6 +292,31 @@ export function looksLikeWafChallenge(body: string, contentType = ""): boolean {
   return /RGV587|FAIL_SYS_USER_VALIDATE|aliyun_waf|punish_|x5sec/i.test(body);
 }
 
+/**
+ * Pull the WAF punish/challenge URL out of a response body. The body arrives
+ * JSON-wrapped today (`{"ret":[...],"data":{"url":"https://…/_____tmd_____/punish?x5sec…"}}`)
+ * but the upstream has also shipped HTML/attribute forms, so all three are
+ * normalized before matching. Sanitized: only the URL is returned.
+ */
+export function extractPunishUrl(body: string): string | null {
+  if (!body) return null;
+  const normalized = body
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&");
+  const m = normalized.match(
+    /https?:\/\/[^\s"'`\\<>()]*(?:_____tmd_____|x5secdata=|\/punish)[^\s"'`\\<>()]*/i,
+  );
+  if (m && m[0]) {
+    try {
+      return new URL(m[0]).toString().slice(0, 400);
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
+
 /** Risk-control code qwen2api retries on with fresh anti-bot material. */
 export function isRiskControlled(body: string, code?: string | null): boolean {
   if (code && /rgv.?587/i.test(code)) return true;
@@ -396,6 +421,8 @@ export interface DirectCompletionResult {
   httpStatus: number;
   contentType: string;
   waf: boolean;
+  /** The WAF punish/challenge URL to hand to the recovery coordinator. */
+  punishUrl: string | null;
   sseStarted: boolean;
   sseDone: boolean;
   outputLength: number;
@@ -501,6 +528,7 @@ export async function directCompletion(input: {
         httpStatus: res.status,
         contentType,
         waf: looksLikeWafChallenge(raw, contentType),
+        punishUrl: extractPunishUrl(raw),
         sseStarted: false,
         sseDone: false,
         outputLength: 0,
@@ -512,6 +540,7 @@ export async function directCompletion(input: {
       // JSON answer: either an app-level error or a non-streaming payload.
       const raw = await res.text().catch(() => "");
       const waf = looksLikeWafChallenge(raw, contentType);
+      const punishUrl = extractPunishUrl(raw);
       let json: any = null;
       try {
         json = raw ? JSON.parse(raw) : null;
@@ -524,6 +553,7 @@ export async function directCompletion(input: {
           httpStatus: res.status,
           contentType,
           waf,
+          punishUrl,
           sseStarted: false,
           sseDone: false,
           outputLength: 0,
@@ -540,6 +570,7 @@ export async function directCompletion(input: {
         httpStatus: res.status,
         contentType,
         waf,
+        punishUrl,
         sseStarted: false,
         sseDone: Boolean(text),
         outputLength: typeof text === "string" ? text.length : 0,
@@ -556,6 +587,7 @@ export async function directCompletion(input: {
         httpStatus: res.status,
         contentType,
         waf: false,
+        punishUrl: null,
         sseStarted: false,
         sseDone: false,
         outputLength: 0,
@@ -618,6 +650,7 @@ export async function directCompletion(input: {
       httpStatus: res.status,
       contentType,
       waf: false,
+      punishUrl: null,
       sseStarted,
       sseDone,
       outputLength: text.length,
@@ -630,6 +663,7 @@ export async function directCompletion(input: {
       httpStatus: 0,
       contentType: "",
       waf: false,
+      punishUrl: null,
       sseStarted: false,
       sseDone: false,
       outputLength: 0,
@@ -675,4 +709,198 @@ export function extractAnswerFromSse(raw: string): string {
     if (typeof content === "string" && content.length > 0) out += content;
   }
   return out;
+}
+
+// ── WAF recovery orchestration ─────────────────────────────────────────────
+
+export interface DirectRunLeg {
+  create: {
+    http: number;
+    appSuccess: boolean;
+    ok: boolean;
+    chatId: string | null;
+    waf: boolean;
+    riskControlled: boolean;
+    errorCode: string | null;
+  };
+  completion: DirectCompletionResult | null;
+}
+
+export interface DirectWafRunResult {
+  first: DirectRunLeg;
+  recoveryAttempted: boolean;
+  recoverySuccess: boolean;
+  recoveryDurationMs: number;
+  recoverySkipReason: string | null;
+  postBaxiaReady: boolean;
+  second: DirectRunLeg | null;
+}
+
+async function runLeg(args: {
+  baxia: BaxiaMaterial | null;
+  cookie: string;
+  model: string;
+  content: string;
+  chatMode: string;
+  chatType: string;
+  version: string | null;
+  timeoutMs: number;
+}): Promise<DirectRunLeg> {
+  const created = await directCreateChat({
+    cookie: args.cookie,
+    model: args.model,
+    chatMode: args.chatMode,
+    chatType: args.chatType,
+    baxia: args.baxia,
+    version: args.version,
+  });
+  let completion: DirectCompletionResult | null = null;
+  if (created.ok && created.chatId) {
+    completion = await directCompletion({
+      cookie: args.cookie,
+      chatId: created.chatId,
+      model: args.model,
+      content: args.content,
+      chatMode: args.chatMode,
+      chatType: args.chatType,
+      baxia: args.baxia,
+      version: args.version,
+      timeoutMs: args.timeoutMs,
+    });
+  }
+  return {
+    create: {
+      http: created.httpStatus,
+      appSuccess: created.appSuccess,
+      ok: created.ok,
+      chatId: created.chatId,
+      waf: created.waf,
+      riskControlled: created.riskControlled,
+      errorCode: created.errorCode,
+    },
+    completion,
+  };
+}
+
+/**
+ * create-chat -> completion, with AT MOST ONE WAF recovery.
+ *
+ * On FAIL_SYS_USER_VALIDATE / RGV587 / _____tmd_____/punish / x5sec it hands the
+ * challenge body to the existing `recoverBaxiaCaptcha` coordinator (which runs
+ * the slider in the ACCOUNT browser), then — only if that succeeded — discards
+ * the anti-bot material, mints a fresh one from the dedicated minter, and runs a
+ * BRAND NEW chat. The previous chatId is never reused and there are no loops.
+ *
+ * Browser separation is preserved: account browser = session/solve; dedicated
+ * minter = anti-bot material only.
+ */
+export async function directChatWithWafRecovery(args: {
+  accountId?: string;
+  cookie: string;
+  model: string;
+  content: string;
+  chatMode: string;
+  chatType: string;
+  version: string | null;
+  baxia: BaxiaMaterial | null;
+  timeoutMs?: number;
+  allowRecovery?: boolean;
+}): Promise<DirectWafRunResult> {
+  const timeoutMs = args.timeoutMs ?? 90_000;
+  const first = await runLeg({
+    baxia: args.baxia,
+    cookie: args.cookie,
+    model: args.model,
+    content: args.content,
+    chatMode: args.chatMode,
+    chatType: args.chatType,
+    version: args.version,
+    timeoutMs,
+  });
+  const comp = first.completion;
+  const wafHit = Boolean(
+    comp && (comp.waf === true || /RGV587|FAIL_SYS_USER_VALIDATE/i.test(comp.bodyPreview)),
+  );
+  if (!wafHit) {
+    return {
+      first,
+      recoveryAttempted: false,
+      recoverySuccess: false,
+      recoveryDurationMs: 0,
+      recoverySkipReason: null,
+      postBaxiaReady: false,
+      second: null,
+    };
+  }
+  if (args.allowRecovery === false) {
+    return {
+      first,
+      recoveryAttempted: false,
+      recoverySuccess: false,
+      recoveryDurationMs: 0,
+      recoverySkipReason: "recovery-disabled-by-caller",
+      postBaxiaReady: false,
+      second: null,
+    };
+  }
+  const startedAt = Date.now();
+  let recoverySuccess = false;
+  let recoverySkipReason: string | null = null;
+  try {
+    const { recoverBaxiaCaptcha } = await import("./captcha-coordinator.ts");
+    // The challenge body carries the punish URL; the coordinator extracts and
+    // validates it against the Qwen origin itself (same-origin only).
+    recoverySuccess = await recoverBaxiaCaptcha(
+      args.accountId,
+      "direct-transport",
+      { challengeBody: comp?.bodyPreview ?? "" },
+    );
+  } catch (e) {
+    recoverySkipReason =
+      e instanceof Error ? e.message.slice(0, 120) : "recovery-threw";
+  }
+  const recoveryDurationMs = Date.now() - startedAt;
+  if (!recoverySuccess) {
+    return {
+      first,
+      recoveryAttempted: true,
+      recoverySuccess: false,
+      recoveryDurationMs,
+      recoverySkipReason: recoverySkipReason ?? "recovery-returned-false",
+      postBaxiaReady: false,
+      second: null,
+    };
+  }
+  // Recovery cleared the challenge: the old token material is now suspect and
+  // the old chatId belongs to a pre-recovery session. Fresh material, new chat.
+  const { invalidateQwenBaxiaMaterial, mintQwenBaxiaMaterial } = await import(
+    "./qwen-baxia-minter.ts"
+  );
+  invalidateQwenBaxiaMaterial();
+  const fresh = await mintQwenBaxiaMaterial({ force: true });
+  const postBaxia = fresh
+    ? {
+        ...toBaxiaMaterial(fresh),
+        cookie: fresh.cookie,
+      }
+    : null;
+  const second = await runLeg({
+    baxia: postBaxia,
+    cookie: args.cookie,
+    model: args.model,
+    content: args.content,
+    chatMode: args.chatMode,
+    chatType: args.chatType,
+    version: args.version,
+    timeoutMs,
+  });
+  return {
+    first,
+    recoveryAttempted: true,
+    recoverySuccess: true,
+    recoveryDurationMs,
+    recoverySkipReason: null,
+    postBaxiaReady: postBaxia !== null,
+    second,
+  };
 }

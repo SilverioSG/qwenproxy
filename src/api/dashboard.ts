@@ -790,6 +790,82 @@ dashboardApp.post("/v1/accounts/:id/probe-direct-guest", async (c) => {
   }
 });
 
+dashboardApp.post("/v1/accounts/:id/probe-direct-waf", async (c) => {
+  // DIAGNOSTIC: create-chat -> completion -> (one) WAF recovery -> fresh
+  // material -> NEW chat -> completion. mode=guest uses no account cookie.
+  // No /v1 traffic, no hot-path integration, no composer.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const mode = c.req.query("mode") === "guest" ? "guest" : "account";
+  const model = c.req.query("model") || "qwen3.8-max";
+  const prompt = c.req.query("prompt") || "Responde únicamente: OK";
+  const version = c.req.query("version") === "0.2.83" ? "0.2.83" : null;
+  try {
+    const direct = await import("../services/qwen-direct-transport.js");
+    const minter = await import("../services/qwen-baxia-minter.js");
+    const baxia = await direct.getBaxiaMaterial();
+    let cookie = baxia?.cookie ?? "";
+    if (mode === "account") {
+      const { getQwenHeaders } = await import("../services/auth-playwright.js");
+      const { headers } = await getQwenHeaders(false, id);
+      cookie = headers["cookie"] || "";
+    }
+    const ver = version || (mode === "guest" ? "0.2.83" : await direct.getFrontendVersion());
+    const r = await direct.directChatWithWafRecovery({
+      accountId: id,
+      cookie,
+      model,
+      content: prompt,
+      chatMode: mode === "guest" ? "guest" : "normal",
+      chatType: "t2t",
+      version: ver,
+      baxia,
+      timeoutMs: 90_000,
+    });
+    const summarize = (leg: Record<string, unknown> | null) =>
+      leg
+        ? {
+            create: (leg.create as Record<string, unknown>) ?? null,
+            completion: (leg.completion as Record<string, unknown> | null)
+              ? {
+                  ok: (leg.completion as Record<string, unknown>).ok,
+                  http: (leg.completion as Record<string, unknown>).httpStatus,
+                  ct: (leg.completion as Record<string, unknown>).contentType,
+                  waf: (leg.completion as Record<string, unknown>).waf,
+                  punishUrl: (leg.completion as Record<string, unknown>).punishUrl,
+                  sseStarted: (leg.completion as Record<string, unknown>).sseStarted,
+                  sseDone: (leg.completion as Record<string, unknown>).sseDone,
+                  outputLength: (leg.completion as Record<string, unknown>).outputLength,
+                  text: String((leg.completion as Record<string, unknown>).text ?? "")
+                    .slice(0, 120),
+                }
+              : null,
+          }
+        : null;
+    return c.json({
+      ok: Boolean((r.second?.completion as Record<string, unknown> | null)?.ok),
+      mode,
+      accountId: id,
+      version: ver,
+      baxiaReady: Boolean(baxia && baxia.fromSdk),
+      baxiaMintMs: minter.getLastBaxiaMintDiagnostics()?.mintMs ?? null,
+      first: summarize(r.first as never),
+      recoveryAttempted: r.recoveryAttempted,
+      recoverySuccess: r.recoverySuccess,
+      recoveryDurationMs: r.recoveryDurationMs,
+      recoverySkipReason: r.recoverySkipReason,
+      postBaxiaReady: r.postBaxiaReady,
+      second: summarize(r.second as never),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) },
+      500,
+    );
+  }
+});
+
 dashboardApp.post("/v1/accounts/:id/probe-direct-transport", async (c) => {
   // DIAGNOSTIC: isolated direct-web smoke on ONE account. Reads the real Baxia
   // anti-bot material from the live page, then does create-chat + completion as
