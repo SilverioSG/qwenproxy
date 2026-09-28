@@ -410,12 +410,20 @@ export async function probeComposerDuringCapture(
   const page2 = handles.page as {
     addInitScript?: (fn: unknown, arg?: unknown) => Promise<void>;
   };
+  const installFn = compileInPage(COMPOSER_INSTALL_FN);
+  let initScriptOk = false;
   try {
-    const initScript = page2.addInitScript;
-    if (typeof initScript !== "function") {
-      return { ...empty, error: "addInitScript-unavailable" };
+    if (typeof page2.addInitScript === "function") {
+      await page2.addInitScript.call(handles.page, installFn);
+      initScriptOk = true;
     }
-    await initScript.call(handles.page, compileInPage(COMPOSER_INSTALL_FN));
+  } catch {
+    // Not fatal: the immediate evaluate below also installs.
+  }
+  try {
+    // Proven path in this browser: a single self-contained evaluate that
+    // installs the collector and returns the live state.
+    await page.evaluate(installFn);
   } catch (err) {
     return {
       ...empty,
@@ -434,7 +442,7 @@ export async function probeComposerDuringCapture(
       return null;
     }
   };
-  let bootDiag: unknown = null;
+  let bootDiag: unknown = { initScriptOk };
   try {
     bootDiag = await page.evaluate(compileInPage(COMPOSER_BOOT_DIAG_FN));
   } catch {
