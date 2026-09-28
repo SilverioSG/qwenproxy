@@ -81,6 +81,19 @@ export interface BaxiaProbe {
   err?: string;
 }
 
+/**
+ * Compile an in-page source into a real function so Playwright serializes and
+ * CALLS it. Passing the raw string makes Playwright evaluate it as an
+ * expression (a function literal that is never invoked).
+ */
+function compileInPage<T>(source: string): (arg?: unknown) => T {
+  try {
+    return new Function(`return (${source});`)() as (arg?: unknown) => T;
+  } catch {
+    return () => null as unknown as T;
+  }
+}
+
 export interface BaxiaMaterial {
   /** getFYToken() — sent as bx-ua. */
   bxUa: string;
@@ -178,7 +191,7 @@ export async function getBaxiaMaterial(
       const deadline = Date.now() + (opts.baxiaWaitMs ?? 25_000);
       while (Date.now() < deadline) {
         const attempt = (await page
-          .evaluate(BAXIA_EXTRACT_FN as unknown as () => unknown)
+          .evaluate(compileInPage<BaxiaProbe>(BAXIA_EXTRACT_FN))
           .catch(() => null)) as BaxiaProbe | null;
         if (attempt) lastBaxiaProbe = attempt.diag ?? lastBaxiaProbe;
         if (attempt && attempt.ready) {
