@@ -58,6 +58,14 @@ export const VERSION_CACHE_TTL_MS = 30 * 60 * 1000;
 /** qwen2api's hardcoded fallback when the SDK/browser is unavailable. */
 export const BAXIA_VERSION_FALLBACK = "2.5.37";
 
+/** Shape returned by the in-page Baxia probe. */
+export interface BaxiaProbe {
+  ready: boolean;
+  uid?: string;
+  fy?: string;
+  ver?: string;
+}
+
 export interface BaxiaMaterial {
   /** getFYToken() — sent as bx-ua. */
   bxUa: string;
@@ -143,17 +151,12 @@ export async function getBaxiaMaterial(
       };
       // The SDK needs time: qwen2api polls up to 60 x 500ms waiting for
       // getFYModule().fyObj and a T2gA uid token. Same wait, same shape.
-      let raw: {
-        ready: boolean;
-        uid?: string;
-        fy?: string;
-        ver?: string;
-      } | null = null;
+      let raw: BaxiaProbe | null = null;
       const deadline = Date.now() + (opts.baxiaWaitMs ?? 25_000);
       while (Date.now() < deadline) {
         const attempt = (await page
           .evaluate(BAXIA_EXTRACT_FN as unknown as () => unknown)
-          .catch(() => null)) as typeof raw;
+          .catch(() => null)) as BaxiaProbe | null;
         if (attempt && attempt.ready) {
           const uidNow = typeof attempt.uid === "string" ? attempt.uid : "";
           if (/^T2gA/i.test(uidNow) && uidNow.length > 20) {
