@@ -256,9 +256,18 @@ export const BAXIA_EXTRACT_FN = `
     DIAG.hasBaxia = !!b;
     if (b) {
       try { DIAG.baxiaKeys = Object.keys(b).slice(0, 12).join(","); } catch (e) {}
-      DIAG.hasGetFYModule = typeof b.getFYModule === "function";
     }
-    const fm = b && b.getFYModule ? b.getFYModule() : null;
+    // CRITICAL (verified against sfiorini/pi-stef @f0adb33, which works today):
+    // getFYModule is a FUNCTION-OBJECT. Its getUidToken/getFYToken methods and
+    // the fyObj property are attached by the SDK once ready. Calling
+    // getFYModule() returns something else and fyObj is always undefined, so
+    // the SDK looks permanently uninitialised. Read it as a property.
+    const fm = b ? b.getFYModule : null;
+    DIAG.hasGetFYModule = !!fm;
+    if (typeof fm === "function") {
+      DIAG.getFYModuleErr = "called-by-mistake";
+      return { ready: false, diag: DIAG };
+    }
     if (!fm) {
       DIAG.getFYModuleErr = "no-module";
       return { ready: false, diag: DIAG };
