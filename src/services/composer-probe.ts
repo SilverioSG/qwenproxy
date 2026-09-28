@@ -78,6 +78,7 @@ export interface GenericRequest {
 export interface ComposerProbeResult {
   installed: boolean;
   error: string | null;
+  bootDiag?: unknown;
   pre: ComposerState | null;
   post: ComposerState | null;
   afterSubmit: ComposerState[];
@@ -102,6 +103,7 @@ export interface ComposerProbeResult {
  */
 export const COMPOSER_INSTALL_FN = `
 () => {
+  try { window.__qwenBootRan = (window.__qwenBootRan || 0) + 1; } catch (e) {}
   // Selectors are baked in: relying on an init-script argument made the whole
   // boot throw in the page (silently) whenever the argument was not delivered,
   // which left the collector missing and every snapshot null.
@@ -205,6 +207,23 @@ export const COMPOSER_INSTALL_FN = `
     document.addEventListener(ty, REC[0], true);
   }
   return SNAP[0]("pre");
+}
+`;
+
+/** Diagnostic: reports whether the boot ran and why it did not, if it did not. */
+export const COMPOSER_BOOT_DIAG_FN = `
+() => {
+  let present = false;
+  try { present = typeof window.__qwenComposerProbe === "object"; } catch (e) {}
+  return {
+    bootRan: (typeof window.__qwenBootRan === "number" ? window.__qwenBootRan : 0),
+    present,
+    hasSnap: (() => {
+      try { return !!(window.__qwenComposerProbe && window.__qwenComposerProbe.snap); }
+      catch (e) { return false; }
+    })(),
+    href: (() => { try { return String(location.href).slice(0, 100); } catch (e) { return "n/a"; } })(),
+  };
 }
 `;
 
@@ -415,6 +434,12 @@ export async function probeComposerDuringCapture(
       return null;
     }
   };
+  let bootDiag: unknown = null;
+  try {
+    bootDiag = await page.evaluate(compileInPage(COMPOSER_BOOT_DIAG_FN));
+  } catch {
+    bootDiag = { error: "boot-diag-evaluate-failed" };
+  }
   const pre = await snap("pre");
 
   let captureError: string | null = null;
@@ -455,6 +480,7 @@ export async function probeComposerDuringCapture(
   return {
     installed: true,
     error: null,
+    bootDiag,
     pre,
     post,
     afterSubmit,
