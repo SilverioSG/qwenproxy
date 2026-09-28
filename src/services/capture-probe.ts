@@ -15,6 +15,9 @@ interface CaptureTraceState {
 let trace: CaptureTraceState | null = null;
 let captureActive = false;
 let heartbeatTimer: NodeJS.Timeout | null = null;
+/** Bounded ring of emitted events so diagnostics can read the stage timeline. */
+const eventRing: Array<Record<string, string | number>> = [];
+const EVENT_RING_SIZE = 400;
 
 function enabled(): boolean {
   return process.env.CAPTURE_PROBE !== "0";
@@ -58,6 +61,10 @@ function emit(fields: Record<string, string | number>): void {
   if (fields.attempt === undefined) {
     base.attempt = trace.attempt;
   }
+  eventRing.push(base);
+  if (eventRing.length > EVENT_RING_SIZE) {
+    eventRing.splice(0, eventRing.length - EVENT_RING_SIZE);
+  }
   const parts = Object.entries(base)
     .map(([key, value]) => `${key}=${value}`)
     .join(" ");
@@ -66,6 +73,24 @@ function emit(fields: Record<string, string | number>): void {
 
 export function captureProbeEnabled(): boolean {
   return enabled();
+}
+
+/** Copy of the bounded event ring (most recent `limit` entries). */
+export function captureEventsSnapshot(
+  limit = EVENT_RING_SIZE,
+): Array<Record<string, string | number>> {
+  const n = Math.max(1, Math.min(EVENT_RING_SIZE, limit));
+  return eventRing.slice(-n).map((e) => ({ ...e }));
+}
+
+/** Read and clear the event ring. */
+export function drainCaptureEvents(
+  limit = EVENT_RING_SIZE,
+): Array<Record<string, string | number>> {
+  const n = Math.max(1, Math.min(EVENT_RING_SIZE, limit));
+  const out = eventRing.slice(-n).map((e) => ({ ...e }));
+  eventRing.length = 0;
+  return out;
 }
 
 function stopHeartbeat(): void {

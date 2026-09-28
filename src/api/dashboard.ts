@@ -623,6 +623,55 @@ dashboardApp.post("/v1/accounts/:id/probe-login", async (c) => {
   }
 });
 
+dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: exactly ONE refreshHeaders(forceReauth=true) on the
+  // account, i.e. the internal re-auth -> captureQwenHeaders flow, with NO
+  // /v1/chat/completions traffic, no rotation and no cooldown changes.
+  // Sanitized result only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const timeoutMs = Math.max(
+    5_000,
+    Math.min(120_000, Number.parseInt(c.req.query("timeoutMs") ?? "45000", 10) || 45_000),
+  );
+  const events: Array<Record<string, unknown>> = [];
+  try {
+    const captureProbe = await import("../services/capture-probe.js");
+    captureProbe.beginCaptureTrace(id);
+    const startedAt = Date.now();
+    let ok = false;
+    let errorClass: string | null = null;
+    let errorMessage: string | null = null;
+    try {
+      const { refreshHeaders } = await import("../services/playwright.js");
+      await refreshHeaders(id, timeoutMs, true);
+      ok = true;
+    } catch (err) {
+      errorClass =
+        err instanceof Error ? err.name : typeof err === "string" ? "string" : "unknown";
+      errorMessage =
+        err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200);
+    }
+    for (const e of captureProbe.captureEventsSnapshot(200)) events.push(e);
+    const stages = events.map((e) => String(e.stage));
+    return c.json({
+      ok,
+      accountId: id,
+      durationMs: Date.now() - startedAt,
+      errorClass,
+      errorMessage,
+      stages,
+      events,
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
 dashboardApp.post("/v1/accounts/:id/probe-chat-shaping", async (c) => {
   // EXPERIMENTAL DIAGNOSTIC: fresh loginViaApi, then baseline minimal
   // create-chat, single-header additions (stop at first failure), group
