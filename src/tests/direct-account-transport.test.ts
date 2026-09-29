@@ -326,6 +326,7 @@ test("secrets: account session diagnostics never contain material values", () =>
     accountId: "acct-1",
     cookieHeader: "token=SECRETCOOKIE; x5sec=SECRETCLEARANCE",
     bearerToken: "SECRETJWT",
+    bearerSource: "cookie",
     userAgent: "Mozilla/5.0 Chrome/153.0.0.0",
     x5secPresent: true,
     x5secExpiresAt: Date.now() + 60_000,

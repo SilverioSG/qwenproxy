@@ -31,6 +31,9 @@ import { config } from "../core/config.ts";
 /** Name of the Aliyun WAF clearance cookie produced by a successful solve. */
 export const X5SEC_COOKIE_NAME = "x5sec";
 
+/** The account session cookie; its value is a JWT usable as a Bearer. */
+export const ACCOUNT_TOKEN_COOKIE_NAME = "token";
+
 /** Re-capture the jar at most this often (it is cheap: the page is already up). */
 const SESSION_TTL_MS = 60_000;
 
@@ -38,8 +41,19 @@ export interface AccountSessionState {
   accountId: string;
   /** Full `Cookie:` header value for chat.qwen.ai. NEVER logged. */
   cookieHeader: string;
-  /** localStorage `token` — the account JWT used as `Authorization: Bearer`. NEVER logged. */
+  /** Account JWT used as `Authorization: Bearer`. NEVER logged, never printed. */
   bearerToken: string;
+  /**
+   * Where the Bearer came from. `localStorage` is the browser SPA's own token;
+   * `cookie` is the account session cookie. They are DIFFERENT tokens (209 vs
+   * 281 chars in practice) and BOTH are accepted by the upstream — verified
+   * live: a cookie-sourced Bearer returns `success:true` from /chats/new.
+   *
+   * Pool accounts authenticate with the cookie and never persist the
+   * localStorage token, so without this fallback the direct transport can never
+   * authenticate them and always falls back to the legacy path.
+   */
+  bearerSource: "localStorage" | "cookie" | "none";
   userAgent: string;
   /** Aliyun clearance presence/expiry, derived from the cookie itself. */
   x5secPresent: boolean;
@@ -138,12 +152,29 @@ export async function captureAccountSessionFromPage(
     );
   });
   const cookieHeader = applicable.map((c) => `${c.name}=${c.value}`).join("; ");
-  const { token, userAgent } = await page.evaluate(READ_SESSION_FN);
+  const { token: lsToken, userAgent } = await page.evaluate(READ_SESSION_FN);
+  // Precedence: the SPA's own token wins; the account session cookie is the
+  // fallback. The cookie is only READ here — the jar itself is untouched, so
+  // the `token` cookie keeps flowing on the Cookie header exactly as before.
+  const cookieToken =
+    applicable.find((c) => c.name === ACCOUNT_TOKEN_COOKIE_NAME)?.value ?? "";
+  const bearerToken = lsToken || cookieToken || "";
+  const bearerSource: AccountSessionState["bearerSource"] = lsToken
+    ? "localStorage"
+    : cookieToken
+      ? "cookie"
+      : "none";
   const x5 = parseX5secFromCookies(applicable);
+  console.log(
+    `[AccountSession] captured | account=${accountId.slice(0, 8)} | bearer_source=${bearerSource} | ` +
+      `bearer_present=${Boolean(bearerToken)} | bearer_length=${bearerToken.length} | ` +
+      `cookie_count=${applicable.length} | x5sec_present=${x5.present}`,
+  );
   const state: AccountSessionState = {
     accountId,
     cookieHeader,
-    bearerToken: token,
+    bearerToken,
+    bearerSource,
     userAgent,
     x5secPresent: x5.present,
     x5secExpiresAt: x5.expiresAt,
