@@ -25,7 +25,9 @@ import {
 } from "./qwen-direct-transport.ts";
 import {
   captureAccountSession,
+  captureX5secBaseline,
   invalidateX5sec,
+  peekAccountSession,
 } from "./qwen-account-session.ts";
 import type { TokenEstimationContext } from "./token-estimation-metrics.ts";
 import { isLocalChatMode, type ChatMode } from "../core/config.ts";
@@ -201,13 +203,19 @@ export async function createDirectAccountStream(
     console.warn(
       `🚪 [DirectTransport] HUMAN_CAPTCHA_REQUIRED=YES | account=${accountId8} | CHALLENGE_OPENED=pending | challenge=${result.punishUrl ? "punish_url" : "none"}`,
     );
-    // The clearance we were refused on is now known to be useless.
+    // Snapshot the clearance we were JUST refused on, BEFORE dropping it from
+    // the operational cache. Recovery must be able to tell a new clearance from
+    // this one; invalidating first used to erase that evidence and made the wait
+    // report success in ~2.8s against the unchanged rejected cookie.
+    const baseline = captureX5secBaseline(peekAccountSession(opts.accountId));
+    // Now it can be dropped from the cache: it is not trusted.
     invalidateX5sec(opts.accountId);
     const { recoverWithHumanCaptcha } = await import("./qwen-human-captcha.ts");
     const outcome = await recoverWithHumanCaptcha(opts.accountId, {
       // FULL body: the punish URL's x5secdata is truncated in any preview.
       challengeBody: result.challengeBody ?? "",
       timeoutMs: opts.humanSolveTimeoutMs,
+      baseline,
     });
     if (!outcome.solved || !outcome.cookieHeader) {
       console.warn(

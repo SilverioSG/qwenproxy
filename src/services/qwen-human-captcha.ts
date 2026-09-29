@@ -29,8 +29,9 @@ import { extractBaxiaChallengeUrl } from "./captcha-solver.ts";
 import {
   captureAccountSessionFromPage,
   describeAccountSession,
-  invalidateX5sec,
+  isNewClearance,
   X5SEC_COOKIE_NAME,
+  type X5secBaseline,
 } from "./qwen-account-session.ts";
 
 const CHALLENGE_PATH_MARKER = "_____tmd_____";
@@ -110,7 +111,12 @@ export async function waitForHumanCaptchaClearance(
   accountId: string,
   options: {
     timeoutMs?: number;
-    previousX5secHash?: string | null;
+    /**
+     * The clearance that was REJECTED, snapshotted before the operational
+     * cache was invalidated. Success requires a DIFFERENT clearance, never
+     * merely a present one.
+     */
+    baseline?: X5secBaseline;
   } = {},
 ): Promise<HumanChallengeResult> {
   const timeoutMs = Math.max(
@@ -119,9 +125,10 @@ export async function waitForHumanCaptchaClearance(
   );
   const accountId8 = accountId.slice(0, 8);
   const startedAt = Date.now();
-  const previous = options.previousX5secHash ?? null;
+  const baseline: X5secBaseline = options.baseline ?? {
+    present: false, hash: null, expiresAt: 0,
+  };
   let opened = false;
-  let lastSeen: string | null = previous;
 
   console.warn(
     `⏳ [HumanCaptcha] awaiting_manual_solve | account=${accountId8} | budget=${Math.round(timeoutMs / 1000)}s`,
@@ -138,6 +145,7 @@ export async function waitForHumanCaptchaClearance(
           const x5 = cookies.find((c) => c.name === X5SEC_COOKIE_NAME);
           const state = await captureAccountSessionFromPage(accountId, page);
           return {
+            present: state.x5secPresent,
             hash: state.x5secHash,
             valid: state.x5secValid,
             ttlMs: state.x5secExpiresAt
@@ -152,10 +160,9 @@ export async function waitForHumanCaptchaClearance(
       );
       if (!snap) continue;
       if (!opened) opened = true;
-      // A clearance that is new (no previous) OR replaced (different value) and
-      // not already expired counts as solved.
-      if (snap.valid && snap.hash !== lastSeen) {
-        lastSeen = snap.hash;
+      // Only a clearance that is ABSENT-before, or genuinely DIFFERENT from the
+      // one that was refused, counts as solved.
+      if (isNewClearance(baseline, { present: snap.present, valid: snap.valid, hash: snap.hash })) {
         console.warn(
           `✅ [HumanCaptcha] solved | account=${accountId8} | x5sec_ttl_ms=${Math.round(snap.ttlMs)} | waited=${Date.now() - startedAt}ms`,
         );
@@ -168,7 +175,6 @@ export async function waitForHumanCaptchaClearance(
           sanitized: describeAccountSession(snap.state),
         };
       }
-      lastSeen = snap.hash ?? lastSeen;
     } catch {
       // A transient page error is not a verdict; keep waiting within budget.
     }
@@ -194,23 +200,23 @@ export async function waitForHumanCaptchaClearance(
  */
 export async function recoverWithHumanCaptcha(
   accountId: string,
-  options: { challengeBody?: string; timeoutMs?: number } = {},
+  options: { challengeBody?: string; timeoutMs?: number; baseline?: X5secBaseline } = {},
 ): Promise<{
   solved: boolean;
   x5secTtlMs: number;
   cookieHeader: string | null;
   sanitized: Record<string, unknown>;
 }> {
-  const { peekAccountSession } = await import("./qwen-account-session.ts");
-  const before = peekAccountSession(accountId);
-  const previousHash = before?.x5secHash ?? null;
+  const { peekAccountSession, captureX5secBaseline } = await import("./qwen-account-session.ts");
+  // The caller normally passes the baseline it snapshotted before invalidating.
+  // Fall back to the live cache so this stays safe when it is not supplied.
+  const baseline = options.baseline ?? captureX5secBaseline(peekAccountSession(accountId));
   const opened = await openHumanCaptchaChallenge(accountId, options);
   const result = await waitForHumanCaptchaClearance(accountId, {
     timeoutMs: options.timeoutMs,
-    previousX5secHash: previousHash,
+    baseline,
   });
   if (!result.solved) {
-    invalidateX5sec(accountId);
     return {
       solved: false,
       x5secTtlMs: 0,

@@ -78,6 +78,20 @@ export interface AccountSessionState {
   capturedAt: number;
 }
 
+/**
+ * Immutable snapshot of the clearance that was just REJECTED.
+ *
+ * It exists so the human-solve wait can tell a genuinely new clearance from the
+ * very cookie that failed. The operational cache is invalidated before recovery
+ * (the rejected clearance is not trusted), but that must not erase the evidence
+ * of what was there.
+ */
+export interface X5secBaseline {
+  present: boolean;
+  hash: string | null;
+  expiresAt: number;
+}
+
 const sessions = new Map<string, AccountSessionState>();
 
 /**
@@ -109,6 +123,41 @@ function hash8(value: string | undefined | null): string {
  * clearance is always a real cookie with a TTL, so a non-positive expiry is
  * treated as "no usable clearance" rather than "valid forever".
  */
+/**
+ * Normalize a cookie `expires` value to epoch milliseconds.
+ *
+ * Playwright reports epoch SECONDS, but this repo also persists and restores
+ * cookies, and a restored `expires` can arrive in milliseconds, as a relative
+ * duration in seconds, or as -1 for a session cookie. Reading a duration as an
+ * epoch produced a clearance TTL of ~365 days, which made a stale cookie look
+ * valid forever.
+ *
+ * Returns null for "no usable expiry" (session cookie / unparseable).
+ */
+export function normalizeCookieExpiryMs(
+  expires: unknown,
+  nowMs: number = Date.now(),
+): number | null {
+  if (typeof expires !== "number" || !Number.isFinite(expires)) return null;
+  // -1 (and any non-positive) means a session cookie: no expiry to compare.
+  if (expires <= 0) return null;
+
+  // Decide by proximity to `now` rather than by absolute magnitude: the same
+  // number is an epoch only if it lands near the current time. A fixed
+  // threshold would misread any clock near a round epoch boundary.
+  const PLAUSIBLE_WINDOW_MS = 2 * 365 * 24 * 60 * 60 * 1000; // ~2 years
+
+  // Already epoch milliseconds.
+  if (Math.abs(expires - nowMs) <= PLAUSIBLE_WINDOW_MS) return expires;
+  // Epoch seconds.
+  const asSecondsMs = expires * 1000;
+  if (Math.abs(asSecondsMs - nowMs) <= PLAUSIBLE_WINDOW_MS) return asSecondsMs;
+  // Neither is plausible as an epoch, so it is a RELATIVE duration in seconds
+  // (e.g. 31536000 = one year). Anchoring it to `now` is what stops a
+  // one-year duration from being read as 1970 and yielding a ~365-day TTL.
+  return nowMs + asSecondsMs;
+}
+
 export function parseX5secFromCookies(
   cookies: Array<{ name: string; expires?: number; value?: string }>,
   nowMs: number = Date.now(),
@@ -116,11 +165,8 @@ export function parseX5secFromCookies(
   const found = cookies.find((c) => c.name === X5SEC_COOKIE_NAME);
   if (!found) return { present: false, expiresAt: 0, valid: false, hash: null };
   const hash = hash8(found.value ?? "");
-  if (typeof found.expires !== "number" || found.expires <= 0) {
-    return { present: true, expiresAt: 0, valid: false, hash };
-  }
-  const expiresAt = found.expires * 1000;
-  return { present: true, expiresAt, valid: expiresAt > nowMs, hash };
+  const expiresAt = normalizeCookieExpiryMs(found.expires, nowMs) ?? 0;
+  return { present: true, expiresAt, valid: expiresAt > 0 && expiresAt > nowMs, hash };
 }
 
 /** True when the cached clearance has lapsed and must not be trusted. */
@@ -254,6 +300,37 @@ export async function captureAccountSession(
   } catch {
     return null;
   }
+}
+
+/**
+ * Snapshot the current clearance as a recovery baseline. Call this BEFORE
+ * `invalidateX5sec`, which deliberately clears the operational cache.
+ */
+export function captureX5secBaseline(
+  state: AccountSessionState | null,
+): X5secBaseline {
+  return {
+    present: state?.x5secPresent ?? false,
+    hash: state?.x5secHash ?? null,
+    expiresAt: state?.x5secExpiresAt ?? 0,
+  };
+}
+
+/**
+ * Is the observed clearance genuinely NEW relative to the rejected one?
+ *
+ * A clearance that is merely present and unexpired is NOT enough: if the very
+ * cookie that was refused is still sitting there, nothing was solved. This
+ * was the production false positive — recovery reported success in ~2.8s
+ * against the unchanged rejected cookie.
+ */
+export function isNewClearance(
+  baseline: X5secBaseline,
+  observed: { present: boolean; valid: boolean; hash: string | null },
+): boolean {
+  if (!observed.present || !observed.valid) return false;
+  if (!baseline.present) return true; // nothing was there before
+  return observed.hash !== baseline.hash;
 }
 
 /** Cached state without touching the browser. */
