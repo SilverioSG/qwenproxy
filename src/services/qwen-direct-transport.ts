@@ -256,6 +256,20 @@ export interface DirectHeaderInput {
    * cookie alone is the *guest* credential. Guest requests must NOT send it.
    */
   bearerToken?: string | null;
+  /**
+   * Omit the `version` header entirely.
+   *
+   * Only for POST /api/v2/chats/new. The frontend version scraped from the
+   * homepage is NOT always accepted by that endpoint: with a stale value such
+   * as 0.3.12 it answers HTTP 200 {"code":"unauthorized","details":"401
+   * Unauthorized"} for an otherwise valid account session — same bearer, same
+   * cookie jar, same User-Agent. With 0.2.91, 0.2.83, or with the header
+   * omitted, the same request returns success:true. So the header is dropped
+   * for chat creation rather than pinned to a value that can rot the same way.
+   *
+   * /api/v2/chat/completions still REQUIRES `version` and keeps sending it.
+   */
+  omitVersion?: boolean;
   extra?: Record<string, string>;
 }
 
@@ -283,8 +297,8 @@ export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string,
     "X-Request-Id": crypto.randomUUID(),
     "bx-v": input.bxV || BAXIA_VERSION_FALLBACK,
     source: "web",
-    // REQUIRED by /api/v2/chat/completions (Qwen-Free-Api).
-    version: input.version || getQwenWebVersion(),
+    // REQUIRED by /api/v2/chat/completions; rejected by /chats/new when stale.
+    ...(input.omitVersion ? {} : { version: input.version || getQwenWebVersion() }),
     timezone: new Date().toString().split(" (")[0],
     "sec-ch-ua": '"Chromium";v="151", "Not.A/Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
@@ -384,6 +398,9 @@ export async function directCreateChat(input: {
         bxUmidToken: input.baxia?.bxUmidToken,
         bxV: input.baxia?.bxV,
         version: input.version,
+        // See DirectHeaderInput.omitVersion: a stale scraped version makes
+        // /chats/new answer 401 for a perfectly valid session.
+        omitVersion: true,
         bearerToken: input.bearerToken,
         // Account chats are referenced by their own session; the guest
         // referer would be wrong for them.
