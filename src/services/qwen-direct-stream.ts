@@ -60,19 +60,49 @@ export class DirectTransportUnsupported extends Error {
   }
 }
 
-/** Thrown when the upstream refused; says whether a human solve was tried. */
+/** Why a WAF-blocked request could not be completed. */
+export type DirectWafBlockReason =
+  /** Recovery was disabled by the caller, or there is no account to solve on. */
+  | "no-recovery"
+  /** The official challenge was opened but no clearance arrived within budget. */
+  | "clearance-timeout"
+  /** A clearance arrived, yet the single retry was refused again. */
+  | "retry-refused";
+
+/**
+ * Thrown when the upstream refused this request with a WAF challenge.
+ *
+ * The transport NEVER retries internally beyond its single recovery leg
+ * (MAX_RECOVERY_RETRIES = 1). When the recovery cannot produce a usable
+ * clearance the failure is handed upward so the EXISTING retry/account policy
+ * can treat it as the transient condition it is -- see
+ * `isDirectClearanceExhausted` in routes/chat/retry-policy.ts.
+ */
 export class DirectTransportWafBlocked extends Error {
   readonly recoveryAttempted: boolean;
   readonly recoverySucceeded: boolean;
-  constructor(recoveryAttempted: boolean, recoverySucceeded: boolean) {
+  /** Distinguishes clearance-timeout from auth/config failures. */
+  readonly blockReason: DirectWafBlockReason;
+  constructor(
+    recoveryAttempted: boolean,
+    recoverySucceeded: boolean,
+    blockReason: DirectWafBlockReason = recoverySucceeded
+      ? "retry-refused"
+      : recoveryAttempted
+        ? "clearance-timeout"
+        : "no-recovery",
+  ) {
     super(
-      recoverySucceeded
-        ? "direct-transport-waf-retry-failed"
-        : "direct-transport-waf-human-solve-required",
+      blockReason === "retry-refused"
+        ? "direct-transport-waf-retry-refused"
+        : blockReason === "clearance-timeout"
+          ? "direct-transport-waf-clearance-timeout"
+          : "direct-transport-waf-recovery-unavailable",
     );
     this.name = "DirectTransportWafBlocked";
     this.recoveryAttempted = recoveryAttempted;
     this.recoverySucceeded = recoverySucceeded;
+    this.blockReason = blockReason;
   }
 }
 
@@ -166,7 +196,7 @@ export async function createDirectAccountStream(
   if (!result.ok && result.waf) {
     if (opts.allowRecovery === false || !opts.accountId) {
       invalidateX5sec(opts.accountId ?? "");
-      throw new DirectTransportWafBlocked(false, false);
+      throw new DirectTransportWafBlocked(false, false, "no-recovery");
     }
     console.warn(
       `🚪 [DirectTransport] HUMAN_CAPTCHA_REQUIRED=YES | account=${accountId8} | CHALLENGE_OPENED=pending | challenge=${result.punishUrl ? "punish_url" : "none"}`,
@@ -183,7 +213,7 @@ export async function createDirectAccountStream(
       console.warn(
         `❌ [DirectTransport] human_solve_failed | account=${accountId8}`,
       );
-      throw new DirectTransportWafBlocked(true, false);
+      throw new DirectTransportWafBlocked(true, false, "clearance-timeout");
     }
     cookie = outcome.cookieHeader;
     console.log(
@@ -191,10 +221,10 @@ export async function createDirectAccountStream(
     );
     // NEW chat: the pre-solve chatId belongs to the pre-solve session.
     chatId = await createLeg(cookie);
-    if (!chatId) throw new DirectTransportWafBlocked(true, true);
+    if (!chatId) throw new DirectTransportWafBlocked(true, true, "retry-refused");
     result = await completeLeg(cookie, chatId);
     // A second challenge fails cleanly. No loop.
-    if (!result.ok) throw new DirectTransportWafBlocked(true, true);
+    if (!result.ok) throw new DirectTransportWafBlocked(true, true, "retry-refused");
   }
 
   if (!result.ok || !result.stream) {

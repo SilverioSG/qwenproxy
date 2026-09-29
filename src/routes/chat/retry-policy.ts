@@ -293,6 +293,44 @@ export function isAntiBotError(err: unknown): boolean {
   );
 }
 
+/**
+ * A direct-transport request that ran its SINGLE WAF recovery leg and still
+ * could not obtain a usable clearance (`x5sec`).
+ *
+ * This is deliberately NOT the same as `isAntiBotError`: that one matches every
+ * WAF signal, including a challenge the transport never tried to clear, and its
+ * branch intentionally does not retry. Here the transport already spent its one
+ * recovery attempt, so the only remaining lever is the existing policy's own
+ * retry / account rotation.
+ *
+ * Only the transport's own typed error qualifies. An upstream auth failure, a
+ * malformed response or a config error must never be routed here, which is why
+ * this checks the concrete error class plus the exact reason string instead of
+ * pattern-matching prose.
+ */
+export function isDirectClearanceExhausted(err: unknown): boolean {
+  const e = err as {
+    name?: unknown;
+    message?: unknown;
+    blockReason?: unknown;
+  };
+  if (e?.name !== "DirectTransportWafBlocked") return false;
+  if (e.blockReason !== "clearance-timeout") return false;
+  return String(e.message ?? "") === "direct-transport-waf-clearance-timeout";
+}
+
+/**
+ * The transport never got the chance to run its recovery leg (no account
+ * context, or recovery disabled by the caller). Rotating accounts would only
+ * mask the misconfiguration, so this is deliberately terminal.
+ */
+export function isDirectWafRecoveryUnavailable(err: unknown): boolean {
+  const e = err as { name?: unknown; blockReason?: unknown };
+  return (
+    e?.name === "DirectTransportWafBlocked" && e.blockReason === "no-recovery"
+  );
+}
+
 function classifyQuotaCooldown(message: string): {
   accountCooldownMs?: number;
   accountCooldownReason: string;
@@ -564,6 +602,32 @@ export function classifyRetryAction(
     // same doomed request and cooldown-marking accounts for ~5 hours.
     if (isModelNotFoundError(err)) {
       return makeRetryAction("model_not_found", { retryable: false });
+    }
+
+    // The direct transport already spent its single recovery leg and still had
+    // no clearance. That is a transient, account-scoped condition: retry once
+    // on the same account, and let the existing account cooldown/backoff apply.
+    // Deliberately BEFORE isAntiBotError so this precise case is not absorbed
+    // by the generic (non-retrying) WAF branch below.
+    if (isDirectClearanceExhausted(err)) {
+      return makeRetryAction("direct_waf_clearance_timeout", {
+        retryable: true,
+        // Same account first: a fresh clearance attempt on the same session is
+        // the cheapest recovery. Account rotation remains available to the
+        // caller if the retry also fails.
+        switchAccount: false,
+        forceNewChat: true,
+        retryAfterMs: baseDelayMs,
+      });
+    }
+
+    // The transport had no way to attempt recovery at all (no account, or
+    // recovery disabled). That is a configuration/ownership condition, not a
+    // transient one: rotating accounts would hide it. Fail fast.
+    if (isDirectWafRecoveryUnavailable(err)) {
+      return makeRetryAction("direct_waf_recovery_unavailable", {
+        retryable: false,
+      });
     }
 
     if (isAntiBotError(err)) {
