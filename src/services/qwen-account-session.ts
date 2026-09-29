@@ -49,11 +49,19 @@ export interface AccountSessionState {
    * 281 chars in practice) and BOTH are accepted by the upstream — verified
    * live: a cookie-sourced Bearer returns `success:true` from /chats/new.
    *
-   * Pool accounts authenticate with the cookie and never persist the
-   * localStorage token, so without this fallback the direct transport can never
-   * authenticate them and always falls back to the legacy path.
+   * Precedence is: persisted DB token -> localStorage token -> live `token`
+   * cookie. The DB entry comes first because it is the credential the account
+   * is actually authenticated with: measured in production, the token sitting
+   * in the live browser context is a DIFFERENT, rejected value (both 209
+   * chars), and create-chat answers `Unauthorized` with it, while the persisted
+   * one is accepted by every account in the pool.
+   *
+   * IMPORTANT: the Bearer is the ONLY thing taken from the database. The cookie
+   * jar and the `x5sec` clearance always come from the live browser context,
+   * because they are WAF/session state rather than a credential, and a stale
+   * copy of either would break the clearance path.
    */
-  bearerSource: "localStorage" | "cookie" | "none";
+  bearerSource: "db" | "localStorage" | "cookie" | "none";
   userAgent: string;
   /** Aliyun clearance presence/expiry, derived from the cookie itself. */
   x5secPresent: boolean;
@@ -71,6 +79,20 @@ export interface AccountSessionState {
 }
 
 const sessions = new Map<string, AccountSessionState>();
+
+/**
+ * Resolves the persisted account token. Injectable so the precedence rules are
+ * unit-testable without a database; production always goes through the DB
+ * reader. Restored to null by `_resetAccountSessionsForTests`.
+ */
+let persistedTokenResolver: ((accountId: string) => string) | null = null;
+
+/** @internal test seam */
+export function _setPersistedTokenResolverForTests(
+  fn: ((accountId: string) => string) | null,
+): void {
+  persistedTokenResolver = fn;
+}
 
 function hash8(value: string | undefined | null): string {
   return createHash("sha256")
@@ -153,17 +175,32 @@ export async function captureAccountSessionFromPage(
   });
   const cookieHeader = applicable.map((c) => `${c.name}=${c.value}`).join("; ");
   const { token: lsToken, userAgent } = await page.evaluate(READ_SESSION_FN);
-  // Precedence: the SPA's own token wins; the account session cookie is the
-  // fallback. The cookie is only READ here — the jar itself is untouched, so
-  // the `token` cookie keeps flowing on the Cookie header exactly as before.
+  // Precedence: persisted account credential first (it is the one the upstream
+  // actually accepts for this account), then the SPA's own token, then the live
+  // `token` cookie. The live cookie is only READ here — the jar itself is
+  // untouched, so it keeps flowing on the Cookie header exactly as before, and
+  // the live `x5sec` above is unaffected by where the Bearer came from.
   const cookieToken =
     applicable.find((c) => c.name === ACCOUNT_TOKEN_COOKIE_NAME)?.value ?? "";
-  const bearerToken = lsToken || cookieToken || "";
-  const bearerSource: AccountSessionState["bearerSource"] = lsToken
-    ? "localStorage"
-    : cookieToken
-      ? "cookie"
-      : "none";
+  let dbToken = "";
+  try {
+    if (persistedTokenResolver) {
+      dbToken = persistedTokenResolver(accountId) || "";
+    } else {
+      const { getPersistedBearerToken } = await import("../core/database.ts");
+      dbToken = getPersistedBearerToken(accountId)?.token ?? "";
+    }
+  } catch {
+    dbToken = "";
+  }
+  const bearerToken = dbToken || lsToken || cookieToken || "";
+  const bearerSource: AccountSessionState["bearerSource"] = dbToken
+    ? "db"
+    : lsToken
+      ? "localStorage"
+      : cookieToken
+        ? "cookie"
+        : "none";
   const x5 = parseX5secFromCookies(applicable);
   console.log(
     `[AccountSession] captured | account=${accountId.slice(0, 8)} | bearer_source=${bearerSource} | ` +
@@ -247,6 +284,7 @@ export function invalidateX5sec(accountId: string): void {
 /** Forget the account entirely (logout, account removal, context reset). */
 export function _resetAccountSessionsForTests(): void {
   sessions.clear();
+  persistedTokenResolver = null;
 }
 
 /** Sanitized diagnostic view. Contains no secrets by construction. */

@@ -435,6 +435,67 @@ export function getValidAuthSession(
   };
 }
 
+/**
+ * The persisted account auth token ONLY, for use as an `Authorization: Bearer`.
+ *
+ * Deliberately separate from `getValidAuthSession`, which additionally requires
+ * `bx_ua` / `bx_umidtoken` to be non-empty. Those are anti-bot fields the direct
+ * transport does not send, so requiring them here would discard sessions whose
+ * token is perfectly valid. This reader checks only what actually matters for a
+ * Bearer: a stored token, a recorded capture time, and not being expired.
+ *
+ * Returns metadata about the token, never the token itself, to keep the DB read
+ * side-effect free for logging.
+ */
+export interface PersistedBearerToken {
+  token: string;
+  tokenExpiresAt?: number;
+  capturedAt: number;
+}
+
+export function getPersistedBearerToken(
+  accountId: string,
+  maxAgeMs = 30 * 24 * 60 * 60 * 1000,
+): PersistedBearerToken | null {
+  let database: ReturnType<typeof getDatabase>;
+  try {
+    database = getDatabase();
+  } catch {
+    // No DB (e.g. a harness): the caller falls back to the live browser state.
+    return null;
+  }
+  const row = database
+    .prepare(
+      `SELECT cookie, token_expires_at, captured_at
+       FROM qwen_auth_sessions WHERE account_id = ?`,
+    )
+    .get(accountId) as any;
+  if (!row || typeof row.cookie !== "string" || !row.cookie) return null;
+
+  const capturedAt = Number(row.captured_at) || 0;
+  if (capturedAt <= 0 || Date.now() - capturedAt > maxAgeMs) return null;
+  if (row.token_expires_at) {
+    const expMs = Number(row.token_expires_at) * 1000;
+    // Same 5 minute safety margin as getValidAuthSession.
+    if (expMs <= Date.now() + 5 * 60 * 1000) return null;
+  }
+
+  // The account credential lives in the `token` cookie of the persisted jar.
+  const match = String(row.cookie)
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith("token="));
+  if (!match) return null;
+  const token = match.slice(6);
+  if (!token) return null;
+
+  return {
+    token,
+    tokenExpiresAt: row.token_expires_at ? Number(row.token_expires_at) : undefined,
+    capturedAt,
+  };
+}
+
 export function deleteAuthSession(accountId: string): void {
   const database = getDatabase();
   database.prepare("DELETE FROM qwen_auth_sessions WHERE account_id = ?").run(accountId);

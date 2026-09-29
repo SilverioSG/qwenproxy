@@ -1,15 +1,19 @@
 /**
- * Bearer source precedence for the direct account transport.
+ * Bearer source precedence for the direct account transport:
  *
- *   1. localStorage.token   (the SPA's own token)
- *   2. cookie "token"        (the account session cookie — what pool accounts have)
- *   3. neither              -> the existing unsupported/fallback behaviour
+ *   1. persisted account token (qwen_auth_sessions)  -> "db"
+ *   2. localStorage.token                            -> "localStorage"
+ *   3. live `token` cookie from the browser context   -> "cookie"
+ *   4. none
  *
- * Verified live: the cookie value IS a JWT the upstream accepts as a Bearer
- * (/chats/new returns success:true with it). localStorage.token is a
- * DIFFERENT, longer token and is not required.
+ * The DB entry wins because it is the credential the upstream actually accepts
+ * for that account: in production the token in the LIVE browser context is a
+ * different, rejected value and create-chat answers `Unauthorized` with it,
+ * while the persisted one is accepted across the whole pool.
  *
- * The cookie is only READ; the jar must keep carrying it on the Cookie header.
+ * Only the Bearer comes from the DB. The cookie jar and the `x5sec` clearance
+ * ALWAYS come from the live browser context, because they are WAF/session state
+ * rather than a credential.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,158 +22,193 @@ import fs from "node:fs";
 import {
   ACCOUNT_TOKEN_COOKIE_NAME,
   X5SEC_COOKIE_NAME,
+  _resetAccountSessionsForTests,
+  _setPersistedTokenResolverForTests,
   captureAccountSessionFromPage,
   describeAccountSession,
-  _resetAccountSessionsForTests,
 } from "../services/qwen-account-session.ts";
 import { buildDirectQwenHeaders } from "../services/qwen-direct-transport.ts";
 
-/**
- * Minimal page double: the only surface captureAccountSessionFromPage uses is
- * context().cookies() and evaluate() for the localStorage/UA read.
- */
-function fakePage(opts: {
-  cookies: Array<{ name: string; value: string; domain: string; path: string; expires: number }>;
-  lsToken: string;
-}) {
+const DB_TOKEN = "eyJdb.persisted.token.sig";
+const LS_TOKEN = "eyJ-bigger-localstorage-token.sig-xx";
+const COOKIE_TOKEN = "eyJcookie.live.token.sig";
+const CLEARANCE = "live-clearance-value";
+
+function fakePage(opts: { cookies: Array<Record<string, unknown>>; lsToken: string }) {
   return {
     context: () => ({ cookies: async () => opts.cookies }),
     evaluate: async () => ({ token: opts.lsToken, userAgent: "Mozilla/5.0 Chrome/153.0.0.0" }),
   } as unknown as Parameters<typeof captureAccountSessionFromPage>[1];
 }
 
-const COOKIE_TOKEN = "eyJWT.cookie.value.signature";
-const LS_TOKEN = "eyJ-bigger-localstorage-token.value.signature-xx";
-const jar = (withCookie: boolean) => [
+const jar = (opts: { withCookie?: boolean; withX5sec?: boolean } = {}) => [
   { name: "cna", value: "x", domain: ".qwen.ai", path: "/", expires: -1 },
-  ...(withCookie
+  ...(opts.withCookie !== false
     ? [{ name: ACCOUNT_TOKEN_COOKIE_NAME, value: COOKIE_TOKEN, domain: ".qwen.ai", path: "/", expires: 1793225168 }]
     : []),
-  { name: X5SEC_COOKIE_NAME, value: "clearance", domain: "chat.qwen.ai", path: "/", expires: Math.floor(Date.now() / 1000) + 900 },
+  ...(opts.withX5sec !== false
+    ? [{ name: X5SEC_COOKIE_NAME, value: CLEARANCE, domain: "chat.qwen.ai", path: "/", expires: Math.floor(Date.now() / 1000) + 900 }]
+    : []),
 ];
 
-// ── 1. both present -> localStorage wins ───────────────────────────────────
-
-test("bearer: localStorage wins when both sources are present", async () => {
+function setup(dbToken: string | null) {
   _resetAccountSessionsForTests();
-  const state = await captureAccountSessionFromPage(
-    "acct-1",
-    fakePage({ cookies: jar(true), lsToken: LS_TOKEN }),
-  );
-  assert.equal(state.bearerSource, "localStorage");
-  assert.equal(state.bearerToken, LS_TOKEN);
-  assert.notEqual(state.bearerToken, COOKIE_TOKEN);
+  _setPersistedTokenResolverForTests(dbToken === null ? null : () => dbToken);
+}
+
+// ── 1..5 the precedence itself ─────────────────────────────────────────────
+
+test("bearer: db wins when all three sources exist", async () => {
+  setup(DB_TOKEN);
+  const s = await captureAccountSessionFromPage("a1", fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
+  assert.equal(s.bearerSource, "db");
+  assert.equal(s.bearerToken, DB_TOKEN);
 });
 
-// ── 2. cookie-only -> cookie is used ───────────────────────────────────────
-
-test("bearer: the cookie is the fallback when localStorage has no token", async () => {
-  _resetAccountSessionsForTests();
-  const state = await captureAccountSessionFromPage(
-    "acct-2",
-    fakePage({ cookies: jar(true), lsToken: "" }),
-  );
-  assert.equal(state.bearerSource, "cookie");
-  assert.equal(state.bearerToken, COOKIE_TOKEN);
-  assert.equal(state.bearerToken.length, COOKIE_TOKEN.length);
+test("bearer: db wins over cookie when localStorage is absent", async () => {
+  setup(DB_TOKEN);
+  const s = await captureAccountSessionFromPage("a2", fakePage({ cookies: jar(), lsToken: "" }));
+  assert.equal(s.bearerSource, "db");
+  assert.equal(s.bearerToken, DB_TOKEN);
 });
 
-// ── 3. neither -> unchanged unsupported behaviour ──────────────────────────
+test("bearer: localStorage is used when no db token exists", async () => {
+  setup(null);
+  const s = await captureAccountSessionFromPage("a3", fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
+  assert.equal(s.bearerSource, "localStorage");
+  assert.equal(s.bearerToken, LS_TOKEN);
+});
 
-test("bearer: with neither source there is no token and no source", async () => {
-  _resetAccountSessionsForTests();
-  const state = await captureAccountSessionFromPage(
-    "acct-3",
-    fakePage({ cookies: jar(false), lsToken: "" }),
+test("bearer: the live cookie is the last resort", async () => {
+  setup(null);
+  const s = await captureAccountSessionFromPage("a4", fakePage({ cookies: jar(), lsToken: "" }));
+  assert.equal(s.bearerSource, "cookie");
+  assert.equal(s.bearerToken, COOKIE_TOKEN);
+});
+
+test("bearer: with no source at all the request stays unsupported", async () => {
+  setup(null);
+  const s = await captureAccountSessionFromPage(
+    "a5",
+    fakePage({ cookies: jar({ withCookie: false }), lsToken: "" }),
   );
-  assert.equal(state.bearerSource, "none");
-  assert.equal(state.bearerToken, "");
-  // The stream factory must still refuse this rather than send an empty Bearer.
+  assert.equal(s.bearerSource, "none");
+  assert.equal(s.bearerToken, "");
+  // The stream factory must still refuse it, with no malformed Bearer header.
   const src = fs.readFileSync("src/services/qwen-direct-stream.ts", "utf-8");
-  assert.ok(src.includes('"no-bearer-token"'), "unsupported reason preserved");
-  const headers = buildDirectQwenHeaders({ cookie: "cna=x", bearerToken: state.bearerToken });
-  assert.equal(headers["Authorization"], undefined, "no malformed 'Bearer ' header");
+  assert.ok(src.includes('"no-bearer-token"'));
+  assert.equal(
+    buildDirectQwenHeaders({ cookie: "cna=x", bearerToken: s.bearerToken })["Authorization"],
+    undefined,
+  );
 });
 
-// ── 4. the cookie must survive untouched in the jar ───────────────────────
-
-test("bearer: reading the cookie does not remove or alter it from the jar", async () => {
-  _resetAccountSessionsForTests();
-  const before = jar(true);
-  const state = await captureAccountSessionFromPage(
-    "acct-4",
-    fakePage({ cookies: before, lsToken: "" }),
-  );
-  // The Cookie header sent to the upstream still carries the very same value.
-  assert.ok(state.cookieHeader.includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`));
-  // …and so does the clearance, untouched.
-  assert.ok(state.cookieHeader.includes(`${X5SEC_COOKIE_NAME}=clearance`));
-  // The source cookie objects were not mutated.
-  const tok = before.find((c) => c.name === ACCOUNT_TOKEN_COOKIE_NAME);
-  assert.equal(tok?.value, COOKIE_TOKEN);
-  assert.equal(before.length, 3);
+test("bearer: an expired or unreadable db entry falls through, never blocks", async () => {
+  // getPersistedBearerToken returns null on expiry; the resolver models that.
+  setup("");
+  const s = await captureAccountSessionFromPage("a6", fakePage({ cookies: jar(), lsToken: "" }));
+  assert.equal(s.bearerSource, "cookie", "an unusable db entry must not win");
 });
 
-// ── 5. the transport receives it correctly ─────────────────────────────────
+// ── 6..7 the live session state is never replaced by the db ────────────────
 
-test("bearer: the cookie-sourced token is sent as a real Bearer", async () => {
-  _resetAccountSessionsForTests();
-  const state = await captureAccountSessionFromPage(
-    "acct-5",
-    fakePage({ cookies: jar(true), lsToken: "" }),
+test("session: the live cookie jar is preserved even when the db wins", async () => {
+  setup(DB_TOKEN);
+  const live = jar();
+  const s = await captureAccountSessionFromPage("a7", fakePage({ cookies: live, lsToken: "" }));
+  // The jar sent upstream is the LIVE one, including its own token cookie…
+  assert.ok(s.cookieHeader.includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`));
+  // …and it is not the persisted jar, even though the Bearer came from the db.
+  assert.notEqual(s.bearerToken, COOKIE_TOKEN);
+  // The live source objects were not mutated.
+  assert.equal(live.find((c) => c.name === ACCOUNT_TOKEN_COOKIE_NAME)?.value, COOKIE_TOKEN);
+});
+
+test("session: x5sec still comes from the live browser context", async () => {
+  setup(DB_TOKEN);
+  const s = await captureAccountSessionFromPage("a8", fakePage({ cookies: jar(), lsToken: "" }));
+  assert.equal(s.x5secPresent, true, "clearance must be read from the live context");
+  assert.equal(s.x5secValid, true);
+  assert.ok(s.x5secExpiresAt > Date.now());
+  assert.ok(s.cookieHeader.includes(`${X5SEC_COOKIE_NAME}=${CLEARANCE}`));
+  // The db reader must not be able to inject a clearance.
+  const dbSrc = fs.readFileSync("src/core/database.ts", "utf-8");
+  const s0 = dbSrc.indexOf("export function getPersistedBearerToken");
+  const r0 = dbSrc.slice(s0 + "export function".length);
+  const body0 = r0.slice(0, r0.indexOf("export function"));
+  assert.ok(!/x5sec/i.test(body0), "the db reader must not touch clearance");
+});
+
+test("session: the db reader returns only the token and never the jar", async () => {
+  const src = fs.readFileSync("src/core/database.ts", "utf-8");
+  // Isolate the function body: from its declaration up to the next top-level
+  // export (the slice must start AFTER the "export function" keyword itself,
+  // otherwise splitting on it would yield an empty string).
+  const start = src.indexOf("export function getPersistedBearerToken");
+  assert.ok(start > 0, "the db reader must exist");
+  const rest = src.slice(start + "export function".length);
+  const body = rest.slice(0, rest.indexOf("export function"));
+  assert.ok(body.length > 100, "function body must be non-trivial");
+  assert.ok(
+    /return\s*\{\s*token,/.test(body),
+    "must return the token",
   );
+  assert.ok(
+    !/cookie:\s*row\.cookie/.test(body),
+    "must not hand the persisted jar out",
+  );
+  // The only fields it returns are token metadata, never a cookie.
+  const ret = body.slice(body.lastIndexOf("return {"));
+  assert.ok(!/cookie/i.test(ret), "the returned object must not carry a cookie");
+});
+
+// ── 8 it really reaches the header ─────────────────────────────────────────
+
+test("header: a db-sourced bearer is sent verbatim as Authorization: Bearer", async () => {
+  setup(DB_TOKEN);
+  const s = await captureAccountSessionFromPage("a9", fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
   const h = buildDirectQwenHeaders({
-    cookie: state.cookieHeader,
-    bearerToken: state.bearerToken,
-    chatSessionId: "chat-1",
+    cookie: s.cookieHeader, bearerToken: s.bearerToken, chatSessionId: "chat-9",
   });
-  assert.equal(h["Authorization"], `Bearer ${COOKIE_TOKEN}`);
-  // Account referer, not the guest one.
-  assert.ok(h["Referer"].includes("/c/chat-1"));
+  assert.equal(h["Authorization"], `Bearer ${DB_TOKEN}`);
+  assert.notEqual(h["Authorization"], `Bearer ${LS_TOKEN}`);
+  assert.notEqual(h["Authorization"], `Bearer ${COOKIE_TOKEN}`);
+  // …with the account referer and the live jar.
+  assert.ok(h["Referer"].includes("/c/chat-9"));
+  assert.ok(h["Cookie"].includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`));
 });
 
-// ── 6. no secrets in logs ──────────────────────────────────────────────────
+// ── 9 no secrets in logs ───────────────────────────────────────────────────
 
-test("bearer: capture logging never interpolates a token value", () => {
-  const src = fs.readFileSync("src/services/qwen-account-session.ts", "utf-8");
-  const logs = [...src.matchAll(/console\.log\(([\s\S]{0,600}?)\);/g)].map((m) => m[1]);
-  assert.ok(logs.length > 0, "expected the capture log to exist");
-  for (const l of logs) {
-    // The sanctioned diagnostics.
-    assert.ok(/bearer_source=/.test(l), "log must report the source");
-    assert.ok(/bearer_present=/.test(l), "log must report presence");
-    assert.ok(/bearer_length=/.test(l), "log must report length");
-    // A leak would be interpolating the token ITSELF. Reading `.length` or
-    // `Boolean(...)` is exactly the intended, safe usage.
-    assert.ok(
-      !/\$\{bearerToken\}/.test(l),
-      "log interpolates the bearer token itself",
-    );
-    assert.ok(
-      !/\$\{cookieToken\}/.test(l),
-      "log interpolates the cookie token itself",
-    );
-    assert.ok(
-      !/\$\{token\}/.test(l),
-      "log interpolates a raw token",
-    );
-    assert.ok(!/cookieHeader/.test(l), "log must not print the jar");
-    assert.ok(
-      /bearerToken\.length/.test(l),
-      "length must come from .length, not the value",
-    );
+test("logs: capture never interpolates a token value", () => {
+  for (const f of [
+    "src/services/qwen-account-session.ts",
+    "src/core/database.ts",
+  ]) {
+    const src = fs.readFileSync(f, "utf-8");
+    for (const m of src.matchAll(/console\.(log|warn|error)\(([\s\S]{0,600}?)\);/g)) {
+      const l = m[2];
+      if (!/bearer_source|AccountSession|PersistedBearer/.test(l)) continue;
+      assert.ok(!/\$\{bearerToken\}/.test(l), `${f}: interpolates the bearer`);
+      assert.ok(!/\$\{cookieToken\}/.test(l), `${f}: interpolates the cookie token`);
+      assert.ok(!/\$\{dbToken\}/.test(l), `${f}: interpolates the db token`);
+      assert.ok(!/\$\{token\}/.test(l), `${f}: interpolates a raw token`);
+      assert.ok(!/cookieHeader|row\.cookie/.test(l), `${f}: prints the jar`);
+    }
   }
+  // The capture log reports only source, presence and length.
+  const src = fs.readFileSync("src/services/qwen-account-session.ts", "utf-8");
+  assert.ok(/bearer_source=\$\{bearerSource\}/.test(src));
+  assert.ok(/bearer_present=/.test(src));
+  assert.ok(/bearer_length=/.test(src));
 });
 
-test("bearer: describeAccountSession still exposes no token material", async () => {
-  _resetAccountSessionsForTests();
-  const state = await captureAccountSessionFromPage(
-    "acct-6",
-    fakePage({ cookies: jar(true), lsToken: "" }),
-  );
-  const text = JSON.stringify(describeAccountSession(state));
-  assert.ok(!text.includes(COOKIE_TOKEN), "cookie token leaked into diagnostics");
-  assert.ok(!text.includes(LS_TOKEN), "localStorage token leaked");
-  assert.equal(state.bearerSource, "cookie");
-  assert.equal(describeAccountSession(state).bearerLen, COOKIE_TOKEN.length);
+test("logs: diagnostics stay free of token material", async () => {
+  setup(DB_TOKEN);
+  const s = await captureAccountSessionFromPage("a10", fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
+  const text = JSON.stringify(describeAccountSession(s));
+  for (const secret of [DB_TOKEN, LS_TOKEN, COOKIE_TOKEN, CLEARANCE]) {
+    assert.ok(!text.includes(secret), `diagnostics leaked ${secret.slice(0, 12)}…`);
+  }
+  assert.equal(describeAccountSession(s).bearerLen, DB_TOKEN.length);
 });
