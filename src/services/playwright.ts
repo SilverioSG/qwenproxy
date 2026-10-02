@@ -98,6 +98,9 @@ import {
 } from "./capture-probe.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
+// Static import is cycle-free: qwen-token-refresh only touches playwright via
+// dynamic import (best-effort cache push after a no-browser refresh).
+import { getJarPair, ensureAccountFresh } from "./qwen-token-refresh.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
 const contextInitHooks: ContextInitHook[] = [];
@@ -1581,6 +1584,134 @@ export function getCachedQwenHeaders(
   return { ...cache.headers };
 }
 
+/**
+ * Push a freshly-refreshed jar (no-browser refresh) into the in-memory
+ * header/cookie caches so the next request serves the new token instead of
+ * healing through a 401. Memory-only: persistence is the caller's job.
+ * No-op when the account has no cache entry (cold account).
+ */
+export function updateCachedCookieHeader(
+  accountId: string,
+  cookie: string,
+): boolean {
+  if (!accountId || !cookie) return false;
+  let updated = false;
+  const cache = headerCaches.get(accountId);
+  if (cache?.headers && hasRequiredQwenHeaders(cache.headers)) {
+    cache.headers["cookie"] = cookie;
+    updated = true;
+  }
+  if (cookieCaches.has(accountId)) {
+    cookieCaches.set(accountId, { cookie, timestamp: Date.now() });
+    updated = true;
+  }
+  return updated;
+}
+
+/**
+ * Read-only snapshot of an account's LIVE cookie jar (already-open context
+ * only). Non-mutating IPC: no navigation, no reload, no profile open, no
+ * Chromium launch — null when the account has no live page. This is NOT a
+ * cold profile read (which destroys undecryptable cookie DBs); it only
+ * observes a context the service itself keeps warm.
+ *
+ * The live jar is the freshest refresh material: in-page heals rotate
+ * cookies without persisting to SQLite immediately, so the persisted jar can
+ * lag the live one. Preferring live material when available is what keeps a
+ * proactive refresh from sending a superseded refresh_token.
+ */
+export async function peekLiveCookieJar(
+  accountId: string,
+): Promise<{ jar: string; userAgent: string } | null> {
+  try {
+    const page = accountPages.get(accountId);
+    if (!page || page.isClosed()) return null;
+    const cookies = await page.context().cookies();
+    if (!cookies || cookies.length === 0) return null;
+    const applicable = cookies.filter((c) => {
+      const d = String(c.domain || "").replace(/^\./, "");
+      return (
+        d === "qwen.ai" ||
+        d.endsWith(".qwen.ai") ||
+        d === "chat.qwen.ai" ||
+        d.endsWith(".alicdn.com") ||
+        d.endsWith(".aliyuncs.com") ||
+        d.endsWith(".taobao.com") ||
+        d.endsWith(".mmstat.com")
+      );
+    });
+    if (applicable.length === 0) return null;
+    const jar = applicable.map((c) => `${c.name}=${c.value}`).join("; ");
+    let userAgent = "";
+    try {
+      userAgent = cachedUserAgents.get(accountId) || "";
+      if (!userAgent) {
+        userAgent =
+          (await page.evaluate(() => navigator.userAgent).catch(() => "")) ||
+          "";
+      }
+    } catch {
+      // UA is best-effort; the caller falls back to config.
+    }
+    return { jar, userAgent };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Propagate a no-browser-refreshed jar into the LIVE browser context
+ * (continued): rewrite the context cookies from the jar, align
+ * localStorage.token with the new access token, and refresh the in-memory
+ * caches. Without this the hot-account fast path would keep serving the
+ * stale live cookies until the next reactive heal.
+ *
+ * Strictly additive and best-effort: no navigation, no reload, no profile
+ * open, no login — and any failure is swallowed, leaving the persisted
+ * session (already fresh) plus the existing reactive paths as the fallback.
+ * Never throws.
+ */
+export async function pushRefreshedJarToLiveContext(
+  accountId: string,
+  jar: string,
+): Promise<boolean> {
+  if (!accountId || !jar) return false;
+  try {
+    const page = accountPages.get(accountId);
+    if (!page || page.isClosed()) {
+      updateCachedCookieHeader(accountId, jar);
+      return false;
+    }
+    try {
+      const forBrowser = parseCookiesForBrowser(jar);
+      if (forBrowser.length > 0) {
+        await page.context().addCookies(forBrowser as never).catch(() => {});
+      }
+    } catch {
+      // Cookie push is optional; the cache update below still helps.
+    }
+    try {
+      const token = getJarPair(jar, "token");
+      if (token) {
+        await page
+          .evaluate((t: string) => {
+            try {
+              localStorage.setItem("token", t);
+            } catch {}
+          }, token)
+          .catch(() => {});
+      }
+    } catch {
+      // localStorage alignment is optional.
+    }
+    updateCachedCookieHeader(accountId, jar);
+    cookieCaches.delete(accountId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function getAccountPageSnapshotHandles(accountId: string): {
   page: unknown;
   context: unknown;
@@ -2019,6 +2150,17 @@ export async function initPlaywrightForAccount(
 
     // If a context limit is configured, make room by closing idle contexts.
     await evictIdlePlaywrightContextsToLimit().catch(() => {});
+
+    // Modern auth: renew the persisted session WITHOUT a browser before the
+    // context opens, so the fast-boot DB restore below sees a fresh jar and
+    // skips the login flow. Best-effort and silent: failure falls through to
+    // the existing restore/login machinery unchanged. Never opens a profile
+    // for auth purposes — this is pure HTTPS against the refresh endpoint.
+    try {
+      await ensureAccountFresh(account.id);
+    } catch {
+      // ensureAccountFresh never throws; this guards future refactors.
+    }
 
     const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
@@ -2649,6 +2791,10 @@ async function loginToQwenInner(
     if (apiResult.success) {
       cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
+      // The refresh_token cookie can land a tick after the access token;
+      // persisting before it arrives writes a session that can never renew
+      // without a browser. Bounded wait, then persist once with everything.
+      await waitForRefreshTokenCookie(page.context()).catch(() => false);
       try {
         const liveCookies = await page.context().cookies();
         const tokenCookie = liveCookies.find((c) => c.name === "token");
@@ -2672,6 +2818,7 @@ async function loginToQwenInner(
             version: cache.headers["version"] || undefined,
             tokenExpiresAt: exp || undefined,
             capturedAt: Date.now(),
+            refreshToken: getJarPair(cookieStr, "refresh_token"),
           });
         }
       } catch {}
@@ -2695,6 +2842,8 @@ async function loginToQwenInner(
     if (uiResult.success) {
       cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
+      // Same bounded refresh_token wait as the API-login path above.
+      await waitForRefreshTokenCookie(page.context()).catch(() => false);
       try {
         const liveCookies = await page.context().cookies();
         const tokenCookie = liveCookies.find((c) => c.name === "token");
@@ -2718,6 +2867,7 @@ async function loginToQwenInner(
             version: cache.headers["version"] || undefined,
             tokenExpiresAt: exp || undefined,
             capturedAt: Date.now(),
+            refreshToken: getJarPair(cookieStr, "refresh_token"),
           });
         }
       } catch {}
@@ -4263,6 +4413,11 @@ export async function captureQwenHeaders(
           version: capturedHeaders["version"],
           tokenExpiresAt: tokenExpiry || undefined,
           capturedAt: Date.now(),
+          // Opportunistic: keep the refresh bookkeeping fresh when the
+          // captured jar carries it. Absence keeps the stored value
+          // (saveAuthSession preserves on undefined).
+          refreshToken:
+            getJarPair(capturedHeaders.cookie, "refresh_token") ?? undefined,
         });
       } catch {}
       }
@@ -4653,6 +4808,40 @@ async function getCookieSnapshot(
 }
 
 /**
+ * Wait for the `refresh_token` cookie to land in a browser context after a
+ * login. Qwen emits the access token (localStorage + `token` cookie) and the
+ * `refresh_token` cookie in the same sign-in, but not always in the same
+ * tick — persisting on the first token sighting writes refresh-less sessions
+ * that can never renew without a browser. Polls the live jar (no fixed
+ * sleep) with a bounded deadline so a missing cookie cannot hold login open.
+ *
+ * @returns true when the jar contains refresh_token (already or on arrival).
+ */
+export async function waitForRefreshTokenCookie(
+  context: Pick<BrowserContext, "cookies">,
+  timeoutMs = 10_000,
+  pollMs = 500,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    try {
+      const cookies = await context.cookies();
+      if (
+        cookies.some(
+          (c) => c.name === "refresh_token" && c.value && c.value.length > 0,
+        )
+      ) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    if (Date.now() >= deadline) return false;
+    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+  }
+}
+
+/**
  * Check whether a raw cookie header string contains a valid, non-empty auth token.
  */
 export function hasValidAuthToken(cookieHeader?: string): boolean {
@@ -4870,6 +5059,7 @@ async function refreshHeadersInternal(
               version: cache.headers["version"] || undefined,
               tokenExpiresAt: exp || undefined,
               capturedAt: Date.now(),
+              refreshToken: getJarPair(cookieStr, "refresh_token") ?? undefined,
             });
           } catch {}
           return;

@@ -194,6 +194,10 @@ function runMigrations(db: Database.Database): void {
     "sec_ch_ua_platform TEXT",
     "version TEXT",
     "captured_at INTEGER DEFAULT 0",
+    // Modern auth: explicit refresh material (nullable → legacy rows keep
+    // loading unchanged; the jar remains the Cookie transport either way).
+    "refresh_token TEXT",
+    "refresh_expires_at INTEGER",
   ];
   for (const col of authSessionCols) {
     try {
@@ -310,6 +314,12 @@ export interface PersistedAuthSession {
   userId?: string;
   tokenExpiresAt?: number;
   capturedAt: number;
+  /**
+   * Modern auth material. Null on legacy rows (pre-refresh era) — loaders
+   * must treat absence as "unknown", never as "revoked".
+   */
+  refreshToken?: string | null;
+  refreshExpiresAt?: number;
 }
 
 export function saveAuthSession(
@@ -327,18 +337,50 @@ export function saveAuthSession(
     userId?: string;
     tokenExpiresAt?: number;
     capturedAt?: number;
+    refreshToken?: string | null;
+    refreshExpiresAt?: number;
   },
 ): void {
   const database = getDatabase();
+  // INSERT OR REPLACE would null out the refresh bookkeeping when callers
+  // that only captured headers (no login/refresh context) persist. Preserve
+  // the stored values unless the caller explicitly supplies new ones.
+  // Explicit null clears the field (revocation evidence); undefined keeps it.
+  let refreshToken: string | null = session.refreshToken ?? null;
+  let refreshExpiresAt: number | null = session.refreshExpiresAt ?? null;
+  if (session.refreshToken === undefined || session.refreshExpiresAt === undefined) {
+    try {
+      const prev = database
+        .prepare(
+          `SELECT refresh_token, refresh_expires_at
+           FROM qwen_auth_sessions WHERE account_id = ?`,
+        )
+        .get(accountId) as
+        | { refresh_token?: string | null; refresh_expires_at?: number | null }
+        | undefined;
+      if (session.refreshToken === undefined) {
+        refreshToken = prev?.refresh_token ?? null;
+      }
+      if (session.refreshExpiresAt === undefined) {
+        refreshExpiresAt = prev?.refresh_expires_at
+          ? Number(prev.refresh_expires_at)
+          : null;
+      }
+    } catch {
+      // No previous row (or no DB): fall back to the supplied values.
+    }
+  }
   const stmt = database.prepare(`
     INSERT OR REPLACE INTO qwen_auth_sessions (
       account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
       sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
-      user_id, token_expires_at, captured_at, updated_at
+      user_id, token_expires_at, captured_at, updated_at,
+      refresh_token, refresh_expires_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
-      ?, ?, ?, datetime('now')
+      ?, ?, ?, datetime('now'),
+      ?, ?
     )
   `);
   stmt.run(
@@ -355,6 +397,8 @@ export function saveAuthSession(
     session.userId || null,
     session.tokenExpiresAt || null,
     session.capturedAt ?? Date.now(),
+    refreshToken,
+    refreshExpiresAt,
   );
   try {
     const capturedAt = session.capturedAt ?? Date.now();
@@ -381,7 +425,8 @@ export function getValidAuthSession(
     .prepare(
       `SELECT account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
               sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
-              user_id, token_expires_at, captured_at
+              user_id, token_expires_at, captured_at,
+              refresh_token, refresh_expires_at
        FROM qwen_auth_sessions WHERE account_id = ?`,
     )
     .get(accountId) as any;
@@ -432,6 +477,10 @@ export function getValidAuthSession(
     userId: row.user_id || undefined,
     tokenExpiresAt: row.token_expires_at ? Number(row.token_expires_at) : undefined,
     capturedAt,
+    refreshToken: row.refresh_token ? String(row.refresh_token) : null,
+    refreshExpiresAt: row.refresh_expires_at
+      ? Number(row.refresh_expires_at)
+      : undefined,
   };
 }
 
@@ -499,4 +548,136 @@ export function getPersistedBearerToken(
 export function deleteAuthSession(accountId: string): void {
   const database = getDatabase();
   database.prepare("DELETE FROM qwen_auth_sessions WHERE account_id = ?").run(accountId);
+}
+
+/**
+ * Modern-auth read path for the no-browser refresh.
+ *
+ * Unlike `getValidAuthSession` (which requires a live access token plus the
+ * anti-bot fields for browser transport), this returns the row even when the
+ * access token is expired — expiry is exactly what the refresh heals. Only
+ * the row age (refresh lifetime, default 30d) and the presence of a jar gate.
+ * Returns the stored refresh bookkeeping plus the jar-derived fallback, so
+ * legacy rows (refresh_token only inside the jar) work unchanged.
+ */
+export interface RefreshMaterial {
+  accountId: string;
+  /** Full persisted `Cookie:` jar. NEVER logged. */
+  jar: string;
+  /** Stored refresh bookkeeping, or the jar's refresh_token pair. NEVER logged. */
+  refreshToken: string | null;
+  /** Access-token exp (unix seconds), when recorded. */
+  tokenExpiresAtSec: number | null;
+  userAgent: string;
+}
+
+export function getRefreshMaterial(
+  accountId: string,
+  maxAgeMs = 30 * 24 * 60 * 60 * 1000,
+): RefreshMaterial | null {
+  let database: ReturnType<typeof getDatabase>;
+  try {
+    database = getDatabase();
+  } catch {
+    return null;
+  }
+  const row = database
+    .prepare(
+      `SELECT account_id, cookie, user_agent, token_expires_at, captured_at,
+              refresh_token, refresh_expires_at
+       FROM qwen_auth_sessions WHERE account_id = ?`,
+    )
+    .get(accountId) as any;
+  if (!row || typeof row.cookie !== "string" || !row.cookie) return null;
+
+  const capturedAt = Number(row.captured_at) || 0;
+  if (capturedAt <= 0 || Date.now() - capturedAt > maxAgeMs) return null;
+
+  const jarRefresh = String(row.cookie)
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith("refresh_token="));
+  const jarRefreshValue = jarRefresh ? jarRefresh.slice(14).trim() : "";
+  const stored = typeof row.refresh_token === "string" ? row.refresh_token : "";
+  return {
+    accountId: row.account_id,
+    jar: String(row.cookie),
+    refreshToken: stored || jarRefreshValue || null,
+    tokenExpiresAtSec: row.token_expires_at
+      ? Number(row.token_expires_at)
+      : null,
+    userAgent: typeof row.user_agent === "string" ? row.user_agent : "",
+  };
+}
+
+/**
+ * Persist a successful no-browser refresh. Atomic read-modify-write:
+ * - jar (with the new token pair, rotation and Set-Cookie already folded in)
+ *   always replaces the stored jar;
+ * - refresh bookkeeping is replaced only when the caller supplies it
+ *   (rotation); otherwise the stored value is kept verbatim;
+ * - access expiry is replaced only when the caller supplies it (JWT exp of
+ *   the new token); anti-bot/user-agent fields are preserved as-is.
+ * Never wipes material on failure — this runs only after a successful
+ * refresh.
+ */
+export function saveRefreshedSession(
+  accountId: string,
+  refreshed: {
+    cookie: string;
+    refreshToken?: string | null;
+    tokenExpiresAt?: number;
+  },
+): void {
+  const database = getDatabase();
+  const write = database.transaction(() => {
+    const prev = database
+      .prepare(
+        `SELECT user_agent, bx_v, bx_ua, bx_umidtoken,
+                sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
+                user_id, token_expires_at, refresh_token, refresh_expires_at
+         FROM qwen_auth_sessions WHERE account_id = ?`,
+      )
+      .get(accountId) as any;
+    const nextRefreshToken =
+      refreshed.refreshToken !== undefined
+        ? refreshed.refreshToken
+        : (prev?.refresh_token ?? null);
+    const nextExpiresAt =
+      refreshed.tokenExpiresAt !== undefined
+        ? refreshed.tokenExpiresAt
+        : (prev?.token_expires_at ?? null);
+    database
+      .prepare(
+        `INSERT OR REPLACE INTO qwen_auth_sessions (
+           account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
+           sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
+           user_id, token_expires_at, captured_at, updated_at,
+           refresh_token, refresh_expires_at
+         ) VALUES (
+           ?, ?, ?, ?, ?, ?,
+           ?, ?, ?, ?,
+           ?, ?, ?, datetime('now'),
+           ?, ?
+         )`,
+      )
+      .run(
+        accountId,
+        refreshed.cookie,
+        prev?.user_agent ?? "",
+        prev?.bx_v ?? "2.5.37",
+        prev?.bx_ua ?? "",
+        prev?.bx_umidtoken ?? "",
+        prev?.sec_ch_ua ?? null,
+        prev?.sec_ch_ua_mobile ?? null,
+        prev?.sec_ch_ua_platform ?? null,
+        prev?.version ?? null,
+        prev?.user_id ?? null,
+        nextExpiresAt,
+        Date.now(),
+        nextRefreshToken,
+        prev?.refresh_expires_at ?? null,
+      );
+  });
+  write();
 }

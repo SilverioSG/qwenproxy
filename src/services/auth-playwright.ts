@@ -58,6 +58,25 @@ async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
   }
 }
 
+/**
+ * Central pre-request freshness gate. Every credential path (chat streaming
+ * and non-streaming, responses/anthropic via chat loopback, upload, models,
+ * personalization) flows through getBasicHeaders/getQwenHeaders, so one
+ * hook here covers them all with no redundant per-route wiring.
+ *
+ * No-browser, never throws, ~1 SQLite SELECT when the token is valid. A
+ * renewal only hits the network when the persisted access token is expired
+ * or inside the refresh margin — and then it is single-flight per account.
+ */
+async function ensurePersistedSessionFresh(accountId: string): Promise<void> {
+  try {
+    const { ensureAccountFresh } = await import("./qwen-token-refresh.ts");
+    await ensureAccountFresh(accountId);
+  } catch {
+    // Freshness is best-effort: the browser path below is the fallback.
+  }
+}
+
 export async function getBasicHeaders(accountId?: string): Promise<{
   cookie: string;
   userAgent: string;
@@ -90,6 +109,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{
     );
   }
 
+  await ensurePersistedSessionFresh(resolvedAccountId);
   await ensurePlaywrightInitialized(resolvedAccountId);
   return getPlaywrightBasicHeaders(resolvedAccountId);
 }
@@ -125,6 +145,7 @@ export async function getQwenHeaders(
     );
   }
 
+  await ensurePersistedSessionFresh(resolvedAccountId);
   await ensurePlaywrightInitialized(resolvedAccountId);
 
   if (forceNew || forceReauth) {

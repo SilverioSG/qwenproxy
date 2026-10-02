@@ -288,6 +288,14 @@ export async function captureAccountSession(
     // source of truth for whether a solve happened in the meantime.
     if (cached.x5secValid) return cached;
   }
+  // Modern auth first (best-effort, no browser): renew the persisted access
+  // token the Bearer precedence chain reads from, before touching the page.
+  try {
+    const { ensureAccountFresh } = await import("./qwen-token-refresh.ts");
+    await ensureAccountFresh(accountId);
+  } catch {
+    // Fall through to the existing page/browser machinery.
+  }
   try {
     const { withAccountPage } = await import("./playwright.ts");
     return await withAccountPage(

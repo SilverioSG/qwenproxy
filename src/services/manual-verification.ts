@@ -341,6 +341,13 @@ const deps: {
     } catch {
       tokenExpiresAt = undefined;
     }
+    let refreshToken: string | null = null;
+    try {
+      const { getJarPair } = await import("./qwen-token-refresh.ts");
+      refreshToken = getJarPair(cookie, "refresh_token");
+    } catch {
+      refreshToken = null;
+    }
     return {
       cookie,
       userAgent,
@@ -352,6 +359,9 @@ const deps: {
       secChUaPlatform,
       version,
       tokenExpiresAt,
+      // Opportunistic refresh bookkeeping (manual login path): null/undefined
+      // keeps the stored value, an explicit value updates it.
+      refreshToken: refreshToken ?? undefined,
     };
   },
   saveSession: async (accountId, session) => {

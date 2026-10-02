@@ -509,6 +509,45 @@ app.get("/diagnostics/tokens", async (c) => {
   }
 });
 
+// Modern-auth diagnostic: run one no-browser session renewal for an account
+// and report the outcome. Same API-key gate as /diagnostics/tokens. Returns
+// status fields only — never tokens, cookies or jars. On success the fresh
+// session is persisted (the designed refresh behavior); on failure nothing
+// is wiped. Never opens a browser profile: only an already-warm context is
+// observed, otherwise the persisted jar is used.
+app.post("/diagnostics/refresh", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+
+  const accountId = c.req.query("accountId") || "";
+  if (!accountId) {
+    return c.json({ error: "accountId query param is required" }, 400);
+  }
+  try {
+    const { tryRefreshToken } = await import(
+      "../services/qwen-token-refresh.ts"
+    );
+    const result = await tryRefreshToken(accountId);
+    return c.json({
+      accountId8: accountId.slice(0, 8),
+      ok: result.ok,
+      code: result.code ?? null,
+      details: result.details ?? null,
+      rotated: result.rotated ?? null,
+    });
+  } catch (err) {
+    return c.json(
+      {
+        accountId8: accountId.slice(0, 8),
+        ok: false,
+        code: "DiagnosticError",
+        details: err instanceof Error ? err.message : String(err),
+      },
+      500,
+    );
+  }
+});
+
 app.get("/metrics", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
