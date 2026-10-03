@@ -14,13 +14,14 @@ import {
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
+import { setCookiePairInJar } from "./qwen-token-refresh.ts";
 import { logger } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
 import type {
   PersonalizationEstimationInfo,
   TokenEstimationContext,
 } from "./token-estimation-metrics.ts";
-import { getDatabase } from "../core/database.ts";
+import { getDatabase, getPersistedBearerToken } from "../core/database.ts";
 import { mapClientModelToQwen } from "../core/model-alias.ts";
 import {
   MAX_PAYLOAD_SIZE,
@@ -4248,6 +4249,7 @@ async function readResponsePreview(
 export function buildCompletionHeaders(
   headers: Record<string, string>,
   chatSessionId: string | null | undefined,
+  accountId?: string,
 ): Record<string, string> {
   const base = buildCapturedQwenHeaders(headers, {
     chatSessionId: chatSessionId || null,
@@ -4257,7 +4259,49 @@ export function buildCompletionHeaders(
   });
   if (headers["bx-ua"]) base["bx-ua"] = headers["bx-ua"];
   if (headers["bx-umidtoken"]) base["bx-umidtoken"] = headers["bx-umidtoken"];
+  alignLegacyCompletionAuth(base, accountId);
   return base;
+}
+
+/**
+ * Align a legacy completion with the proven modern session (Fix C).
+ *
+ * A reused thread forces the legacy transport, which would otherwise replay
+ * the continuation with cached browser material: a `version` restored from
+ * `qwen_auth_sessions` (rows carry 0.3.11/0.3.12, and completions sent with
+ * those answer 401 while the configured 0.2.91 answers 200) and an
+ * `Authorization` synthesized from a possibly stale `token` cookie. The
+ * DirectTransport proves the working pair every round: persisted Bearer +
+ * configured bundle version. Apply exactly that pair here:
+ *
+ * - `version` is always the configured chat-completions version;
+ * - when a usable persisted Bearer exists, both `Authorization` and the
+ *   jar's `token` pair carry it (pair coherence: a mismatched Bearer/cookie
+ *   pair is rejected even when each is individually valid);
+ * - otherwise the previously built headers stand unchanged (legacy fallback).
+ *
+ * Completions only. Non-chat endpoints (chats/new, settings) use their own
+ * builders and are untouched. No DB writes, no refresh, no restore.
+ */
+function alignLegacyCompletionAuth(
+  base: Record<string, string>,
+  accountId?: string,
+): void {
+  base["version"] = config.qwen.webVersion;
+  if (!accountId) return;
+  let bearer = "";
+  try {
+    bearer = getPersistedBearerToken(accountId)?.token ?? "";
+  } catch {
+    return;
+  }
+  if (!bearer) return;
+  base["Authorization"] = `Bearer ${bearer}`;
+  const cookie = base["Cookie"] ?? base["cookie"] ?? "";
+  if (cookie) {
+    base["Cookie"] = setCookiePairInJar(cookie, "token", bearer);
+    delete base["cookie"];
+  }
 }
 
 export interface PostCaptchaResetDeps {
@@ -4749,7 +4793,7 @@ async function createQwenStreamInternal(
         // The 0.2.86 HAR shows the real client POSTs completions with
         // bx-ua/bx-umidtoken + x-accel-buffering, so the relay matches it
         // instead of relying on sendBxUa.
-        buildCompletionHeaders(requestHeaders, chatSessionId),
+        buildCompletionHeaders(requestHeaders, chatSessionId, accountId),
         payloadJson,
         controller.signal,
         qwenUrl(
