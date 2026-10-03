@@ -320,6 +320,32 @@ function isAntiBotError(err: any): boolean {
 	return isAntiBotPolicyError(err);
 }
 
+/**
+ * Sticky-thread rotation decision for the outer account loop.
+ *
+ * The retry policy is the single source of truth for "this account must be
+ * abandoned": a raw QwenUpstreamError(unauthorized) matches none of the
+ * error-class predicates, yet classifyRetryAction already mapped it to
+ * account_initialization_failed (and the inner loop already parked the
+ * account with AuthInitFailed). Without consulting the policy here, a 401
+ * on the sticky account breaks the loop into a terminal 502 without ever
+ * trying account B. Scoped to account_initialization_failed only: terminal,
+ * quota, personalization and healthy paths keep their existing behavior.
+ */
+export function shouldRotateStickyAccount(
+	lastError: unknown,
+	requestAborted = false,
+): boolean {
+	if (!lastError) return false;
+	return (
+		isAccountUnavailableError(lastError) ||
+		isAccountInitializationError(lastError) ||
+		isAntiBotError(lastError) ||
+		classifyRetryAction(lastError, { requestAborted }).reason ===
+			"account_initialization_failed"
+	);
+}
+
 function hasFreeAlternateAccount(
 	accounts: SelectedAccount[],
 	currentAccountId: string,
@@ -761,10 +787,10 @@ export async function acquireUpstreamStream(
 			// A challenged sticky account must be allowed to fall through to the
 			// anti-bot handling below; otherwise the whole conversation dies on the
 			// account the WAF happened to pick.
-			const stickyAccountMustRotate =
-				isAccountUnavailableError(lastError) ||
-				isAccountInitializationError(lastError) ||
-				isAntiBotError(lastError);
+			const stickyAccountMustRotate = shouldRotateStickyAccount(
+				lastError,
+				params.requestSignal?.aborted === true,
+			);
 			if (stickyAccountMustRotate) {
 				if (!quotaInfo) {
 					console.warn(
