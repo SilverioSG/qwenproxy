@@ -2049,9 +2049,11 @@ export async function getBasicHeaders(accountId: string): Promise<{
               } catch {}
             }
             cache.headers = restoredHeaders;
-            if (persisted.version) {
-              updateQwenWebVersion(persisted.version);
-            }
+            // Never feed the persisted version into the global bundle version:
+            // rows outlive frontend releases, and a stale bundle version sent
+            // on completions answers 401 Unauthorized (proven: version 0.3.11
+            // vs live 0.2.91). The global stays fresh-only (live scrape /
+            // live capture); the restored row's own headers are untouched.
             cache.lastRefresh = persisted.capturedAt;
             markAccountHeadersReady(accountId);
           }
@@ -2387,9 +2389,8 @@ export async function initPlaywrightForAccount(
 
               const cache = getHeaderCache(account.id);
               cache.headers = restoredHeaders;
-              if (persisted.version) {
-                updateQwenWebVersion(persisted.version);
-              }
+              // Same as above: a persisted row must never set the global web
+              // bundle version (stale bundle on completions → 401).
               cache.lastRefresh = persisted.capturedAt;
               markAccountHeadersReady(account.id);
               restoredFromDb = true;
@@ -2733,6 +2734,30 @@ export async function loginToQwen(
   void import("./session-tracer.ts")
     .then((m) => m.traceLsCheckpoint(accountId, "login-start").catch(() => {}))
     .catch(() => {});
+  // MODERN_AUTH_PRESENT: an account holding modern refresh material must never
+  // run the password machinery — password flows cannot restore a modern
+  // session, and their exhaustion parks the account 24h AuthFailed (proven
+  // live by the SessionKeeper proactive renewal). Silent refresh only; the
+  // boolean result flows to the caller with no cooldown side effects.
+  try {
+    const { getRefreshMaterial } = await import("../core/database.ts");
+    if (getRefreshMaterial(accountId)?.jar) {
+      try {
+        const { ensureAccountFresh } = await import(
+          "./qwen-token-refresh.ts"
+        );
+        const fresh = await ensureAccountFresh(accountId).catch(() => false);
+        try {
+          traceSessionEvent(accountId, "LOGIN_END", fresh ? "ok-modern" : "stale-modern");
+        } catch {}
+        return fresh;
+      } catch {
+        return false;
+      }
+    }
+  } catch {
+    // No readable material: fall through to the legacy password path.
+  }
   try {
     const ok = await loginToQwenInner(accountId, email, password);
     try {
@@ -5649,6 +5674,26 @@ export async function keepAlivePlaywrightAccount(
       console.log(
         `💓 [SessionKeeper] Account ${accountId} token expires within 45m; proactively renewing session...`,
       );
+      // MODERN_AUTH_PRESENT: silent refresh only. A forced password re-auth
+      // cannot restore a modern session and its failure parks the account 24h
+      // AuthFailed; a stale modern session is left for classification, never
+      // password retried.
+      try {
+        const { getRefreshMaterial } = await import("../core/database.ts");
+        if (getRefreshMaterial(accountId)?.jar) {
+          const { ensureAccountFresh } = await import(
+            "./qwen-token-refresh.ts"
+          );
+          if (await ensureAccountFresh(accountId).catch(() => false)) {
+            lastKeepAliveNavigation.set(accountId, now);
+            touchAccountActivity(accountId);
+            return true;
+          }
+          return false;
+        }
+      } catch {
+        // Fall through to the legacy forced re-auth below.
+      }
       try {
         await refreshHeadersInternal(accountId, config.timeouts.headers, true);
         lastKeepAliveNavigation.set(accountId, now);

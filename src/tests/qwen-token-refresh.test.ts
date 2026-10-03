@@ -147,11 +147,12 @@ test("contract: hasRefreshMaterial / needsRefresh margin", () => {
   assert.equal(hasRefreshMaterial(null), false);
   const nowSec = Math.floor(Date.now() / 1000);
   assert.equal(needsRefresh(nowSec + 3600), false);
-  assert.equal(needsRefresh(nowSec + 30), true); // inside 60s margin
+  assert.equal(needsRefresh(nowSec + 240), true); // inside 5min margin
+  assert.equal(needsRefresh(nowSec + 400), false); // outside 5min margin
   assert.equal(needsRefresh(nowSec - 10), true);
   assert.equal(needsRefresh(null), false); // legacy-tolerant
   assert.equal(needsRefresh(undefined), false);
-  assert.equal(QWEN_REFRESH_MARGIN_MS, 60_000);
+  assert.equal(QWEN_REFRESH_MARGIN_MS, 5 * 60 * 1000);
 });
 
 test("contract: parseRefreshBody accepts both field shapes", () => {

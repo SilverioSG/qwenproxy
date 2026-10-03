@@ -346,6 +346,20 @@ export function saveAuthSession(
   // that only captured headers (no login/refresh context) persist. Preserve
   // the stored values unless the caller explicitly supplies new ones.
   // Explicit null clears the field (revocation evidence); undefined keeps it.
+  // Same for user_agent: an empty snapshot (headed evaluate failure) must not
+  // wipe the fleet UA, or the row stops restoring (init falls back to legacy
+  // validation burns for an otherwise valid modern session).
+  let userAgent = session.userAgent;
+  if (!userAgent) {
+    try {
+      const prevUa = database
+        .prepare(`SELECT user_agent FROM qwen_auth_sessions WHERE account_id = ?`)
+        .get(accountId) as { user_agent?: string | null } | undefined;
+      if (prevUa?.user_agent) userAgent = prevUa.user_agent;
+    } catch {
+      // No previous row (or no DB): fall back to the supplied value.
+    }
+  }
   let refreshToken: string | null = session.refreshToken ?? null;
   let refreshExpiresAt: number | null = session.refreshExpiresAt ?? null;
   if (session.refreshToken === undefined || session.refreshExpiresAt === undefined) {
@@ -386,7 +400,7 @@ export function saveAuthSession(
   stmt.run(
     accountId,
     session.cookie,
-    session.userAgent,
+    userAgent,
     session.bxV || "2.5.37",
     session.bxUa || "",
     session.bxUmidtoken || "",
@@ -453,8 +467,17 @@ export function getValidAuthSession(
     }
   }
 
-  // Ensure critical fields are non-empty
-  if (!row.cookie || !row.user_agent || !row.bx_v || !row.bx_ua || !row.bx_umidtoken) {
+  // Critical fields: cookie/UA/bx-v trio is always required (matches the
+  // browser transport gate when QWEN_SEND_BX_UA=false, the default).
+  // bx-ua/bx-umidtoken are captured but never injected in that mode, and the
+  // manual-verification snapshot (context.cookies()) routinely lacks them —
+  // requiring them here discarded a just-proven modern session, forcing a
+  // contradictory legacy re-auth (auths-schema false negative → AuthFailed).
+  // Only require them when they are actually sent.
+  if (!row.cookie || !row.user_agent || !row.bx_v) {
+    return null;
+  }
+  if (process.env.QWEN_SEND_BX_UA === "true" && (!row.bx_ua || !row.bx_umidtoken)) {
     return null;
   }
 
@@ -543,6 +566,25 @@ export function getPersistedBearerToken(
     tokenExpiresAt: row.token_expires_at ? Number(row.token_expires_at) : undefined,
     capturedAt,
   };
+}
+
+/**
+ * Whether an account holds usable MODERN persisted auth: a persisted jar plus
+ * a live (unexpired) persisted Bearer. Sync and side-effect free so the hot
+ * request path (selection, transport dispatch) can consult it without opening
+ * a browser. Distinguishes MODERN_AUTH_PRESENT accounts — servable via
+ * ensureAccountFresh + the cold persisted bridge — from LEGACY_ONLY accounts
+ * that still need the browser/login machinery.
+ */
+export function hasUsableModernPersistedAuth(accountId: string): boolean {
+  if (!accountId || accountId === "global") return false;
+  try {
+    const material = getRefreshMaterial(accountId);
+    if (!material || !material.jar) return false;
+    return getPersistedBearerToken(accountId) !== null;
+  } catch {
+    return false;
+  }
 }
 
 export function deleteAuthSession(accountId: string): void {

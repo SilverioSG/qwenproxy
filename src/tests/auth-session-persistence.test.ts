@@ -62,6 +62,90 @@ test("auth-session-persistence: rejects expired capturedAt headers", () => {
   deleteAuthSession(accountId);
 });
 
+test("auth-session-persistence: manual snapshot without bx-ua/bx-umidtoken stays valid (default transport)", () => {
+  // Regression for manual-verify handoff: the headed snapshot comes from
+  // context.cookies() which routinely lacks bx-ua/bx-umidtoken. With the
+  // default transport (QWEN_SEND_BX_UA!=true) only the cookie/UA/bx-v trio
+  // is sent, so the row must restore instead of forcing legacy re-auth.
+  const saved = process.env.QWEN_SEND_BX_UA;
+  delete process.env.QWEN_SEND_BX_UA;
+  try {
+    const accountId = "test-acc-manual-no-bx";
+    deleteAuthSession(accountId);
+    const now = Date.now();
+    saveAuthSession(accountId, {
+      cookie: "token=manual.jwt.token; refresh_token=rt-123; other=1",
+      userAgent: "Mozilla/5.0 TestChrome",
+      bxV: "2.5.37",
+      bxUa: "",
+      bxUmidtoken: "",
+      tokenExpiresAt: Math.floor(now / 1000) + 36000,
+      capturedAt: now,
+      refreshToken: "rt-123",
+    });
+    const session = getValidAuthSession(accountId, 4 * 60 * 60 * 1000);
+    assert.ok(session !== null, "expected manual snapshot without bx fields to be valid");
+    assert.equal(session?.refreshToken, "rt-123");
+    deleteAuthSession(accountId);
+  } finally {
+    if (saved === undefined) delete process.env.QWEN_SEND_BX_UA;
+    else process.env.QWEN_SEND_BX_UA = saved;
+  }
+});
+
+test("auth-session-persistence: empty userAgent snapshot preserves stored UA", () => {
+  const accountId = "test-acc-ua-preserve";
+  deleteAuthSession(accountId);
+  const now = Date.now();
+  saveAuthSession(accountId, {
+    cookie: "token=a.jwt.token; refresh_token=R1",
+    userAgent: "Mozilla/5.0 Fleet-UA",
+    bxV: "2.5.37",
+    bxUa: "",
+    bxUmidtoken: "",
+    tokenExpiresAt: Math.floor(now / 1000) + 36000,
+    capturedAt: now,
+    refreshToken: "R1",
+  });
+  // A later snapshot that failed to read the UA must not wipe it, or the row
+  // stops restoring and the account falls back to legacy validation burns.
+  saveAuthSession(accountId, {
+    cookie: "token=a.jwt.token; refresh_token=R1",
+    userAgent: "",
+    bxV: "2.5.37",
+    capturedAt: Date.now(),
+  } as never);
+  const session = getValidAuthSession(accountId, 4 * 60 * 60 * 1000);
+  assert.ok(session !== null, "expected restored row to stay valid");
+  assert.equal(session?.userAgent, "Mozilla/5.0 Fleet-UA");
+  assert.equal(session?.refreshToken, "R1");
+  deleteAuthSession(accountId);
+});
+
+test("auth-session-persistence: strict bx gate only when QWEN_SEND_BX_UA=true", () => {
+  const saved = process.env.QWEN_SEND_BX_UA;
+  process.env.QWEN_SEND_BX_UA = "true";
+  try {
+    const accountId = "test-acc-strict-bx";
+    deleteAuthSession(accountId);
+    const now = Date.now();
+    saveAuthSession(accountId, {
+      cookie: "token=manual.jwt.token",
+      userAgent: "Mozilla/5.0 TestChrome",
+      bxV: "2.5.37",
+      bxUa: "",
+      bxUmidtoken: "",
+      tokenExpiresAt: Math.floor(now / 1000) + 36000,
+      capturedAt: now,
+    });
+    assert.equal(getValidAuthSession(accountId, 4 * 60 * 60 * 1000), null);
+    deleteAuthSession(accountId);
+  } finally {
+    if (saved === undefined) delete process.env.QWEN_SEND_BX_UA;
+    else process.env.QWEN_SEND_BX_UA = saved;
+  }
+});
+
 test("auth-session-persistence: rejects session with expired token", () => {
   const accountId = "test-acc-expired-token";
   deleteAuthSession(accountId);

@@ -371,6 +371,28 @@ async function attemptRelogin(
 	accountId: string,
 	accountEmail: string,
 ): Promise<boolean> {
+	// MODERN_AUTH_PRESENT first: an account with usable modern persisted auth
+	// must never run the password-login machinery just because no browser
+	// context exists. Fresh → retry serves it via the cold bridge/direct path;
+	// stale modern material → return false so the request rotates with
+	// classification instead of paying password retries. LEGACY_ONLY accounts
+	// fall through to the existing password path unchanged.
+	try {
+		const { revalidateModernAccountSession } = await import(
+			"../../services/qwen-account-session.ts"
+		);
+		const modern = await revalidateModernAccountSession(accountId).catch(
+			() => null,
+		);
+		if (modern !== null) {
+			console.warn(
+				`🔄 [Chat] Modern session revalidation for ${maskEmail(accountEmail)} (${accountId.slice(0, 8)}): fresh=${modern}, no legacy login attempted`,
+			);
+			return modern;
+		}
+	} catch {
+		// Fall through to the legacy path.
+	}
 	try {
 		await refreshHeaders(accountId);
 		console.log(
@@ -390,6 +412,9 @@ async function attemptRelogin(
 	}
 	return false;
 }
+
+/** @internal test seam: modern-first relogin without the request loop. */
+export const _attemptReloginForTests = attemptRelogin;
 
 export async function acquireUpstreamStream(
 	params: AcquireParams,

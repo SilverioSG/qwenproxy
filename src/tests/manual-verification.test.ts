@@ -824,6 +824,34 @@ test("manual verification: autofillQwenLoginForm detects challenge wall", async 
   assert.equal(r.reason, "challenge-wall");
 });
 
+test("manual verification: auths-schema false negative + same-context proof → verified, no legacy reauth", async () => {
+  // Exact live regression (57cabcfa): probe still reports login=false /
+  // class=auths-schema while the SAME visible context proves
+  // settings=200 + create=200/createOk + liveToken + cookies>0 and the row
+  // persists fresh. That must be terminal SUCCESS: cooldown cleared, manual
+  // browser closed, final capture runtime-only, no legacy re-auth failure.
+  const { calls, contexts, emit } = installHarness({ loggedIn: false, probeReason: "auths-schema" });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
+  assert.deepEqual(calls.capture, [TEST_ID]);
+  const opts = (calls as { captureOpts?: Array<{ persistSession?: boolean }> }).captureOpts ?? [];
+  assert.ok(opts.length >= 1 && opts.every((o) => o.persistSession === false));
+  assert.ok(contexts.length >= 1 && contexts.every((c) => c.closed), "manual browser must close");
+  assert.deepEqual(calls.probed, ["probe"]);
+});
+
+test("manual verification: visible snapshot without usable cookies → failed, never verified", async () => {
+  const { calls, emit } = installHarness({ loggedIn: false, probeReason: "auths-schema" });
+  const { setManualVerificationDeps } = await import("../services/manual-verification.ts");
+  setManualVerificationDeps({ snapshotVisible: async () => null });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.deepEqual(calls.clearedCooldown, []);
+});
+
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {
   const res = resolveManualDisplay() as { display?: string; xauthority?: string; error?: string };
   if ("error" in res && res.error) {

@@ -116,8 +116,12 @@ test("session: the live cookie jar is preserved even when the db wins", async ()
   setup(DB_TOKEN);
   const live = jar();
   const s = await captureAccountSessionFromPage("a7", fakePage({ cookies: live, lsToken: "" }));
-  // The jar sent upstream is the LIVE one, including its own token cookie…
-  assert.ok(s.cookieHeader.includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`));
+  // The jar sent upstream is the LIVE one (other cookies, clearance), except
+  // the token pair is aligned to the authoritative db bearer — a mismatched
+  // pair answers 401 on completions while chats/new still returns 200.
+  assert.ok(s.cookieHeader.includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${DB_TOKEN}`));
+  assert.ok(!s.cookieHeader.includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`));
+  assert.ok(s.cookieHeader.includes(`${X5SEC_COOKIE_NAME}=${CLEARANCE}`));
   // …and it is not the persisted jar, even though the Bearer came from the db.
   assert.notEqual(s.bearerToken, COOKIE_TOKEN);
   // The live source objects were not mutated.
@@ -173,9 +177,9 @@ test("header: a db-sourced bearer is sent verbatim as Authorization: Bearer", as
   assert.equal(h["Authorization"], `Bearer ${DB_TOKEN}`);
   assert.notEqual(h["Authorization"], `Bearer ${LS_TOKEN}`);
   assert.notEqual(h["Authorization"], `Bearer ${COOKIE_TOKEN}`);
-  // …with the account referer and the live jar.
+  // …with the account referer and the live jar (token pair aligned to db).
   assert.ok(h["Referer"].includes("/c/chat-9"));
-  assert.ok(h["Cookie"].includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`));
+  assert.ok(h["Cookie"].includes(`${ACCOUNT_TOKEN_COOKIE_NAME}=${DB_TOKEN}`));
 });
 
 // ── 9 no secrets in logs ───────────────────────────────────────────────────
@@ -211,4 +215,58 @@ test("logs: diagnostics stay free of token material", async () => {
     assert.ok(!text.includes(secret), `diagnostics leaked ${secret.slice(0, 12)}…`);
   }
   assert.equal(describeAccountSession(s).bearerLen, DB_TOKEN.length);
+});
+
+test("pair: db bearer aligns the jar token cookie (mismatched live pair 401s)", async () => {
+  // The upstream completion endpoint validates the Bearer/cookie pair: a live
+  // context holding a different token cookie answers 401 while chats/new
+  // still returns 200. The persisted credential is authoritative.
+  setup(DB_TOKEN);
+  const s = await captureAccountSessionFromPage("a11", fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
+  assert.equal(s.bearerSource, "db");
+  assert.equal(s.bearerToken, DB_TOKEN);
+  const tokenPair = s.cookieHeader
+    .split(";")
+    .map((p) => p.trim())
+    .find((p) => p.startsWith(`${ACCOUNT_TOKEN_COOKIE_NAME}=`));
+  assert.ok(tokenPair, "jar must carry a token pair");
+  assert.equal(tokenPair, `${ACCOUNT_TOKEN_COOKIE_NAME}=${DB_TOKEN}`);
+});
+
+test("pair: non-db bearers leave the live jar untouched", async () => {
+  setup(null);
+  const s = await captureAccountSessionFromPage("a12", fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
+  assert.equal(s.bearerSource, "localStorage");
+  const tokenPair = s.cookieHeader
+    .split(";")
+    .map((p) => p.trim())
+    .find((p) => p.startsWith(`${ACCOUNT_TOKEN_COOKIE_NAME}=`));
+  assert.equal(tokenPair, `${ACCOUNT_TOKEN_COOKIE_NAME}=${COOKIE_TOKEN}`);
+});
+
+test("pair: db bearer serves the persisted jar, not the live one", async () => {
+  const { saveAuthSession, deleteAuthSession } = await import("../core/database.ts");
+  const id = "a13-persisted-jar";
+  const persistedAccess = "eyJpersisted.db.token.sig";
+  try {
+    saveAuthSession(id, {
+      cookie: `token=${persistedAccess}; refresh_token=R13; cna=persisted`,
+      userAgent: "Mozilla/5.0 TestPersisted",
+      bxV: "2.5.37",
+      tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+      capturedAt: Date.now(),
+    });
+    _resetAccountSessionsForTests();
+    _setPersistedTokenResolverForTests(() => persistedAccess);
+    const s = await captureAccountSessionFromPage(id, fakePage({ cookies: jar(), lsToken: LS_TOKEN }));
+    assert.equal(s.bearerSource, "db");
+    assert.equal(s.bearerToken, persistedAccess);
+    assert.ok(s.cookieHeader.includes("cna=persisted"));
+    assert.ok(!s.cookieHeader.includes("cna=x") || s.cookieHeader.includes("cna=persisted"));
+    assert.ok(!s.cookieHeader.includes(COOKIE_TOKEN));
+  } finally {
+    try { deleteAuthSession(id); } catch {}
+    _resetAccountSessionsForTests();
+    _setPersistedTokenResolverForTests(null);
+  }
 });

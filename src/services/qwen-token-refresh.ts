@@ -38,10 +38,13 @@ export const QWEN_REFRESH_URL = "https://auth.qwen.ai/api/v2/auths/refresh";
 export const QWEN_REFRESH_VERSION = "0.3.11";
 /**
  * How close to expiry (ms) an access token may be before it counts as
- * needing a refresh. 60 s covers one slow upstream round-trip without
- * renewing on every request.
+ * needing a refresh. 5 min covers slow upstream round-trips AND matches the
+ * persisted-bearer usability margin: refreshing here guarantees the silent
+ * path heals the session before readers treat the bearer as unusable.
+ * A smaller value opened a dead window every cycle (fresh=true with no
+ * network, yet no usable bearer), parking valid accounts in legacy burns.
  */
-export const QWEN_REFRESH_MARGIN_MS = 60_000;
+export const QWEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 /** Network timeout for one refresh attempt. */
 export const QWEN_REFRESH_TIMEOUT_MS = 15_000;
 /** Max age of a persisted session row usable for refresh (refresh lifetime). */

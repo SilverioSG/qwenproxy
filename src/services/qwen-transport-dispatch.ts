@@ -5,7 +5,11 @@
  *
  *   QWEN_DIRECT_WEB_TRANSPORT=false (default)
  *     -> legacy `createQwenStream` (browser page, composer, header capture).
- *        Behaviour is byte-for-byte what it was before this module existed.
+ *        Behaviour is byte-for-byte what it was before this module existed,
+ *        EXCEPT for in-scope requests on accounts with usable modern persisted
+ *        auth (MODERN_PERSISTED_ACCOUNT_DIRECT_PATH): those go direct from
+ *        ensureAccountFresh + the cold persisted bridge, with no browser.
+ *        Legacy-only accounts are untouched.
  *
  *   QWEN_DIRECT_WEB_TRANSPORT=true
  *     -> direct HTTP account transport (Bearer + live cookie jar incl. the
@@ -21,6 +25,7 @@
  */
 
 import { config, type ChatMode } from "../core/config.ts";
+import { hasUsableModernPersistedAuth } from "../core/database.ts";
 import type { QwenFileEntry } from "./qwen.ts";
 
 export interface DispatchArgs {
@@ -77,13 +82,21 @@ export function shouldUseDirectTransport(args: {
   useThreadNative?: boolean;
   existingChatSessionId?: string | null;
 }): { use: boolean; reason: string } {
-  if (!config.qwen.directWebTransport) {
-    return { use: false, reason: "flag-disabled" };
-  }
   const scope = directTransportScopeReason(args);
-  return scope
-    ? { use: false, reason: scope }
-    : { use: true, reason: "in-scope" };
+  if (scope) {
+    return { use: false, reason: scope };
+  }
+  if (config.qwen.directWebTransport) {
+    return { use: true, reason: "in-scope" };
+  }
+  // MODERN_PERSISTED_ACCOUNT_DIRECT_PATH: without the global flag, an
+  // in-scope request on an account with usable modern persisted auth still
+  // goes direct — it is served from ensureAccountFresh + the cold persisted
+  // bridge with no browser. Legacy-only accounts keep the legacy transport.
+  if (args.accountId && hasUsableModernPersistedAuth(args.accountId)) {
+    return { use: true, reason: "modern-persisted" };
+  }
+  return { use: false, reason: "flag-disabled" };
 }
 
 /**
@@ -117,6 +130,7 @@ export async function createStreamForAccount(
       accountId: args.accountId as string,
       chatMode: args.options?.chatMode,
       signal: args.signal,
+      modernPersisted: decision.reason === "modern-persisted",
     });
     return {
       stream: direct.stream,

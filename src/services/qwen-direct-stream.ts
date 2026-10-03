@@ -21,7 +21,7 @@ import {
   QWEN_DIRECT_WEB_TRANSPORT_ENABLED,
   directCompletionStream,
   directCreateChat,
-  getFrontendVersion,
+  getDirectBundleVersion,
 } from "./qwen-direct-transport.ts";
 import {
   captureAccountSession,
@@ -41,6 +41,12 @@ export interface DirectStreamOptions {
   humanSolveTimeoutMs?: number;
   allowRecovery?: boolean;
   signal?: AbortSignal;
+  /**
+   * Set by the dispatcher for MODERN_PERSISTED_ACCOUNT_DIRECT_PATH: the
+   * account holds usable modern persisted auth, so the flag gate is bypassed
+   * without flipping the global flag. Never set by other callers.
+   */
+  modernPersisted?: boolean;
 }
 
 export interface DirectStreamResult {
@@ -50,6 +56,11 @@ export interface DirectStreamResult {
   accountId: string;
   createdNewChat: boolean;
   tokenEstimationContext: TokenEstimationContext;
+}
+
+/** Strip the public Fast suffix to the upstream model id. Pure. */
+export function resolveUpstreamModel(model: string): string {
+  return model.endsWith("-fast") ? model.slice(0, -5) : model;
 }
 
 /** Thrown when the caller must fall back to the legacy transport. */
@@ -122,7 +133,7 @@ export function isDirectTransportEnabled(): boolean {
 export async function createDirectAccountStream(
   opts: DirectStreamOptions,
 ): Promise<DirectStreamResult> {
-  if (!isDirectTransportEnabled()) {
+  if (!isDirectTransportEnabled() && !opts.modernPersisted) {
     throw new DirectTransportUnsupported("feature-flag-disabled");
   }
   if (opts.signal?.aborted) {
@@ -146,17 +157,22 @@ export async function createDirectAccountStream(
     throw new Error("client aborted before direct request");
   }
 
-  const version = await getFrontendVersion().catch(() => null);
+  const version = await getDirectBundleVersion().catch(() => null);
   // "local" is the upstream ephemeral chat mode; every other ChatMode value
   // maps to a normal (threaded) upstream chat.
   // Same mapping the legacy transport uses (qwen.ts:4562).
   const chatMode = isLocalChatMode(opts.chatMode) ? "local" : "normal";
   const accountId8 = opts.accountId.slice(0, 8);
+  // Defense in depth: the normal request path already normalizes synthetic
+  // variants (qwen3.8-max-fast -> qwen3.8-max), but a literal alias sent to
+  // the upstream answers Not_Found/Model not found (proven live). The public
+  // alias stays accepted; only the upstream model id is canonical here.
+  const upstreamModel = resolveUpstreamModel(opts.model);
 
   const createLeg = async (cookie: string): Promise<string | null> => {
     const created = await directCreateChat({
       cookie,
-      model: opts.model,
+      model: upstreamModel,
       chatMode,
       chatType: "t2t",
       userAgent: session.userAgent,
@@ -178,7 +194,7 @@ export async function createDirectAccountStream(
       cookie,
       bearerToken: session.bearerToken,
       chatId,
-      model: opts.model,
+      model: upstreamModel,
       content: opts.prompt,
       chatMode,
       chatType: "t2t",
@@ -236,6 +252,15 @@ export async function createDirectAccountStream(
   }
 
   if (!result.ok || !result.stream) {
+    // Sanitized preview only: app error JSONs carry codes, never secrets.
+    const preview = String(
+      (result as { challengeBody?: unknown }).challengeBody ?? "",
+    )
+      .replace(/\s+/g, " ")
+      .slice(0, 200);
+    console.warn(
+      `⚠️ [DirectTransport] completion_rejected | account=${accountId8} | http=${result.httpStatus} | ct=${result.contentType} | waf=${result.waf} | version=${version ?? "-"} | body=${preview}`,
+    );
     throw new Error(
       `direct-completion-failed http=${result.httpStatus} ct=${result.contentType} waf=${result.waf}`,
     );

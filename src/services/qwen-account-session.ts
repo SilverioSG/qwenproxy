@@ -56,10 +56,19 @@ export interface AccountSessionState {
    * chars), and create-chat answers `Unauthorized` with it, while the persisted
    * one is accepted by every account in the pool.
    *
-   * IMPORTANT: the Bearer is the ONLY thing taken from the database. The cookie
-   * jar and the `x5sec` clearance always come from the live browser context,
-   * because they are WAF/session state rather than a credential, and a stale
-   * copy of either would break the clearance path.
+   * IMPORTANT: the Bearer is the ONLY thing taken from the database when a
+   * live browser context exists. The cookie jar and the `x5sec` clearance
+   * then come from the live browser context, because they are WAF/session state
+   * rather than a credential. EXCEPTION — pair coherence: when the Bearer is
+   * the persisted credential, the jar's `token` cookie is aligned to it,
+   * because the upstream completion endpoint validates the Bearer/cookie pair
+   * (mismatched answers 401 while chats/new still returns 200).
+   *
+   * COLD exception: with no live page at all, `captureAccountSession` rebuilds
+   * the whole state from persisted modern auth (jar + Bearer + userAgent) via
+   * `captureAccountSessionFromDb` instead of opening Chromium. A held
+   * clearance that went stale is reported by the upstream punish flow, which
+   * owns recovery — never confused with an auth failure here.
    */
   bearerSource: "db" | "localStorage" | "cookie" | "none";
   userAgent: string;
@@ -247,26 +256,192 @@ export async function captureAccountSessionFromPage(
       : cookieToken
         ? "cookie"
         : "none";
+  // Pair coherence: when the Bearer is the persisted DB credential, the jar
+  // must be the persisted jar, not the live one. A live context routinely
+  // holds rotated non-token cookies from a different session context, and
+  // the upstream completion endpoint validates the Bearer/cookie pair:
+  // live-jar + db-bearer answers 401 Unauthorized (while chats/new still
+  // returns 200), persisted-jar + db-bearer answers 200/OK. Proven by
+  // isolated A/B on the same account, same minute, same functions. The full
+  // persisted jar is used as-is (probe-proven); a stale held clearance, if
+  // any, surfaces as a punish challenge owned by the recovery flow.
+  let effectiveCookieHeader = cookieHeader;
+  let jarSource = "live";
+  if (bearerSource === "db" && bearerToken) {
+    try {
+      const { getRefreshMaterial } = await import("../core/database.ts");
+      const persistedJar = getRefreshMaterial(accountId)?.jar ?? "";
+      if (persistedJar) {
+        effectiveCookieHeader = persistedJar;
+        jarSource = "db";
+      }
+    } catch {
+      // Fall through to the live jar.
+    }
+    if (jarSource === "live") {
+      // Last resort: align at least the token pair (better than a mismatch,
+      // worse than the full persisted context above).
+      const pairs = effectiveCookieHeader
+        .split(";")
+        .map((p) => p.trim())
+        .filter(Boolean);
+      let replaced = false;
+      const aligned = pairs.map((pair) => {
+        const eq = pair.indexOf("=");
+        if (eq > 0 && pair.slice(0, eq).trim() === ACCOUNT_TOKEN_COOKIE_NAME) {
+          replaced = true;
+          return `${ACCOUNT_TOKEN_COOKIE_NAME}=${bearerToken}`;
+        }
+        return pair;
+      });
+      if (!replaced) aligned.unshift(`${ACCOUNT_TOKEN_COOKIE_NAME}=${bearerToken}`);
+      effectiveCookieHeader = aligned.join("; ");
+    }
+  }
   const x5 = parseX5secFromCookies(applicable);
+  // When serving the persisted jar, metadata must describe what is SENT, not
+  // the live context: presence + fingerprint from the effective jar, expiry
+  // unknown (same semantics as the cold bridge).
+  let x5present = x5.present;
+  let x5expiresAt = x5.expiresAt;
+  let x5hash = x5.hash;
+  let x5valid = x5.valid;
+  if (jarSource === "db") {
+    let x5value = "";
+    for (const pair of effectiveCookieHeader.split(";").map((p) => p.trim())) {
+      const eq = pair.indexOf("=");
+      if (eq > 0 && pair.slice(0, eq).trim() === X5SEC_COOKIE_NAME) {
+        x5value = pair.slice(eq + 1).trim();
+        break;
+      }
+    }
+    x5present = x5value.length > 0;
+    x5expiresAt = 0;
+    x5hash = x5value ? hash8(x5value) : null;
+    x5valid = x5present;
+  }
   console.log(
     `[AccountSession] captured | account=${accountId.slice(0, 8)} | bearer_source=${bearerSource} | ` +
       `bearer_present=${Boolean(bearerToken)} | bearer_length=${bearerToken.length} | ` +
-      `cookie_count=${applicable.length} | x5sec_present=${x5.present}`,
+      `cookie_count=${applicable.length} | jar_source=${jarSource} | x5sec_present=${x5present}`,
   );
   const state: AccountSessionState = {
     accountId,
-    cookieHeader,
+    cookieHeader: effectiveCookieHeader,
     bearerToken,
     bearerSource,
     userAgent,
-    x5secPresent: x5.present,
-    x5secExpiresAt: x5.expiresAt,
-    x5secHash: x5.hash,
-    x5secValid: x5.valid,
+    x5secPresent: x5present,
+    x5secExpiresAt: x5expiresAt,
+    x5secHash: x5hash,
+    x5secValid: x5valid,
     capturedAt: Date.now(),
   };
   sessions.set(accountId, state);
   return state;
+}
+
+/**
+ * Rebuild an account session from persisted modern auth WITHOUT a browser.
+ *
+ * Cold path used by `captureAccountSession` when no live page exists: the
+ * caller has already run `ensureAccountFresh`, so the persisted access token
+ * (and jar, after a rotation) is current. Returns null unless BOTH the
+ * persisted jar and the persisted Bearer are usable, in which case the state
+ * is cached in `sessions` exactly like a live capture.
+ *
+ * x5sec: presence + fingerprint come from the persisted jar. The jar carries
+ * no per-cookie expiry, so `x5secExpiresAt` is 0 (unknown); a stale held
+ * clearance surfaces as an upstream punish challenge, never as auth failure.
+ *
+ * Never opens Chromium, never logs in, never recovers. Secrets never logged.
+ */
+export async function captureAccountSessionFromDb(
+  accountId: string,
+): Promise<AccountSessionState | null> {
+  let jar = "";
+  let userAgent = "";
+  try {
+    const { getRefreshMaterial } = await import("../core/database.ts");
+    const material = getRefreshMaterial(accountId);
+    if (!material || !material.jar) return null;
+    jar = material.jar;
+    userAgent = material.userAgent || "";
+  } catch {
+    return null;
+  }
+  let bearerToken = "";
+  try {
+    const { getPersistedBearerToken } = await import("../core/database.ts");
+    bearerToken = getPersistedBearerToken(accountId)?.token ?? "";
+  } catch {
+    return null;
+  }
+  if (!jar || !bearerToken) return null;
+  const pairs = jar
+    .split(";")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  let x5secValue = "";
+  for (const pair of pairs) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    if (pair.slice(0, eq).trim() === X5SEC_COOKIE_NAME) {
+      x5secValue = pair.slice(eq + 1).trim();
+      break;
+    }
+  }
+  const x5secPresent = x5secValue.length > 0;
+  const state: AccountSessionState = {
+    accountId,
+    cookieHeader: jar,
+    bearerToken,
+    bearerSource: "db",
+    userAgent,
+    x5secPresent,
+    x5secExpiresAt: 0,
+    x5secHash: x5secValue ? hash8(x5secValue) : null,
+    x5secValid: x5secPresent,
+    capturedAt: Date.now(),
+  };
+  sessions.set(accountId, state);
+  console.log(
+    `[AccountSession] cold-db | account=${accountId.slice(0, 8)} | bearer_source=db | ` +
+      `bearer_present=true | bearer_length=${bearerToken.length} | ` +
+      `cookie_count=${pairs.length} | cookie_names=${cookieNames(jar)} | ` +
+      `x5sec_present=${x5secPresent} | ua_present=${userAgent.length > 0}`,
+  );
+  return state;
+}
+
+/**
+ * Modern-first session revalidation for the chat request path.
+ *
+ * Returns null when the account holds no usable modern persisted auth (the
+ * caller keeps the legacy login/recovery path unchanged), true when a silent
+ * refresh confirms the persisted session is fresh, false when modern material
+ * exists but is unusable (revoked/expired: classify + rotate, never password
+ * login). Never opens Chromium, never searches passwords, never logs secrets.
+ */
+export async function revalidateModernAccountSession(
+  accountId: string,
+): Promise<boolean | null> {
+  // Gate on refresh MATERIAL (the healable credential), not on a live bearer:
+  // an expired access token with a refresh_token jar is exactly what the
+  // silent refresh heals. No material at all → null (legacy path unchanged).
+  try {
+    const { getRefreshMaterial } = await import("../core/database.ts");
+    const material = getRefreshMaterial(accountId);
+    if (!material || !material.jar) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const { ensureAccountFresh } = await import("./qwen-token-refresh.ts");
+    return await ensureAccountFresh(accountId).catch(() => false);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -296,18 +471,42 @@ export async function captureAccountSession(
   } catch {
     // Fall through to the existing page/browser machinery.
   }
+  // Cold persisted bridge (no browser): with no live page, rebuild from the
+  // just-freshened persisted auth instead of opening Chromium. A live page
+  // that ALREADY exists keeps preference (fresher jar/clearance) via the
+  // withAccountPage path below; this branch never creates one.
+  try {
+    const { getAccountPageSnapshotHandles } = await import("./playwright.ts");
+    if (!getAccountPageSnapshotHandles(accountId)) {
+      const cold = await captureAccountSessionFromDb(accountId);
+      if (cold) return cold;
+    }
+  } catch {
+    // Fall through to the existing page/browser machinery.
+  }
   try {
     const { withAccountPage } = await import("./playwright.ts");
-    return await withAccountPage(
+    const live = await withAccountPage(
       accountId,
       (page) => captureAccountSessionFromPage(accountId, page),
       opts.timeoutMs ?? config.timeouts.page,
       config.timeouts.page,
       false,
-    );
+    ).catch(() => null);
+    if (live) return live;
   } catch {
-    return null;
+    // Fall through to the cold bridge below.
   }
+  // Resilience: a live page that exists but yields nothing (dead context,
+  // unusable jar) must not block the persisted session. Last chance before
+  // the caller falls back to legacy machinery.
+  try {
+    const cold = await captureAccountSessionFromDb(accountId);
+    if (cold) return cold;
+  } catch {
+    // Preserve the previous null contract.
+  }
+  return null;
 }
 
 /**

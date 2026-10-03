@@ -179,13 +179,18 @@ let versionFetchedAt = 0;
 let versionInflight: Promise<string | null> | null = null;
 
 /**
- * Frontend `version` header value.
+ * Bundle version for the DIRECT transport: the configured default, period.
  *
- * Qwen-Free-Api scrapes the homepage bundle path
- * `/qwenweb/qwen-chat-fe/<VERSION>/js/main.js`; qwen2api pins `0.2.83`. We do
- * the same scrape and fall back to the configured value, and we keep the
- * dynamic value in the shared store so every other call site benefits.
+ * Proven live: completions answer 200/OK with the configured default
+ * (0.2.91) and 401 Unauthorized with live-observed values (0.3.11, 0.3.12),
+ * while chats/new (which omits the version) returns 200 either way. Live
+ * scrapes and mixed-source globals observe non-chat bundle releases, so
+ * neither may feed this header. When the upstream chat bundle actually moves,
+ * QWEN_WEB_VERSION is the lever (already env-overridable).
  */
+export async function getDirectBundleVersion(): Promise<string | null> {
+  return config.qwen.webVersion;
+}
 export async function getFrontendVersion(
   opts: { force?: boolean } = {},
 ): Promise<string> {

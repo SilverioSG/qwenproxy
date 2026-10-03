@@ -4,6 +4,7 @@ import {
   updateAccountCooldown,
 } from "./accounts.ts";
 import { getAccountsByPriority } from "./account-priority.ts";
+import { hasUsableModernPersistedAuth } from "./database.ts";
 import { formatCooldownUntil } from "./logger.ts";
 
 let currentIndex = 0;
@@ -176,8 +177,16 @@ function passesHeadersReadyGate(
   accountId: string,
   anyReady: boolean,
 ): boolean {
-  return !anyReady || isAccountHeadersReady(accountId);
+  if (!anyReady || isAccountHeadersReady(accountId)) return true;
+  // Runtime eligibility (not UI status): a cold account holding usable modern
+  // persisted auth is servable via ensureAccountFresh + the cold persisted
+  // bridge with no browser, so the legacy headers-ready gate must not exclude
+  // it while other accounts are ready.
+  return hasUsableModernPersistedAuth(accountId);
 }
+
+/** @internal test seam for the runtime-eligibility gate. */
+export const _passesHeadersReadyGateForTests = passesHeadersReadyGate;
 
 export function syncCooldownsFromDb(accounts: QwenAccount[]): void {
   const now = Date.now();
@@ -197,6 +206,7 @@ export function syncCooldownsFromDb(accounts: QwenAccount[]): void {
   }
 }
 
+
 export function getNextAccount(): QwenAccount | null {
   const accounts = loadAccounts();
   if (accounts.length === 0) {
@@ -204,6 +214,7 @@ export function getNextAccount(): QwenAccount | null {
   }
 
   syncCooldownsFromDb(accounts);
+
 
   // Ordena por prioridade (contas que funcionaram bem vêm primeiro)
   const prioritized = getAccountsByPriority(accounts);
