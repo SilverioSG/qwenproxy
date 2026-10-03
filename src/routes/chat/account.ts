@@ -321,6 +321,33 @@ function isAntiBotError(err: any): boolean {
 }
 
 /**
+ * Single-timer attempt deadline with one coherent policy: normal budget
+ * until human captcha recovery starts, human budget while it is active.
+ * Re-arming REPLACES the timer (clear + set), so two timers never compete.
+ * The waiter it guards is abort-coupled (see qwen-human-captcha.ts), so an
+ * expired attempt also stops the polling instead of orphaning it.
+ */
+export interface AttemptDeadlineController {
+	extend(ms: number): void;
+	clear(): void;
+}
+
+export function createAttemptDeadline(onFire: () => void): AttemptDeadlineController {
+	let timer: NodeJS.Timeout | undefined;
+	return {
+		extend(ms: number) {
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(onFire, Math.max(0, ms));
+			timer.unref?.();
+		},
+		clear() {
+			if (timer) clearTimeout(timer);
+			timer = undefined;
+		},
+	};
+}
+
+/**
  * Sticky-thread rotation decision for the outer account loop.
  *
  * The retry policy is the single source of truth for "this account must be
@@ -1332,9 +1359,12 @@ async function tryCreateStreamWithRetry(
 				// fails fast and retryable instead of blocking the request for minutes
 				// with zero log output.
 				const acquireDeadlineMs = config.concurrency.acquireDeadlineMs;
-				let acquireDeadlineTimer: NodeJS.Timeout | undefined;
+				let attemptSettled = false;
+				const attemptDeadlineBox: { current: AttemptDeadlineController | null } = {
+					current: null,
+				};
 				const acquireDeadline = new Promise<never>((_, reject) => {
-					acquireDeadlineTimer = setTimeout(() => {
+					const fire = () => {
 						// Abort the losing createQwenStream (it is still queued on the
 						// stream lock or mid-create); the post-lock signal re-check in
 						// createQwenStream then throws instead of letting the orphan
@@ -1345,8 +1375,9 @@ async function tryCreateStreamWithRetry(
 						) as Error & { code?: string };
 						err.code = "acquire_deadline";
 						reject(err);
-					}, acquireDeadlineMs);
-					acquireDeadlineTimer.unref?.();
+					};
+					attemptDeadlineBox.current = createAttemptDeadline(fire);
+					attemptDeadlineBox.current.extend(acquireDeadlineMs);
 				});
 				result = await Promise.race([
 					runWithLatencyRequest(params.reqId, () => createStreamForAccount({
@@ -1369,6 +1400,14 @@ async function tryCreateStreamWithRetry(
 								}
 							: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
 						signal: combinedSignal,
+						onCaptchaStart: ({ budgetMs }) => {
+							// Single coherent policy, no competing timers: while
+							// human captcha recovery is active the attempt budget
+							// is the human budget, replacing the normal deadline.
+							// A settled attempt never re-arms (the hook only fires
+							// while createStreamForAccount is still running).
+							if (!attemptSettled) attemptDeadlineBox.current?.extend(Math.max(0, budgetMs));
+						},
 					}, () => createQwenStream(
 						promptForUpstream,
 						params.isThinkingModel,
@@ -1392,9 +1431,11 @@ async function tryCreateStreamWithRetry(
 					))),
 					acquireDeadline,
 				]);
-				// The acquire won: stop the deadline so it cannot fire later and
-				// abort a signal nobody observes anymore.
-				if (acquireDeadlineTimer) clearTimeout(acquireDeadlineTimer);
+				// The acquire settled (won or lost): stop the deadline so it cannot
+				// fire later and abort a signal nobody observes anymore.
+				attemptSettled = true;
+				attemptDeadlineBox.current?.clear();
+				attemptDeadlineBox.current = null;
 
 				if (logger.isLevelEnabled("info")) {
 					console.log(

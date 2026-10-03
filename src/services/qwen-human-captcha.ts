@@ -37,7 +37,8 @@ import {
 const CHALLENGE_PATH_MARKER = "_____tmd_____";
 
 /** How long a person is given before the request gives up and fails cleanly. */
-const DEFAULT_HUMAN_WAIT_MS = 5 * 60_000;
+export const HUMAN_CAPTCHA_BUDGET_MS = 5 * 60_000;
+const DEFAULT_HUMAN_WAIT_MS = HUMAN_CAPTCHA_BUDGET_MS;
 const POLL_INTERVAL_MS = 2_000;
 
 export interface HumanChallengeResult {
@@ -51,6 +52,50 @@ export interface HumanChallengeResult {
   /** Sanitized reason when the wait ended without a clearance. */
   reason: string | null;
   sanitized: Record<string, unknown>;
+}
+
+/**
+ * Page runner seam: production uses the shared account page. Tests replace it
+ * with a fake to drive solve/timeout/abort deterministically without Chromium.
+ */
+type AccountPageRunner = <T>(
+  accountId: string,
+  fn: (page: Page) => Promise<T>,
+  timeoutMs?: number,
+  navigationTimeoutMs?: number,
+  recoverOnTimeout?: boolean,
+) => Promise<T>;
+
+let accountPageRunner: AccountPageRunner = withAccountPage;
+
+/** @internal test seam (restored to the real runner by passing null). */
+export function _setAccountPageRunnerForTests(
+  fn: AccountPageRunner | null,
+): void {
+  accountPageRunner = fn ?? withAccountPage;
+}
+
+/** Marker for "the wait ended because its AbortSignal fired". Never logged. */
+const WAIT_ABORTED = Symbol("captcha-wait-aborted");
+
+/**
+ * Race async work against an AbortSignal without leaking listeners.
+ * Resolves WAIT_ABORTED when the signal fires first.
+ */
+function raceWithAbort<T>(
+  work: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T | typeof WAIT_ABORTED> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.resolve(WAIT_ABORTED);
+  let onAbort: (() => void) | null = null;
+  const aborted = new Promise<typeof WAIT_ABORTED>((resolve) => {
+    onAbort = () => resolve(WAIT_ABORTED);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([work, aborted]).finally(() => {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  });
 }
 
 /**
@@ -74,7 +119,7 @@ export async function openHumanCaptchaChallenge(
     `🚪 [HumanCaptcha] challenge_opened | account=${accountId8} | source=${challengeUrl ? "response_body" : "chat_reload"}`,
   );
   try {
-    return await withAccountPage(
+    return await accountPageRunner(
       accountId,
       async (page: Page) => {
         if (page.isClosed()) return false;
@@ -117,12 +162,20 @@ export async function waitForHumanCaptchaClearance(
      * merely a present one.
      */
     baseline?: X5secBaseline;
+    /**
+     * Aborts the wait immediately: the sleep/poll is cut short and no
+     * further page operation starts. The request lifecycle (acquire
+     * deadline, client disconnect) owns this signal; the waiter never
+     * outlives it, so no orphan polling survives a dead request.
+     */
+    signal?: AbortSignal;
   } = {},
 ): Promise<HumanChallengeResult> {
   const timeoutMs = Math.max(
     5_000,
     options.timeoutMs ?? DEFAULT_HUMAN_WAIT_MS,
   );
+  const { signal } = options;
   const accountId8 = accountId.slice(0, 8);
   const startedAt = Date.now();
   const baseline: X5secBaseline = options.baseline ?? {
@@ -130,34 +183,58 @@ export async function waitForHumanCaptchaClearance(
   };
   let opened = false;
 
+  const abortedResult = (): HumanChallengeResult => {
+    console.warn(
+      `⚠️ [HumanCaptcha] wait aborted | account=${accountId8} | waited=${Date.now() - startedAt}ms`,
+    );
+    return {
+      opened,
+      solved: false,
+      x5secTtlMs: 0,
+      waitedMs: Date.now() - startedAt,
+      reason: "aborted",
+      sanitized: {},
+    };
+  };
+  if (signal?.aborted) return abortedResult();
+
   console.warn(
     `⏳ [HumanCaptcha] awaiting_manual_solve | account=${accountId8} | budget=${Math.round(timeoutMs / 1000)}s`,
   );
 
   while (Date.now() - startedAt < timeoutMs) {
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    if (signal?.aborted) return abortedResult();
+    const slept = await raceWithAbort(
+      new Promise<void>((r) => setTimeout(r, POLL_INTERVAL_MS)),
+      signal,
+    );
+    if (slept === WAIT_ABORTED || signal?.aborted) return abortedResult();
     try {
-      const snap = await withAccountPage(
-        accountId,
-        async (page: Page) => {
-          if (page.isClosed()) return null;
-          const cookies = await page.context().cookies();
-          const x5 = cookies.find((c) => c.name === X5SEC_COOKIE_NAME);
-          const state = await captureAccountSessionFromPage(accountId, page);
-          return {
-            present: state.x5secPresent,
-            hash: state.x5secHash,
-            valid: state.x5secValid,
-            ttlMs: state.x5secExpiresAt
-              ? Math.max(0, state.x5secExpiresAt - Date.now())
-              : 0,
-            state,
-          };
-        },
-        15_000,
-        15_000,
-        false,
+      const snap = await raceWithAbort(
+        accountPageRunner(
+          accountId,
+          async (page: Page) => {
+            if (page.isClosed()) return null;
+            const cookies = await page.context().cookies();
+            const x5 = cookies.find((c) => c.name === X5SEC_COOKIE_NAME);
+            const state = await captureAccountSessionFromPage(accountId, page);
+            return {
+              present: state.x5secPresent,
+              hash: state.x5secHash,
+              valid: state.x5secValid,
+              ttlMs: state.x5secExpiresAt
+                ? Math.max(0, state.x5secExpiresAt - Date.now())
+                : 0,
+              state,
+            };
+          },
+          15_000,
+          15_000,
+          false,
+        ).catch(() => null),
+        signal,
       );
+      if (snap === WAIT_ABORTED || signal?.aborted) return abortedResult();
       if (!snap) continue;
       if (!opened) opened = true;
       // Only a clearance that is ABSENT-before, or genuinely DIFFERENT from the
@@ -200,13 +277,26 @@ export async function waitForHumanCaptchaClearance(
  */
 export async function recoverWithHumanCaptcha(
   accountId: string,
-  options: { challengeBody?: string; timeoutMs?: number; baseline?: X5secBaseline } = {},
+  options: {
+    challengeBody?: string;
+    timeoutMs?: number;
+    baseline?: X5secBaseline;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<{
   solved: boolean;
   x5secTtlMs: number;
   cookieHeader: string | null;
   sanitized: Record<string, unknown>;
 }> {
+  const unsolved = {
+    solved: false,
+    x5secTtlMs: 0,
+    cookieHeader: null,
+    sanitized: {},
+  };
+  // Already dead: skip the navigation entirely, the waiter exits at once.
+  if (options.signal?.aborted) return unsolved;
   const { peekAccountSession, captureX5secBaseline } = await import("./qwen-account-session.ts");
   // The caller normally passes the baseline it snapshotted before invalidating.
   // Fall back to the live cache so this stays safe when it is not supplied.
@@ -215,6 +305,7 @@ export async function recoverWithHumanCaptcha(
   const result = await waitForHumanCaptchaClearance(accountId, {
     timeoutMs: options.timeoutMs,
     baseline,
+    signal: options.signal,
   });
   if (!result.solved) {
     return {

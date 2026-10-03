@@ -43,6 +43,12 @@ export interface DispatchArgs {
     chatMode?: ChatMode;
   };
   signal?: AbortSignal;
+  /**
+   * Forwarded to the direct transport: fired once when human captcha
+   * recovery starts, so the request lifecycle can extend its attempt
+   * deadline for the solve. Never fired otherwise.
+   */
+  onCaptchaStart?: (info: { budgetMs: number }) => void;
 }
 
 export type StreamFactoryResult = Awaited<
@@ -131,6 +137,7 @@ export async function createStreamForAccount(
       chatMode: args.options?.chatMode,
       signal: args.signal,
       modernPersisted: decision.reason === "modern-persisted",
+      onCaptchaStart: args.onCaptchaStart,
     });
     return {
       stream: direct.stream,

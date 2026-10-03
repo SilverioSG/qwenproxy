@@ -42,6 +42,13 @@ export interface DirectStreamOptions {
   allowRecovery?: boolean;
   signal?: AbortSignal;
   /**
+   * Fired once when HUMAN_CAPTCHA_REQUIRED is detected, before the human
+   * waiter starts, with the waiter's effective budget. Lets the request
+   * lifecycle extend its attempt deadline for the solve instead of racing
+   * a shorter timer against it. Never fired when no challenge appears.
+   */
+  onCaptchaStart?: (info: { budgetMs: number }) => void;
+  /**
    * Set by the dispatcher for MODERN_PERSISTED_ACCOUNT_DIRECT_PATH: the
    * account holds usable modern persisted auth, so the flag gate is bypassed
    * without flipping the global flag. Never set by other callers.
@@ -219,6 +226,13 @@ export async function createDirectAccountStream(
     console.warn(
       `🚪 [DirectTransport] HUMAN_CAPTCHA_REQUIRED=YES | account=${accountId8} | CHALLENGE_OPENED=pending | challenge=${result.punishUrl ? "punish_url" : "none"}`,
     );
+    // Single coherent deadline policy: while the human recovery below is
+    // active, the attempt budget is the human budget, not the normal
+    // acquire deadline. The lifecycle owner re-arms its timer from this
+    // hook; without it a solve past the normal deadline could never land.
+    const { HUMAN_CAPTCHA_BUDGET_MS } = await import("./qwen-human-captcha.ts");
+    const humanBudgetMs = Math.max(5_000, opts.humanSolveTimeoutMs ?? HUMAN_CAPTCHA_BUDGET_MS);
+    opts.onCaptchaStart?.({ budgetMs: humanBudgetMs });
     // Snapshot the clearance we were JUST refused on, BEFORE dropping it from
     // the operational cache. Recovery must be able to tell a new clearance from
     // this one; invalidating first used to erase that evidence and made the wait
@@ -232,6 +246,7 @@ export async function createDirectAccountStream(
       challengeBody: result.challengeBody ?? "",
       timeoutMs: opts.humanSolveTimeoutMs,
       baseline,
+      signal: opts.signal,
     });
     if (!outcome.solved || !outcome.cookieHeader) {
       console.warn(
