@@ -10,6 +10,7 @@ import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from 
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
 import {
   getWafCircuitSignature,
+  isSharedWafCircuitError,
   isWafCircuitOpen,
   SharedWafCircuitError,
   wafCircuitTtlRemainingMs,
@@ -311,8 +312,13 @@ export function resolveInitialAccount(
 	);
 }
 
-function isAccountUnavailableError(err: any): boolean {
+/** @internal exported for tests: quota/unavailable classification. */
+export function isAccountUnavailableError(err: any): boolean {
 	// Quota/rate-limit style failures that should cool the account and rotate.
+	// A shared-WAF circuit error carries an external 429 for the client, but
+	// says nothing about this account's quota or auth health: an account that
+	// merely confirmed a shared punish must never be cooled as quota-exceeded.
+	if (isSharedWafCircuitError(err)) return false;
 	if (isQuotaLikeError(err)) return true;
 	return (
 		(err instanceof UpstreamRateLimit &&

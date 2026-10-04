@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { getAccountCooldownInfo } from "../core/account-manager.ts";
+import { isAccountUnavailableError } from "../routes/chat/account.ts";
 import { deleteAuthSession, saveAuthSession } from "../core/database.ts";
 import { UpstreamRateLimit } from "../core/errors.ts";
 import { classifyError } from "../api/error-classifier.ts";
@@ -393,6 +394,48 @@ test("circuit error maps to retryable 429 and is policy-terminal", () => {
   assert.equal(policy.reason, "shared_waf_circuit_open");
   assert.equal(policy.retryable, false);
   assert.ok(!policy.accountCooldownMs);
+});
+
+// ── Fix E2: external 429 is not internal quota evidence ─────────────────────
+
+test("E2: shared-WAF 429 is never account-unavailable/quota", () => {
+  // The confirming account must not be cooled: the 429 is for the client,
+  // not evidence about this account's quota or auth health.
+  const err = new SharedWafCircuitError("punish_url", 42_000);
+  assert.equal(isAccountUnavailableError(err), false);
+  const policy = classifyRetryAction(err, { requestAborted: false });
+  assert.equal(policy.reason, "shared_waf_circuit_open");
+  assert.ok(!policy.accountCooldownMs);
+  assert.ok(!policy.accountCooldownReason);
+});
+
+test("E2: real quota signals still classify as account-unavailable", () => {
+  // membership_limit by code.
+  assert.equal(
+    isAccountUnavailableError({ upstreamCode: "membership_limit" }),
+    true,
+  );
+  // Plain upstream 429 without WAF-circuit identity still matches the
+  // legacy 429 line (only SharedWafCircuitError is excluded).
+  assert.equal(isAccountUnavailableError({ upstreamStatus: 429 }), true);
+  // Genuine auth failures are untouched by the exclusion.
+  assert.equal(
+    isAccountUnavailableError({ upstreamCode: "Unauthorized" }),
+    false,
+  );
+});
+
+test("E2: probe-rotate carries no cooldown", async () => {
+  const { DirectTransportWafBlocked } = await import(
+    "../services/qwen-direct-stream.ts"
+  );
+  const err = new DirectTransportWafBlocked(true, false, "probe-rotate");
+  assert.equal(isAccountUnavailableError(err), false);
+  const policy = classifyRetryAction(err, { requestAborted: false });
+  assert.equal(policy.reason, "waf_probe_rotate");
+  assert.equal(policy.switchAccount, true);
+  assert.ok(!policy.accountCooldownMs);
+  assert.ok(!policy.accountCooldownReason);
 });
 
 test("concurrent punish flows stay bounded and fast, circuit opens", async () => {
