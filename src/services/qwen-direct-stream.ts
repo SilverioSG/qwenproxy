@@ -30,7 +30,27 @@ import {
   peekAccountSession,
 } from "./qwen-account-session.ts";
 import type { TokenEstimationContext } from "./token-estimation-metrics.ts";
-import { isLocalChatMode, type ChatMode } from "../core/config.ts";
+import { config, isLocalChatMode, type ChatMode } from "../core/config.ts";
+import {
+  isWafCircuitOpen,
+  getWafCircuitSignature,
+  recordWafPunish,
+  SharedWafCircuitError,
+  wafCircuitTtlRemainingMs,
+  wafSignatureFromDirectResult,
+} from "../core/waf-circuit.ts";
+
+/**
+ * Which WAF recovery policy applies. Headless production has no human to
+ * solve a challenge, so punish takes the bounded automatic path; headed /
+ * interactive mode keeps the human waiter. Pure and unit-testable; the
+ * caller passes the canonical service flag (`config.playwright.headless`).
+ */
+export function selectWafRecoveryMode(
+  headless: boolean,
+): "human" | "headless-auto" {
+  return headless ? "headless-auto" : "human";
+}
 
 export interface DirectStreamOptions {
   prompt: string;
@@ -87,7 +107,13 @@ export type DirectWafBlockReason =
   /** The official challenge was opened but no clearance arrived within budget. */
   | "clearance-timeout"
   /** A clearance arrived, yet the single retry was refused again. */
-  | "retry-refused";
+  | "retry-refused"
+  /**
+   * Headless automatic recovery (same-account retry, Fix E) was refused with
+   * the same punish signature. Exactly one rotation probe may follow; the
+   * shared circuit opens on the second independent account.
+   */
+  | "probe-rotate";
 
 /**
  * Thrown when the upstream refused this request with a WAF challenge.
@@ -117,7 +143,9 @@ export class DirectTransportWafBlocked extends Error {
         ? "direct-transport-waf-retry-refused"
         : blockReason === "clearance-timeout"
           ? "direct-transport-waf-clearance-timeout"
-          : "direct-transport-waf-recovery-unavailable",
+          : blockReason === "probe-rotate"
+            ? "direct-transport-waf-probe-rotate"
+            : "direct-transport-waf-recovery-unavailable",
     );
     this.name = "DirectTransportWafBlocked";
     this.recoveryAttempted = recoveryAttempted;
@@ -164,6 +192,14 @@ export async function createDirectAccountStream(
     throw new Error("client aborted before direct request");
   }
 
+  // Shared-WAF circuit: while open, fail fast without consuming upstream
+  // state — no legs, no cooldown, no rotation. Checked again after leg 1
+  // in case another request confirmed the punish concurrently.
+  if (isWafCircuitOpen()) {
+    const signature = getWafCircuitSignature() ?? "waf-challenge";
+    throw new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs());
+  }
+
   const version = await getDirectBundleVersion().catch(() => null);
   // "local" is the upstream ephemeral chat mode; every other ChatMode value
   // maps to a normal (threaded) upstream chat.
@@ -176,6 +212,10 @@ export async function createDirectAccountStream(
   // alias stays accepted; only the upstream model id is canonical here.
   const upstreamModel = resolveUpstreamModel(opts.model);
 
+  // The working credential pair, refreshed by recovery legs below. The
+  // legs always send a coherent pair (Fix C): reassign both together.
+  let activeBearer = session.bearerToken;
+
   const createLeg = async (cookie: string): Promise<string | null> => {
     const created = await directCreateChat({
       cookie,
@@ -184,7 +224,7 @@ export async function createDirectAccountStream(
       chatType: "t2t",
       userAgent: session.userAgent,
       version,
-      bearerToken: session.bearerToken,
+      bearerToken: activeBearer,
       baxia: null,
     });
     if (!created.ok || !created.chatId) {
@@ -199,7 +239,7 @@ export async function createDirectAccountStream(
   const completeLeg = (cookie: string, chatId: string) =>
     directCompletionStream({
       cookie,
-      bearerToken: session.bearerToken,
+      bearerToken: activeBearer,
       chatId,
       model: upstreamModel,
       content: opts.prompt,
@@ -217,7 +257,10 @@ export async function createDirectAccountStream(
   if (!chatId) throw new DirectTransportUnsupported("create-chat-failed");
   let result = await completeLeg(cookie, chatId);
 
-  // ── At most ONE human-captcha recovery, always on a BRAND NEW chat ───────
+  // ── At most ONE captcha recovery, always on a BRAND NEW chat ───────
+  // Human mode waits for a person (headed/interactive). Headless production
+  // takes the bounded automatic path instead (Fix E): no 300s wait, at most
+  // one same-account retry and one rotation probe per punish signature.
   if (!result.ok && result.waf) {
     if (opts.allowRecovery === false || !opts.accountId) {
       invalidateX5sec(opts.accountId ?? "");
@@ -226,6 +269,28 @@ export async function createDirectAccountStream(
     console.warn(
       `🚪 [DirectTransport] HUMAN_CAPTCHA_REQUIRED=YES | account=${accountId8} | CHALLENGE_OPENED=pending | challenge=${result.punishUrl ? "punish_url" : "none"}`,
     );
+    const signature = wafSignatureFromDirectResult(result.punishUrl ?? null, result.challengeBody);
+    let headlessRecovery = false;
+    if (selectWafRecoveryMode(config.playwright.headless) === "headless-auto") {
+      // A known-shared WAF fails fast without consuming state: no session
+      // work, no legs, no cooldown, no rotation.
+      if (isWafCircuitOpen(signature)) {
+        throw new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs());
+      }
+      // Same-account bounded recovery: drop the refused clearance, re-capture
+      // the session, and run the single second leg below with fresh material.
+      // No waiting, no cooldown, no rotation yet.
+      invalidateX5sec(opts.accountId);
+      const retrySession = await captureAccountSession(opts.accountId, { force: true }).catch(() => null);
+      if (opts.signal?.aborted) {
+        throw new Error("client aborted before direct retry");
+      }
+      if (retrySession?.cookieHeader && retrySession?.bearerToken) {
+        cookie = retrySession.cookieHeader;
+        activeBearer = retrySession.bearerToken;
+      }
+      headlessRecovery = true;
+    } else {
     // Single coherent deadline policy: while the human recovery below is
     // active, the attempt budget is the human budget, not the normal
     // acquire deadline. The lifecycle owner re-arms its timer from this
@@ -258,12 +323,32 @@ export async function createDirectAccountStream(
     console.log(
       `✅ [HumanCaptcha] HUMAN_CAPTCHA_SOLVED=YES | account=${accountId8} | X5SEC_TTL_MS=${Math.round(outcome.x5secTtlMs)}`,
     );
-    // NEW chat: the pre-solve chatId belongs to the pre-solve session.
+    }
+    // NEW chat: the pre-recovery chatId belongs to the pre-recovery session.
     chatId = await createLeg(cookie);
     if (!chatId) throw new DirectTransportWafBlocked(true, true, "retry-refused");
     result = await completeLeg(cookie, chatId);
-    // A second challenge fails cleanly. No loop.
-    if (!result.ok) throw new DirectTransportWafBlocked(true, true, "retry-refused");
+    if (!result.ok) {
+      if (headlessRecovery) {
+        // Persisted punish: record this account's observation. A second
+        // independent account with the same signature opens the shared
+        // circuit; anything else rotates exactly once via policy (no
+        // cooldown either way). A non-WAF failure keeps existing handling.
+        const retrySignature = result.waf
+          ? wafSignatureFromDirectResult(result.punishUrl ?? null, result.challengeBody)
+          : null;
+        if (retrySignature) {
+          const observed = recordWafPunish(opts.accountId, retrySignature);
+          if (observed.shared || isWafCircuitOpen(retrySignature)) {
+            throw new SharedWafCircuitError(retrySignature, wafCircuitTtlRemainingMs());
+          }
+          throw new DirectTransportWafBlocked(true, false, "probe-rotate");
+        }
+      } else {
+        // A second challenge fails cleanly. No loop.
+        throw new DirectTransportWafBlocked(true, true, "retry-refused");
+      }
+    }
   }
 
   if (!result.ok || !result.stream) {

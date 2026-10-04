@@ -157,12 +157,18 @@ test("the human-solve wait requires a different clearance than the baseline", ()
 
 test("the caller snapshots the rejected clearance before invalidating it", () => {
   const src = fs.readFileSync("src/services/qwen-direct-stream.ts", "utf-8");
-  const capAt = src.indexOf("captureX5secBaseline(peekAccountSession(");
-  const invAt = src.indexOf("invalidateX5sec(opts.accountId)");
-  assert.ok(capAt > 0 && invAt > 0, "both must exist");
+  // Scoped to the HUMAN branch (headless Fix E invalidates without a
+  // baseline/waiter by design): the baseline MUST be captured before the
+  // invalidation that precedes the human recovery call.
+  const humanAt = src.indexOf("opts.onCaptchaStart?.(");
+  assert.ok(humanAt > 0, "human branch present");
+  const region = src.slice(humanAt, humanAt + 2500);
+  const capAt = region.indexOf("captureX5secBaseline(peekAccountSession(");
+  const invAt = region.indexOf("invalidateX5sec(opts.accountId)");
+  assert.ok(capAt > 0 && invAt > 0, "both must exist in the human branch");
   assert.ok(capAt < invAt, "the baseline MUST be captured before invalidation");
   // …and forwarded into the recovery.
-  const after = src.slice(invAt, invAt + 700);
+  const after = region.slice(invAt, invAt + 700);
   assert.ok(/baseline,/.test(after), "the baseline must be passed to recovery");
 });
 

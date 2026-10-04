@@ -8,6 +8,12 @@ import {
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
+import {
+  getWafCircuitSignature,
+  isWafCircuitOpen,
+  SharedWafCircuitError,
+  wafCircuitTtlRemainingMs,
+} from "../../core/waf-circuit.ts";
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { ClientAbortedError, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
@@ -492,6 +498,21 @@ export async function acquireUpstreamStream(
 	const latencyReqId = params.reqId;
 
 	const completionId = "chatcmpl-" + uuidv4();
+	// Shared-WAF circuit: while open, fail fast with a retryable 429 before
+	// touching any account. No selection, no cooldown, no rotation — the pool
+	// is protected until the TTL lapses.
+	if (isWafCircuitOpen()) {
+		const signature = getWafCircuitSignature() ?? "waf-challenge";
+		console.warn(
+			`⛔ [Chat] Shared WAF circuit open | signature=${signature} | ttl=${wafCircuitTtlRemainingMs()}ms | failing fast without consuming accounts`,
+		);
+		return {
+			error: new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs()),
+			completionId,
+			allOnCooldown: false,
+			retryAfterMs: wafCircuitTtlRemainingMs(),
+		};
+	}
 	// Sticky thread binding is independent of forceNewChat. forceNewChat only
 	// means "open a fresh upstream chat", not "forget which account owned the
 	// logical conversation".
@@ -571,6 +592,16 @@ export async function acquireUpstreamStream(
 	let antiBotRotations = 0;
 
 	while (account) {
+		// Shared-WAF circuit may have opened mid-request (a second account
+		// confirmed the punish). Stop before consuming a third account: fail
+		// fast with the retryable circuit error instead of rotating.
+		if (isWafCircuitOpen()) {
+			lastError = new SharedWafCircuitError(
+				getWafCircuitSignature() ?? "waf-challenge",
+				wafCircuitTtlRemainingMs(),
+			);
+			break;
+		}
 		const accountId = account.id;
 		const accountEmail = maskEmail(account.email);
 

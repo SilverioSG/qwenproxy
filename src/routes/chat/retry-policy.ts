@@ -7,6 +7,7 @@
 
 import { config } from "../../core/config.ts";
 import { computeQuotaCooldownMs } from "../../core/account-manager.ts";
+import { isSharedWafCircuitError } from "../../core/waf-circuit.ts";
 import { logger } from "../../core/logger.ts";
 import {
   PersonalizationSyncError,
@@ -626,6 +627,31 @@ export function classifyRetryAction(
     // transient one: rotating accounts would hide it. Fail fast.
     if (isDirectWafRecoveryUnavailable(err)) {
       return makeRetryAction("direct_waf_recovery_unavailable", {
+        retryable: false,
+      });
+    }
+
+    // Headless automatic recovery already spent its one same-account retry
+    // and the punish persisted. Rotate exactly once (second-account probe);
+    // the shared circuit opens on the second independent confirmation and
+    // stops further rotation. No cooldown: a punish is not auth evidence.
+    if (
+      (err as { name?: unknown; blockReason?: unknown })?.name ===
+        "DirectTransportWafBlocked" &&
+      (err as { blockReason?: unknown })?.blockReason === "probe-rotate"
+    ) {
+      return makeRetryAction("waf_probe_rotate", {
+        retryable: true,
+        switchAccount: true,
+        forceNewChat: true,
+        retryAfterMs: baseDelayMs,
+      });
+    }
+
+    // Shared-WAF circuit open: fail fast without consuming accounts,
+    // cooldowns or rotation budget. Terminal by policy.
+    if (isSharedWafCircuitError(err)) {
+      return makeRetryAction("shared_waf_circuit_open", {
         retryable: false,
       });
     }
