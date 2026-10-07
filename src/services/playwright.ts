@@ -2404,10 +2404,23 @@ export async function initPlaywrightForAccount(
 
       if (restoredFromDb) {
         if (!acctPage.isClosed() && (acctPage.url() === "about:blank" || !acctPage.url().startsWith(qwenOrigin()))) {
-          void acctPage.goto(qwenUrl("/"), {
-            waitUntil: "domcontentloaded",
-            timeout: config.timeouts.navigation,
-          }).catch(() => {});
+          // Awaited (not fire-and-forget): an overlapping background
+          // navigation used to race the next page.goto on this same page and
+          // abort it with net::ERR_ABORTED. A benign abort (page already home)
+          // is swallowed; anything else only warns — init stays non-fatal.
+          try {
+            await acctPage.goto(qwenUrl("/"), {
+              waitUntil: "domcontentloaded",
+              timeout: config.timeouts.navigation,
+            });
+            await sleep(300);
+          } catch (err: any) {
+            if (!err?.message?.includes("ERR_ABORTED")) {
+              console.warn(
+                `⚠️  [Playwright] Background navigation warning for ${maskEmail(account.email)}: ${err.message}`,
+              );
+            }
+          }
         }
         return;
       }

@@ -854,6 +854,27 @@ export async function readJsonTextResponse(
   }
 }
 
+/**
+ * True only for a benign same-origin navigation abort: Playwright's
+ * `net::ERR_ABORTED` fired while the page already sits on the expected
+ * target origin (redirect/superseded navigation that still landed home).
+ * Every other failure — Target/context/browser closed, timeouts,
+ * connection errors, off-origin aborts — returns false and must rethrow.
+ */
+export function isBenignNavigationAbort(
+  err: unknown,
+  pageUrl: string,
+  targetOrigin: string,
+): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  if (!message.includes("ERR_ABORTED")) return false;
+  try {
+    return pageUrl.startsWith(targetOrigin);
+  } catch {
+    return false;
+  }
+}
+
 async function withQwenBrowserPage<T>(
   accountId: string,
   fn: (page: Page) => Promise<T>,
@@ -889,10 +910,22 @@ async function withQwenBrowserPage<T>(
         (normalizedTargetPath !== null && currentPath !== normalizedTargetPath);
 
       if (needsNavigation) {
-        await page.goto(targetUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
-        });
+        try {
+          await page.goto(targetUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
+          });
+        } catch (err: unknown) {
+          // A benign navigation interruption (net::ERR_ABORTED) happens when
+          // the page already reached the target origin or a redirect finished
+          // first — the page is where it needs to be, so continue instead of
+          // failing the whole operation (which used to surface as
+          // PersonalizationFailed + 300s account cooldown). Anything else
+          // (Target closed, timeouts, connection errors) still throws.
+          if (!isBenignNavigationAbort(err, page.url(), targetOrigin)) {
+            throw err;
+          }
+        }
       }
 
       return fn(page);
@@ -902,6 +935,9 @@ async function withQwenBrowserPage<T>(
     recoverOnTimeout,
   );
 }
+
+/** Test seam: exercise the navigation-abort tolerance without a browser. */
+export const _withQwenBrowserPageForTests = withQwenBrowserPage;
 
 
 
