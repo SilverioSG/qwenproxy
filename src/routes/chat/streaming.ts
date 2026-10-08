@@ -2824,10 +2824,12 @@ export async function processStreamingResponse(
       // Terminal stream error: the outer retry loop already gave up (it only
       // reaches this onError when the callback throws past the retry budget).
       // One record, after the error [DONE], before the stream is closed.
+      // The dashboard reason comes from the mid-stream resolver (must stay
+      // consistent with the pre-response classifier in index.ts).
       observeStreamEnd({
         success: false,
         error: err.message,
-        errorReason: errorCode,
+        errorReason: resolveMidStreamDashboardReason(err),
       });
     } catch {
       // Stream already closed — client already disconnected or the stream
@@ -2837,6 +2839,24 @@ export async function processStreamingResponse(
 }
 
 // ─── Top-level error wrapper ───────────────────────────────────────────────────
+
+/**
+ * Dashboard errorReason for a terminal mid-stream (SSE) failure.
+ *
+ * Reuses the canonical classifier also used pre-response (index.ts), so one
+ * logical cause yields one terminal taxonomy wherever it surfaces:
+ * SharedWafCircuitError -> "shared_waf_circuit_open" (PROTECTION),
+ * ClientAbortedError / known abort markers -> "client_abort" (CLIENT_ABORT),
+ * account_busy -> "account_busy" (ACCOUNT_HEALTH), etc.
+ * (Deriving the reason from the client-visible error code instead lost the
+ * semantic cause for errors without a usable upstream code, e.g. WAF
+ * mid-stream recorded stream_error / UNKNOWN.)
+ * Pure: no retry, failover, WAF, auth or streaming side effects. The SSE
+ * error payload (`code`) is intentionally untouched.
+ */
+export function resolveMidStreamDashboardReason(err: unknown): string {
+  return classifyRetryAction(err).reason;
+}
 
 export function handleChatCompletionsError(c: Context, err: unknown): Response {
   const classified = classifyError(err);
