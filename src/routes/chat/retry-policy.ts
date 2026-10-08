@@ -19,6 +19,7 @@ import {
 import {
   AuthError,
   ClientAbortedError,
+  isKnownClientAbortMessage,
   NotFoundError,
   ValidationError,
 } from "../../core/errors.ts";
@@ -149,7 +150,10 @@ export function isClientAbortError(
   // retrying the old one resends full context on another account for nothing
   // (and can queue indefinitely behind the new stream's lease).
   if (err instanceof ClientAbortedError) return true;
-  if (err instanceof Error && err.message.includes("client aborted")) return true;
+  // Exact abort markers (pre-lease "Aborted before acquiring account lease",
+  // queued-wait abort, mid-stream disconnect) plus the legacy "client aborted"
+  // substring. Real lease/busy failures never match (see errors.ts).
+  if (err instanceof Error && isKnownClientAbortMessage(err.message)) return true;
   // Bare AbortError mid-stream is usually idle/upstream timeout (retryable).
   return false;
 }
