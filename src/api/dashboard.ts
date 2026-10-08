@@ -490,3 +490,571 @@ dashboardApp.post("/v1/accounts/:id/reset-cooldown", (c) => {
   clearAccountCooldown(id);
   return c.json({ ok: true, id, onCooldown: false });
 });
+
+dashboardApp.post("/v1/accounts/:id/manual-verification/start", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { startManualVerification } = await import(
+      "../services/manual-verification.js"
+    );
+    const status = await startManualVerification(id);
+    return c.json({ ok: true, ...status });
+  } catch (err) {
+    const status =
+      typeof (err as { status?: unknown }).status === "number"
+        ? (err as { status: number }).status
+        : 500;
+    return c.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      status as 400,
+    );
+  }
+});
+
+dashboardApp.get("/v1/accounts/:id/manual-verification/status", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const { getManualVerificationStatus } = await import(
+    "../services/manual-verification.js"
+  );
+  const status = getManualVerificationStatus(id);
+  if (!status) return c.json({ ok: true, accountId: id, state: "idle" });
+  return c.json({ ok: true, ...status });
+});
+
+dashboardApp.post("/v1/accounts/:id/manual-verification/cancel", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const { cancelManualVerification } = await import(
+    "../services/manual-verification.js"
+  );
+  const status = cancelManualVerification(id);
+  if (!status) return c.json({ ok: true, accountId: id, state: "idle" });
+  return c.json({ ok: true, ...status });
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-settings-auth", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: A/B settings auth (live bearer vs cookie-only)
+  // on the live account context. Read-only: no heal, no login, no DB, no
+  // cooldown changes. Booleans/codes only in the response.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeSettingsAuthAB } = await import("../services/qwen.js");
+    const result = await probeSettingsAuthAB(id);
+    try {
+      console.log(
+        `[SettingsAB] account=${id.slice(0, 8)} ` +
+          `bearer=${result.bearerStatus}/${result.bearerAppAuthFailure} ` +
+          `cookieOnly=${result.cookieStatus}/${result.cookieAppAuthFailure} ` +
+          `liveToken=${result.liveTokenPresent} cookies=${result.cookieCount}`,
+      );
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-refresh-structure", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC, single controlled refresh execution. Reports
+  // response STRUCTURE only (key names, value types/lengths, booleans).
+  // Performs NO writes and triggers NO recovery. Never logs values.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeRefreshStructure } = await import("../services/qwen.js");
+    const result = await probeRefreshStructure(id);
+    try {
+      console.log(
+        `[RefreshStruct] account=${id.slice(0, 8)} ` +
+          `http=${result.httpStatus} success=${result.appSuccess} ` +
+          `appFail=${result.appAuthFailure} ` +
+          `top=[${result.topKeys.join(",")}]`,
+      );
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-login", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: exactly ONE loginViaApi invocation plus
+  // same-context models/settings/create-chat reads. No cooldown changes,
+  // no rotation, no loops, no DB writes. Sanitized results only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeLoginOnce } = await import("../services/playwright.js");
+    const result = await probeLoginOnce(id);
+    try {
+      console.log(
+        `[LoginProbe] account=${id.slice(0, 8)} loginOk=${result.loginOk} ` +
+          `models=${result.models.status} settings=${result.settings.status} ` +
+          `create=${result.createChat.status}/${result.createChat.created}`,
+      );
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-capture", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: exactly ONE refreshHeaders(forceReauth=true) on the
+  // account, i.e. the internal re-auth -> captureQwenHeaders flow, with NO
+  // /v1/chat/completions traffic, no rotation and no cooldown changes.
+  // Sanitized result only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const mode = c.req.query("mode") === "capture" ? "capture" : "refresh";
+  const timeoutMs = Math.max(
+    5_000,
+    Math.min(120_000, Number.parseInt(c.req.query("timeoutMs") ?? "45000", 10) || 45_000),
+  );
+  const events: Array<Record<string, unknown>> = [];
+  try {
+    const captureProbe = await import("../services/capture-probe.js");
+    captureProbe.beginCaptureTrace(id);
+    const startedAt = Date.now();
+    let ok = false;
+    let errorClass: string | null = null;
+    let errorMessage: string | null = null;
+    let loginOk: boolean | null = null;
+    try {
+      if (mode === "capture") {
+        // Exercise the UI capture itself: one login, then captureQwenHeaders.
+        const { captureQwenHeaders, loginToQwen } = await import(
+          "../services/playwright.js"
+        );
+        const { getAccountCredentials } = await import("../core/accounts.js");
+        const creds = getAccountCredentials(id);
+        if (creds?.email && creds?.password) {
+          loginOk = await loginToQwen(id, creds.email, creds.password, "capture-probe");
+        }
+        await captureQwenHeaders(id, undefined, timeoutMs);
+      } else {
+        const { refreshHeaders } = await import("../services/playwright.js");
+        await refreshHeaders(id, timeoutMs, true);
+      }
+      ok = true;
+    } catch (err) {
+      errorClass =
+        err instanceof Error ? err.name : typeof err === "string" ? "string" : "unknown";
+      errorMessage =
+        err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200);
+    }
+    for (const e of captureProbe.captureEventsSnapshot(200)) events.push(e);
+    const stages = events.map((e) => String(e.stage));
+    return c.json({
+      ok,
+      mode,
+      accountId: id,
+      loginOk,
+      durationMs: Date.now() - startedAt,
+      errorClass,
+      errorMessage,
+      stages,
+      events,
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-direct-guest", async (c) => {
+  // GUEST smoke: dedicated Baxia minter -> guest cookie -> chats/new ->
+  // chat/completions. No account cookie, no login, no Authorization, no UI.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const model = c.req.query("model") || "qwen3.8-max";
+  const prompt = c.req.query("prompt") || "Responde únicamente: OK";
+  try {
+    const direct = await import("../services/qwen-direct-transport.js");
+    const minter = await import("../services/qwen-baxia-minter.js");
+    const runOnce = async (baxia: unknown): Promise<Record<string, unknown>> => {
+      const created = await direct.directCreateChat({
+        cookie: "",
+        model,
+        chatMode: "guest",
+        chatType: "t2t",
+        baxia: baxia as never,
+        version: "0.2.83",
+      });
+      let completion: Record<string, unknown> | null = null;
+      if (created.ok && created.chatId) {
+        completion = { ...(await direct.directCompletion({
+          cookie: "",
+          chatId: created.chatId,
+          model,
+          content: prompt,
+          chatMode: "guest",
+          chatType: "t2t",
+          baxia: baxia as never,
+          version: "0.2.83",
+          timeoutMs: 90_000,
+        })) };
+      }
+      return {
+        create: {
+          http: created.httpStatus,
+          appSuccess: created.appSuccess,
+          ok: created.ok,
+          chatId: created.chatId,
+          waf: created.waf,
+          riskControlled: created.riskControlled,
+          errorCode: created.errorCode,
+          preview: created.bodyPreview,
+        },
+        completion: completion
+          ? {
+              ok: completion.ok,
+              http: completion.httpStatus,
+              ct: completion.contentType,
+              waf: completion.waf,
+              rgv587: /RGV587|FAIL_SYS_USER_VALIDATE|tmd_____\/punish|x5sec/i.test(
+                String(completion.bodyPreview ?? ""),
+              ),
+              sseStarted: completion.sseStarted,
+              sseDone: completion.sseDone,
+              outputLength: completion.outputLength,
+              text: String(completion.text ?? "").slice(0, 120),
+              preview: completion.bodyPreview,
+            }
+          : null,
+      };
+    };
+    const baxia = await direct.getBaxiaMaterial();
+    const diag = minter.getLastBaxiaMintDiagnostics();
+    const first = await runOnce(baxia);
+    // Exactly one WAF retry with fresh material. No loops.
+    let retryAttempted = false;
+    let retryWithFresh = false;
+    let retryResult: unknown = null;
+    const comp0 = first.completion as Record<string, unknown> | null;
+    if (comp0 && (comp0.waf === true || comp0.rgv587 === true)) {
+      retryAttempted = true;
+      minter.invalidateQwenBaxiaMaterial();
+      const fresh = await direct.getBaxiaMaterial(undefined, { force: true });
+      retryWithFresh = fresh !== null;
+      retryResult = await runOnce(fresh);
+    }
+    return c.json({
+      ok: Boolean((first.create as Record<string, unknown>)?.ok),
+      baxiaReady: Boolean(baxia && baxia.fromSdk),
+      baxiaUidLen: baxia?.bxUmidToken?.length ?? 0,
+      baxiaFyLen: baxia?.bxUa?.length ?? 0,
+      baxiaV: baxia?.bxV ?? null,
+      baxiaCookieLen: baxia?.cookie?.length ?? 0,
+      baxiaHasTokenCookie: /(?:^|;\s*)token=/.test(String(baxia?.cookie ?? "")),
+      baxiaMintMs: diag?.mintMs ?? null,
+      baxiaReason: diag?.reason ?? null,
+      version: "0.2.83",
+      first,
+      retryAttempted,
+      retryWithFresh,
+      retryResult,
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-direct-waf", async (c) => {
+  // DIAGNOSTIC: create-chat -> completion -> (one) WAF recovery -> fresh
+  // material -> NEW chat -> completion. mode=guest uses no account cookie.
+  // No /v1 traffic, no hot-path integration, no composer.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const mode = c.req.query("mode") === "guest" ? "guest" : "account";
+  const model = c.req.query("model") || "qwen3.8-max";
+  const prompt = c.req.query("prompt") || "Responde únicamente: OK";
+  const version = c.req.query("version") === "0.2.83" ? "0.2.83" : null;
+  try {
+    const direct = await import("../services/qwen-direct-transport.js");
+    const minter = await import("../services/qwen-baxia-minter.js");
+    const baxia = await direct.getBaxiaMaterial();
+    let cookie = baxia?.cookie ?? "";
+    // Account mode needs BOTH the live cookie jar and the account JWT: the jar
+    // alone is the guest credential and yields {"code":"Unauthorized"}.
+    let bearerToken: string | null = null;
+    if (mode === "account") {
+      const { getQwenHeaders } = await import("../services/auth-playwright.js");
+      const { headers } = await getQwenHeaders(false, id);
+      cookie = headers["cookie"] || "";
+      const auth = headers["authorization"] || "";
+      bearerToken = auth.replace(/^Bearer\s+/i, "") || null;
+    }
+    const ver = version || (mode === "guest" ? "0.2.83" : await direct.getFrontendVersion());
+    const r = await direct.directChatWithWafRecovery({
+      accountId: id,
+      cookie,
+      bearerToken,
+      model,
+      content: prompt,
+      chatMode: mode === "guest" ? "guest" : "normal",
+      chatType: "t2t",
+      version: ver,
+      baxia,
+      timeoutMs: 90_000,
+    });
+    const summarize = (leg: Record<string, unknown> | null) =>
+      leg
+        ? {
+            create: (leg.create as Record<string, unknown>) ?? null,
+            completion: (leg.completion as Record<string, unknown> | null)
+              ? {
+                  ok: (leg.completion as Record<string, unknown>).ok,
+                  http: (leg.completion as Record<string, unknown>).httpStatus,
+                  ct: (leg.completion as Record<string, unknown>).contentType,
+                  waf: (leg.completion as Record<string, unknown>).waf,
+                  punishUrl: (leg.completion as Record<string, unknown>).punishUrl,
+                  sseStarted: (leg.completion as Record<string, unknown>).sseStarted,
+                  sseDone: (leg.completion as Record<string, unknown>).sseDone,
+                  outputLength: (leg.completion as Record<string, unknown>).outputLength,
+                  text: String((leg.completion as Record<string, unknown>).text ?? "")
+                    .slice(0, 120),
+                }
+              : null,
+          }
+        : null;
+    return c.json({
+      ok: Boolean((r.second?.completion as Record<string, unknown> | null)?.ok),
+      mode,
+      accountId: id,
+      version: ver,
+      baxiaReady: Boolean(baxia && baxia.fromSdk),
+      baxiaMintMs: minter.getLastBaxiaMintDiagnostics()?.mintMs ?? null,
+      first: summarize(r.first as never),
+      recoveryAttempted: r.recoveryAttempted,
+      recoverySuccess: r.recoverySuccess,
+      recoveryDurationMs: r.recoveryDurationMs,
+      recoverySkipReason: r.recoverySkipReason,
+      postBaxiaReady: r.postBaxiaReady,
+      second: summarize(r.second as never),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-direct-transport", async (c) => {
+  // DIAGNOSTIC: isolated direct-web smoke on ONE account. Reads the real Baxia
+  // anti-bot material from the live page, then does create-chat + completion as
+  // plain HTTP. No composer, no captureQwenHeaders, no /v1 traffic.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const model = c.req.query("model") || "qwen3.8-max";
+  const prompt = c.req.query("prompt") || "Responde únicamente: OK";
+  try {
+    const direct = await import("../services/qwen-direct-transport.js");
+    const { getQwenHeaders } = await import("../services/auth-playwright.js");
+    const { headers } = await getQwenHeaders(false, id);
+    const cookie = headers["cookie"] || "";
+    const baxia = await direct.getBaxiaMaterial(id);
+    const version = await direct.getFrontendVersion();
+    const created = await direct.directCreateChat({
+      cookie,
+      model,
+      baxia,
+      version,
+    });
+    let completion: Record<string, unknown> | null = null;
+    if (created.ok && created.chatId) {
+      completion = { ...(await direct.directCompletion({
+        cookie,
+        chatId: created.chatId,
+        model,
+        content: prompt,
+        baxia,
+        version,
+        timeoutMs: 90_000,
+      })) };
+    }
+    return c.json({
+      ok: Boolean(completion && completion.ok),
+      accountId: id,
+      model,
+      authReady: Boolean(cookie && /(?:^|;\s*)token=/.test(cookie)),
+      baxiaReady: Boolean(baxia && baxia.fromSdk),
+      baxiaFromSdk: baxia ? baxia.fromSdk : false,
+      baxiaV: baxia ? baxia.bxV : null,
+      baxiaDiag: direct.getLastBaxiaProbe(),
+      version,
+      createChat: {
+        httpStatus: created.httpStatus,
+        appSuccess: created.appSuccess,
+        ok: created.ok,
+        chatId: created.chatId,
+        waf: created.waf,
+        riskControlled: created.riskControlled,
+        contentType: created.contentType,
+        errorCode: created.errorCode,
+        bodyPreview: created.bodyPreview,
+      },
+      completion: completion
+        ? {
+            ok: completion.ok,
+            httpStatus: completion.httpStatus,
+            contentType: completion.contentType,
+            waf: completion.waf,
+            sseStarted: completion.sseStarted,
+            sseDone: completion.sseDone,
+            outputLength: completion.outputLength,
+            text: completion.text,
+            bodyPreview: completion.bodyPreview,
+          }
+        : null,
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-composer", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: runs ONE real captureQwenHeaders while passively
+  // observing the composer (DOM events + generic request observer). It does not
+  // modify the capture path. No /v1 traffic, no rotation, no cooldown changes.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const timeoutMs = Math.max(
+    5_000,
+    Math.min(120_000, Number.parseInt(c.req.query("timeoutMs") ?? "60000", 10) || 60_000),
+  );
+  try {
+    const { probeComposerDuringCapture } = await import("../services/composer-probe.js");
+    const { captureQwenHeaders } = await import("../services/playwright.js");
+    const result = await probeComposerDuringCapture(id, () =>
+      captureQwenHeaders(id, undefined, timeoutMs),
+    );
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-settings-update", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: A/B of POST /api/v2/users/user/settings/update in
+  // ONE already-authenticated page/context. No re-login, no refresh, no context
+  // recreation, no /v1 traffic, no cooldown or rotation changes. Sanitized only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  const variants = (c.req.query("variants") ?? "proxy,spa")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  try {
+    const { probeSettingsUpdateAB } = await import("../services/qwen.js");
+    const results = [];
+    for (const v of variants) {
+      try {
+        results.push(
+          await probeSettingsUpdateAB(
+            id,
+            v as never,
+            c.req.query("instruction") ?? "",
+          ),
+        );
+      } catch (err) {
+        results.push({
+          variant: v,
+          status: 0,
+          appSuccess: null,
+          appUnauthorized: false,
+          topKeys: [],
+          errorCode: null,
+          request: null,
+          error: err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160),
+        });
+      }
+    }
+    return c.json({ ok: true, accountId: id, results });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.post("/v1/accounts/:id/probe-chat-shaping", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC: fresh loginViaApi, then baseline minimal
+  // create-chat, single-header additions (stop at first failure), group
+  // tests, and settings/update pre/post comparison — all on the SAME live
+  // page/context. No re-auth, no refresh, no cooldown/DB changes, no
+  // rotation, no context recreation. Sanitized results only.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { probeChatShaping } = await import("../services/qwen.js");
+    const result = await probeChatShaping(id);
+    return c.json({ ok: true, accountId: id, ...result });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});
+
+dashboardApp.get("/v1/accounts/:id/session-trace", async (c) => {
+  // EXPERIMENTAL DIAGNOSTIC READ: sanitized temporal session-transition
+  // trace (ring + baseline + first-failure window). No traffic, no writes.
+  const error = verifyApiKey(c);
+  if (error) return error;
+  const id = c.req.param("id");
+  try {
+    const { getSessionTrace } = await import("../services/session-tracer.js");
+    return c.json({ ok: true, ...getSessionTrace() });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message.slice(0, 150) : String(err).slice(0, 150) },
+      500,
+    );
+  }
+});

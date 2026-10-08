@@ -1,5 +1,18 @@
 import "./runtime-compat.ts";
+import fs from "node:fs";
+import dotenv from "dotenv";
 import { z } from "zod";
+import { getEnvFilePath, isRunningUnderNodeTest } from "./paths.ts";
+
+// Ensure .env is loaded before parsing schema across CLI, TUI, and server modes
+if (!isRunningUnderNodeTest()) {
+  const envPath = getEnvFilePath();
+  if (fs.existsSync(envPath)) {
+    dotenv.config({ path: envPath, quiet: true });
+  } else {
+    dotenv.config({ quiet: true });
+  }
+}
 
 const envSchema = z
   .object({
@@ -66,6 +79,11 @@ const envSchema = z
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
+    /**
+     * Direct Web Transport feature flag. Opt-in: default "false" keeps the
+     * legacy browser transport as the production chat path.
+     */
+    QWEN_DIRECT_WEB_TRANSPORT: z.string().default("false"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
     CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
@@ -81,7 +99,7 @@ const envSchema = z
     CHAT_TIMEOUT: z.string().default("180000"),
     NAVIGATION_TIMEOUT: z.string().default("60000"),
     PAGE_TIMEOUT: z.string().default("60000"),
-    HEADERS_TIMEOUT: z.string().default("90000"),
+    HEADERS_TIMEOUT: z.string().default("120000"),
     TIME_TO_FIRST_BYTE: z.string().default("60000"),
     IDLE_STREAM_TIMEOUT: z.string().default("60000"),
     // Deadline for the FIRST upstream chunk on thinking models (the reasoning
@@ -161,7 +179,7 @@ const envSchema = z
 
 
     QWEN_BASE_URL: z.string().default("https://chat.qwen.ai"),
-    QWEN_CHAT_POOL_SIZE: z.string().default("1"),
+    QWEN_CHAT_POOL_SIZE: z.string().default("0"),
     QWEN_CHAT_POOL_MODELS: z.string().default("qwen3.7-plus"),
     QWEN_PERSONALIZATION_FROM_REQUEST: z.string().default("true"),
     QWEN_PERSONALIZATION_VERIFY_GET: z.string().default("true"),
@@ -371,6 +389,14 @@ export const config = {
       env.QWEN_PERSONALIZATION_FROM_REQUEST === "true",
     personalizationVerifyGet: env.QWEN_PERSONALIZATION_VERIFY_GET !== "false",
     /** "thread" (reuse upstream chat) or "temp" (new ephemeral chat per request). */
+    /**
+     * Direct Web Transport: account-mode chats/new + chat/completions issued as
+     * plain HTTP carrying the account Bearer JWT and the live cookie jar
+     * (including the `x5sec` clearance produced by a human solve). DEFAULT
+     * FALSE — the legacy browser transport remains the production path until
+     * this is explicitly enabled.
+     */
+    directWebTransport: env.QWEN_DIRECT_WEB_TRANSPORT === "true",
     /** When true, all requests (personalization, models, media, chat) route exclusively through the browser page (no direct Node fetch). */
     browserOnlyFetch: env.QWEN_BROWSER_ONLY_FETCH !== "false",
     mapOpenAiModels: env.QWEN_MAP_OPENAI_MODELS !== "false",

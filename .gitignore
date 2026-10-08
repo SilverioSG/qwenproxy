@@ -18,6 +18,9 @@ data-test/
 accounts.json
 accounts.json.bak
 
+# Node diagnostic reports (generated on OOM/fatal errors, runtime artifacts)
+report.*.json
+
 # Logs
 *.log
 log*.txt

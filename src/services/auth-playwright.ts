@@ -58,6 +58,25 @@ async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
   }
 }
 
+/**
+ * Central pre-request freshness gate. Every credential path (chat streaming
+ * and non-streaming, responses/anthropic via chat loopback, upload, models,
+ * personalization) flows through getBasicHeaders/getQwenHeaders, so one
+ * hook here covers them all with no redundant per-route wiring.
+ *
+ * No-browser, never throws, ~1 SQLite SELECT when the token is valid. A
+ * renewal only hits the network when the persisted access token is expired
+ * or inside the refresh margin — and then it is single-flight per account.
+ */
+async function ensurePersistedSessionFresh(accountId: string): Promise<void> {
+  try {
+    const { ensureAccountFresh } = await import("./qwen-token-refresh.ts");
+    await ensureAccountFresh(accountId);
+  } catch {
+    // Freshness is best-effort: the browser path below is the fallback.
+  }
+}
+
 export async function getBasicHeaders(accountId?: string): Promise<{
   cookie: string;
   userAgent: string;
@@ -90,40 +109,18 @@ export async function getBasicHeaders(accountId?: string): Promise<{
     );
   }
 
+  await ensurePersistedSessionFresh(resolvedAccountId);
   await ensurePlaywrightInitialized(resolvedAccountId);
   return getPlaywrightBasicHeaders(resolvedAccountId);
 }
 
-export function isTokenExpiringSoon(
-  cookie: string,
-  minutesBeforeExpiry = 5,
-): boolean {
-  const tokenMatch = cookie.match(/token=([^;]+)/);
-  if (!tokenMatch) return false;
-
-  try {
-    const token = decodeURIComponent(tokenMatch[1]);
-    const segments = token.split(".");
-    // Some Qwen deployments use opaque cookies. Treating those as expired
-    // forces expensive header capture on every personalization request.
-    if (segments.length !== 3 || !segments[1]) return false;
-
-    const payloadJson = Buffer.from(segments[1], "base64url").toString("utf-8");
-    const payload = JSON.parse(payloadJson);
-    const exp = payload.exp;
-    if (typeof exp !== "number" || !Number.isFinite(exp)) return false;
-
-    const nowSec = Math.floor(Date.now() / 1000);
-    const thresholdSec = minutesBeforeExpiry * 60;
-    return exp - nowSec < thresholdSec;
-  } catch {
-    return false;
-  }
-}
+import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
+export { parseJwtExpiry, isTokenExpiringSoon };
 
 export async function getQwenHeaders(
   forceNew = false,
   accountId?: string,
+  forceReauth = false,
 ): Promise<HeaderResult> {
   if (isAuthMockEnabled()) {
     const basic = await getBasicHeaders(accountId);
@@ -148,10 +145,11 @@ export async function getQwenHeaders(
     );
   }
 
+  await ensurePersistedSessionFresh(resolvedAccountId);
   await ensurePlaywrightInitialized(resolvedAccountId);
 
-  if (forceNew) {
-    await refreshHeaders(resolvedAccountId);
+  if (forceNew || forceReauth) {
+    await refreshHeaders(resolvedAccountId, config.timeouts.headers, forceReauth);
   }
 
   const basic = await getPlaywrightBasicHeaders(resolvedAccountId);

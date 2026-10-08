@@ -56,6 +56,7 @@ function autoInstallPlaywrightChromium(): void {
   } catch {}
 }
 import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
+import { traceSessionEvent } from "./session-tracer.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
 // only depends on config/logger, so playwright -> account-concurrency stays
 // acyclic, while the reverse direction would drag the browser layer into core.
@@ -96,6 +97,10 @@ import {
   withCaptureStage,
 } from "./capture-probe.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
+import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
+// Static import is cycle-free: qwen-token-refresh only touches playwright via
+// dynamic import (best-effort cache push after a no-browser refresh).
+import { getJarPair, ensureAccountFresh } from "./qwen-token-refresh.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
 const contextInitHooks: ContextInitHook[] = [];
@@ -332,11 +337,17 @@ export async function saveStorageState(
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "storagestate-save-pre").catch(() => {}))
+      .catch(() => {});
     await withTimeout(
       context.storageState({ path: stateFile }),
       timeoutMs,
       `storageState timed out after ${timeoutMs}ms`,
     );
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "storagestate-save-post").catch(() => {}))
+      .catch(() => {});
   } catch (error) {
     if (!isPlaywrightAlreadyClosedError(error)) {
       console.warn(
@@ -374,41 +385,547 @@ async function hasValidAuthCookie(context: BrowserContext, timeoutMs = 3_000): P
  * caller re-authenticates or reloads, which is strictly better than burning the
  * whole header budget waiting on a frozen page.
  */
+export type PageLoginProbeReason =
+  | "no-page"
+  | "page-closed"
+  | "auth-url"
+  | "no-evaluate"
+  | "logged-out-marker"
+  | "evaluate-error"
+  | "context-destroyed"
+  | "auths-status"
+  | "auths-schema"
+  | "settings-401"
+  | "settings-403"
+  | "settings-revoked"
+  | "refresh-401"
+  | "refresh-403"
+  | "refresh-revoked"
+  | "timeout"
+  | "ok";
+
+export interface PageLoginProbe {
+  ok: boolean;
+  reason: PageLoginProbeReason;
+}
+
+/** In-page sanitized sample (hashed forms only; never a raw token). */
+interface InPageObservation {
+  label: string;
+  ts: number;
+  lsPresent: boolean;
+  lsHash: string | null;
+  lsLength: number;
+  marker: boolean;
+  cookiePresent: boolean;
+  cookieHash: string | null;
+  cookieLength: number;
+}
+
+/** In-page per-subrequest outcome (status/keys/booleans only). */
+interface InPageSubResult {
+  step: "auths" | "settings" | "refresh";
+  httpStatus: number;
+  appState: string;
+  appSuccess: boolean | null;
+  usable: boolean | null;
+  responseKeys: string[];
+  setCookieObserved: boolean | null;
+  lsWriteObserved: boolean | null;
+}
+
+export interface PageLoginProbeOptions {
+  /**
+   * Post-login validation mode. `/api/v1/auths/` and the cross-origin
+   * `auth.qwen.ai/api/v2/auths/refresh` both mint/rotate the session cookie;
+   * calling them right after installing a token makes the SPA drop
+   * `localStorage.token` and set `qwen_token_logged_out_marker`, i.e. the probe
+   * invalidates the state it is verifying. In this mode the probe performs the
+   * single non-mutating read (`/api/v2/users/user/settings`) only.
+   */
+  nonMutating?: boolean;
+}
+
+/** Sanitized session presence (hashed forms only). */
+interface SessionPresence {
+  lsPresent: boolean;
+  lsHash: string | null;
+  cookiePresent: boolean;
+  cookieHash: string | null;
+  marker: boolean;
+}
+
+/**
+ * Read localStorage.token presence, the context `token` cookie (httpOnly-safe,
+ * read from the jar) and the logged-out marker. Never mutates anything.
+ */
+async function readSessionPresence(page: Page): Promise<SessionPresence> {
+  const out: SessionPresence = {
+    lsPresent: false,
+    lsHash: null,
+    cookiePresent: false,
+    cookieHash: null,
+    marker: false,
+  };
+  try {
+    const v = (await page
+      .evaluate((): unknown => {
+        try {
+          const t = localStorage.getItem("token");
+          return {
+            token: typeof t === "string" && t.length > 0 ? t : null,
+            marker: Boolean(localStorage.getItem("qwen_token_logged_out_marker")),
+          };
+        } catch {
+          return null;
+        }
+      })
+      .catch(() => null)) as { token: string | null; marker: boolean } | null;
+    if (v && typeof v.token === "string" && v.token.length > 0) {
+      out.lsPresent = true;
+      out.lsHash = traceHashStr(v.token);
+    }
+    out.marker = v?.marker === true;
+  } catch {
+    // Best effort.
+  }
+  try {
+    const cookies = await page.context().cookies().catch(() => []);
+    const tok = cookies.find((c: { name: string; value: string }) => c.name === "token");
+    if (tok && tok.value) {
+      out.cookiePresent = true;
+      out.cookieHash = traceHashStr(tok.value);
+    }
+  } catch {
+    // Best effort.
+  }
+  return out;
+}
+
+interface PageLoginProbeOutcome {
+  reason: PageLoginProbeReason;
+  obs: InPageObservation[];
+  res: InPageSubResult[];
+}
+
+/** Budget added to the probe timeout by the traced deferred samples. */
+const ISLOGGEDIN_TRACE_OVERHEAD_MS = 1_500;
+
+/** Reverse lookup: which account owns this page (null when untracked). */
+function accountIdForPage(page: unknown): string | null {
+  if (!page) return null;
+  for (const [id, p] of accountPages) {
+    if (p === page) return id;
+  }
+  return null;
+}
+
+/**
+ * Authoritative login probe with a sanitized classification reason (no
+ * secrets, URLs, or bodies). Powers manual-verification diagnostics;
+ * isPageLoggedIn() below preserves its exact external contract.
+ */
+export async function probePageLoggedIn(
+  page: Page,
+  timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+  options: PageLoginProbeOptions = {},
+): Promise<PageLoginProbe> {
+  const nonMutating = options.nonMutating === true;
+  if (!page) return { ok: false, reason: "no-page" };
+  if (typeof page.isClosed === "function" && page.isClosed()) {
+    return { ok: false, reason: "page-closed" };
+  }
+  try {
+    const url = typeof page.url === "function" ? page.url() : "";
+    if (url.includes("/auth") || url.includes("/login")) {
+      return { ok: false, reason: "auth-url" };
+    }
+    if (typeof page.evaluate !== "function") return { ok: true, reason: "ok" };
+
+    // Observational instrumentation for the trace-target account only: samples
+    // the live page before/after each of the three subrequests (plus deferred
+    // +50ms/+250ms samples) so the post-login token rotation can be attributed
+    // to exactly one subrequest. Control flow is unchanged and every sample is
+    // gated on TRACE, so untraced accounts pay nothing.
+    const traceAccount = accountIdForPage(page);
+    const isTraced = traceAccount !== null;
+    const probe = page
+      .evaluate(
+        async (args: {
+          trace: boolean;
+          nonMutating: boolean;
+        }): Promise<PageLoginProbeOutcome> => {
+          const OBS: InPageObservation[] = [];
+          const RES: InPageSubResult[] = [];
+          const TRACE = args.trace === true;
+          // Post-login validation mode: /api/v1/auths/ and the cross-origin
+          // refresh both rotate the session cookie (see PageLoginProbeOptions),
+          // so they are skipped and settings becomes the only read.
+          const NON_MUTATING = args.nonMutating === true;
+          // NOTE: these helpers live in array literals on purpose. esbuild with
+          // keepNames rewrites named function expressions AND declarations to
+          // __name(f, "f"), and __name does not exist in the page (regression
+          // d3c7140). Array-literal elements are emitted verbatim.
+          const WAIT = [
+            async (ms: number): Promise<void> => {
+              if (!TRACE) return;
+              await new Promise((r) => setTimeout(r, ms));
+            },
+          ];
+          const SNAP = [
+            (label: string): void => {
+              if (!TRACE) return;
+              let tok: string | null = null;
+              try {
+                tok = localStorage.getItem("token");
+              } catch {}
+              let lsPresent = false;
+              let lsHash: string | null = null;
+              let lsLength = 0;
+              if (typeof tok === "string" && tok.length > 0) {
+                lsPresent = true;
+                lsLength = tok.length;
+                let h = 0x811c9dc5;
+                for (let i = 0; i < tok.length; i++) {
+                  h ^= tok.charCodeAt(i);
+                  h = Math.imul(h, 0x01000193);
+                }
+                lsHash = (h >>> 0).toString(16);
+              }
+              let marker = false;
+              try {
+                marker = Boolean(localStorage.getItem("qwen_token_logged_out_marker"));
+              } catch {}
+              let cookieValue = "";
+              try {
+                const parts = document.cookie ? document.cookie.split(";") : [];
+                for (let i = 0; i < parts.length; i++) {
+                  const kv = parts[i].trim();
+                  if (kv.indexOf("token=") === 0) {
+                    cookieValue = kv.slice(6);
+                    break;
+                  }
+                }
+              } catch {}
+              let cookieHash: string | null = null;
+              if (cookieValue.length > 0) {
+                let h = 0x811c9dc5;
+                for (let i = 0; i < cookieValue.length; i++) {
+                  h ^= cookieValue.charCodeAt(i);
+                  h = Math.imul(h, 0x01000193);
+                }
+                cookieHash = (h >>> 0).toString(16);
+              }
+              OBS.push({
+                label,
+                ts: Date.now(),
+                lsPresent,
+                lsHash,
+                lsLength,
+                marker,
+                cookiePresent: cookieHash !== null,
+                cookieHash,
+                cookieLength: cookieValue.length,
+              });
+            },
+          ];
+          try {
+            SNAP[0]("isloggedin-entry");
+            // The logged-out marker is SPA-local state that our own login
+            // sequence provokes (verified live: the reconcile lands ~250ms
+            // after the settings read, with the session still valid and the
+            // cookie intact). Failing closed on it turns a healthy post-login
+            // page into "did not restore an authenticated session", so in
+            // non-mutating mode the settings read is the authority instead.
+            if (!NON_MUTATING && localStorage.getItem("qwen_token_logged_out_marker")) {
+              return { reason: "logged-out-marker", obs: OBS, res: RES };
+            }
+
+            SNAP[0]("auths-pre");
+            const res = NON_MUTATING
+              ? null
+              : await fetch("/api/v1/auths/", { method: "GET" });
+            if (TRACE && res !== null) {
+              RES.push({
+                step: "auths",
+                httpStatus: res.status,
+                appState: res.status === 200 ? "http-200" : "http-non-200",
+                appSuccess: null,
+                usable: null,
+                responseKeys: [],
+                setCookieObserved: null,
+                lsWriteObserved: null,
+              });
+            }
+            SNAP[0]("auths-post");
+            await WAIT[0](50);
+            SNAP[0]("auths-post-50ms");
+            await WAIT[0](200);
+            SNAP[0]("auths-post-250ms");
+            if (res === null) {
+              // Non-mutating mode: skip the schema checks (there is no auths
+              // payload) and go straight to the single settings read below.
+            } else if (res.status !== 200) {
+              return { reason: "auths-status", obs: OBS, res: RES };
+            }
+            const json: any = res === null ? null : await res.json().catch(() => null);
+            if (TRACE) {
+              const last = RES[RES.length - 1];
+              if (last) {
+                last.responseKeys =
+                  json && typeof json === "object"
+                    ? Object.keys(json).slice(0, 12)
+                    : [];
+                last.appSuccess =
+                  json && typeof json === "object"
+                    ? json.success !== false
+                    : null;
+              }
+            }
+            if (res !== null && !json) return { reason: "auths-schema", obs: OBS, res: RES };
+            if (res !== null && json.success === false) {
+              return { reason: "auths-schema", obs: OBS, res: RES };
+            }
+            if (
+              res !== null &&
+              json &&
+              json.code !== 200 &&
+              json.code !== "200" &&
+              json.code !== 0 &&
+              json.code !== "0"
+            ) {
+              return { reason: "auths-schema", obs: OBS, res: RES };
+            }
+            if (res !== null) {
+              const user = json.data?.user || json.data || json;
+              if (!user || typeof user !== "object") {
+                return { reason: "auths-schema", obs: OBS, res: RES };
+              }
+              if (user.is_guest === true || user.is_login === false) {
+                return { reason: "auths-schema", obs: OBS, res: RES };
+              }
+              const hasIdentity = Boolean(
+                user.id ||
+                  user.user_id ||
+                  user.userId ||
+                  user.email ||
+                  user.name ||
+                  json.data?.token ||
+                  json.token ||
+                  user.token,
+              );
+              if (!hasIdentity) return { reason: "auths-schema", obs: OBS, res: RES };
+            }
+
+            // Check if Alibaba revoked the session upstream via same-origin settings
+            try {
+              SNAP[0]("settings-pre");
+              const settingsRes = await fetch("/api/v2/users/user/settings", {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(3000),
+              });
+              if (TRACE) {
+                RES.push({
+                  step: "settings",
+                  httpStatus: settingsRes.status,
+                  appState: settingsRes.status === 200 ? "http-200" : "http-non-200",
+                  appSuccess: null,
+                  usable: null,
+                  responseKeys: [],
+                  setCookieObserved: null,
+                  lsWriteObserved: null,
+                });
+              }
+              SNAP[0]("settings-post");
+              await WAIT[0](50);
+              SNAP[0]("settings-post-50ms");
+              await WAIT[0](200);
+              SNAP[0]("settings-post-250ms");
+              if (settingsRes.status === 401) {
+                return { reason: "settings-401", obs: OBS, res: RES };
+              }
+              if (settingsRes.status === 403) {
+                return { reason: "settings-403", obs: OBS, res: RES };
+              }
+              const settingsJson: any = await settingsRes.json().catch(() => null);
+              if (TRACE) {
+                const last = RES[RES.length - 1];
+                if (last) {
+                  last.responseKeys =
+                    settingsJson && typeof settingsJson === "object"
+                      ? Object.keys(settingsJson).slice(0, 12)
+                      : [];
+                  last.appSuccess =
+                    settingsJson && typeof settingsJson === "object"
+                      ? settingsJson.success !== false
+                      : null;
+                }
+              }
+              if (settingsJson && settingsJson.success === false) {
+                const code = String(settingsJson.data?.code || settingsJson.code || "").toLowerCase();
+                const details = String(settingsJson.data?.details || settingsJson.details || "").toLowerCase();
+                if (
+                  code.includes("unauthorized") ||
+                  details.includes("401") ||
+                  details.includes("revogado") ||
+                  details.includes("revoked")
+                ) {
+                  return { reason: "settings-revoked", obs: OBS, res: RES };
+                }
+              }
+            } catch {}
+
+            // Fallback cross-origin refresh probe (skipped in non-mutating
+            // mode: this endpoint mints a new session token).
+            try {
+              if (NON_MUTATING) {
+                SNAP[0]("isloggedin-exit");
+                return { reason: "ok", obs: OBS, res: RES };
+              }
+              SNAP[0]("refresh-pre");
+              const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(3000),
+              });
+              if (TRACE) {
+                RES.push({
+                  step: "refresh",
+                  httpStatus: refreshRes.status,
+                  appState: refreshRes.status === 200 ? "http-200" : "http-non-200",
+                  appSuccess: null,
+                  usable: null,
+                  responseKeys: [],
+                  setCookieObserved: null,
+                  lsWriteObserved: null,
+                });
+              }
+              SNAP[0]("refresh-post");
+              await WAIT[0](50);
+              SNAP[0]("refresh-post-50ms");
+              await WAIT[0](200);
+              SNAP[0]("refresh-post-250ms");
+              if (refreshRes.status === 200) {
+                const refreshJson: any = await refreshRes.json().catch(() => null);
+                if (TRACE) {
+                  const last = RES[RES.length - 1];
+                  if (last) {
+                    last.responseKeys =
+                      refreshJson && typeof refreshJson === "object"
+                        ? Object.keys(refreshJson).slice(0, 12)
+                        : [];
+                    last.appSuccess =
+                      refreshJson && typeof refreshJson === "object"
+                        ? refreshJson.success === true
+                        : null;
+                    const rd = refreshJson && refreshJson.data;
+                    last.usable = Boolean(
+                      refreshJson &&
+                        refreshJson.success === true &&
+                        rd &&
+                        typeof rd === "object" &&
+                        (typeof rd.access_token === "string" ||
+                          typeof rd.token === "string"),
+                    );
+                  }
+                }
+                if (refreshJson && refreshJson.success === false) {
+                  const code = refreshJson.data?.code || refreshJson.code;
+                  const details = String(refreshJson.data?.details || "");
+                  if (code === "Unauthorized" || details.includes("revogado") || details.includes("revoked")) {
+                    return { reason: "refresh-revoked", obs: OBS, res: RES };
+                  }
+                }
+              } else if (refreshRes.status === 401) {
+                return { reason: "refresh-401", obs: OBS, res: RES };
+              } else if (refreshRes.status === 403) {
+                return { reason: "refresh-403", obs: OBS, res: RES };
+              }
+            } catch {}
+
+            SNAP[0]("isloggedin-exit");
+            await WAIT[0](50);
+            SNAP[0]("isloggedin-exit-50ms");
+            await WAIT[0](200);
+            SNAP[0]("isloggedin-exit-250ms");
+            // If an authenticated user object is confirmed with a real user identity,
+            // the session is 100% valid and verified by upstream.
+            return { reason: "ok", obs: OBS, res: RES };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (
+              msg.includes("destroyed") ||
+              msg.includes("closed") ||
+              msg.includes("crashed")
+            ) {
+              return { reason: "context-destroyed", obs: OBS, res: RES };
+            }
+            return { reason: "evaluate-error", obs: OBS, res: RES };
+          }
+        },
+        { trace: isTraced, nonMutating },
+      )
+      .catch(
+        (): PageLoginProbeOutcome => ({ reason: "evaluate-error", obs: [], res: [] }),
+      )
+      // Tolerate a bare reason string (the pre-instrumentation in-page payload)
+      // so the previous internal contract keeps working unchanged.
+      .then(
+        (r: PageLoginProbeOutcome | PageLoginProbeReason): PageLoginProbeOutcome =>
+          typeof r === "string" ? { reason: r, obs: [], res: [] } : r,
+      );
+
+    const outcome = await withTimeout(
+      probe,
+      Math.max(1_000, timeoutMs) + (isTraced ? ISLOGGEDIN_TRACE_OVERHEAD_MS : 0),
+      `session probe timed out after ${timeoutMs}ms`,
+    ).catch(
+      (): PageLoginProbeOutcome => ({ reason: "timeout", obs: [], res: [] }),
+    );
+    if (isTraced) {
+      try {
+        const { ingestIsLoggedInTrace } = await import("./session-tracer.ts");
+        let currentUrl: string | null = null;
+        try {
+          currentUrl = typeof page.url === "function" ? page.url() : null;
+        } catch {
+          currentUrl = null;
+        }
+        let ctx: object | null = null;
+        try {
+          ctx =
+            (page as { context?: () => unknown }).context?.() as object | null ??
+            null;
+        } catch {
+          ctx = null;
+        }
+        ingestIsLoggedInTrace(traceAccount, outcome.obs, outcome.res, outcome.reason, {
+          context: ctx,
+          page: page as unknown as object,
+          url: currentUrl,
+        });
+      } catch {
+        // Tracing must never break the login probe.
+      }
+    }
+    return { ok: outcome.reason === "ok", reason: outcome.reason };
+  } catch {
+    return { ok: false, reason: "evaluate-error" };
+  }
+}
+
 export async function isPageLoggedIn(
   page: Page,
   timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+  options: PageLoginProbeOptions = {},
 ): Promise<boolean> {
-  if (!page) return false;
-  if (typeof page.isClosed === "function" && page.isClosed()) return false;
-  try {
-    const url = typeof page.url === "function" ? page.url() : "";
-    if (url.includes("/auth") || url.includes("/login")) return false;
-    if (typeof page.evaluate !== "function") return true;
-
-    const probe = page
-      .evaluate(async () => {
-        try {
-          const res = await fetch("/api/v1/auths/", { method: "GET" });
-          return res.status === 200;
-        } catch {
-          return false;
-        }
-      })
-      .catch(() => false);
-
-    return await withTimeout(
-      probe,
-      Math.max(1_000, timeoutMs),
-      `session probe timed out after ${timeoutMs}ms`,
-    );
-  } catch {
-    return false;
-  }
+  return (await probePageLoggedIn(page, timeoutMs, options)).ok;
 }
 
 export async function getOrLaunchSharedBrowser(
   browserType: BrowserType = "chromium",
-  headless = true,
+  headless = config.playwright.headless,
 ): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) {
     return sharedBrowser;
@@ -482,10 +999,10 @@ interface AccountHeaderCache {
 }
 
 const headerCaches = new Map<string, AccountHeaderCache>();
-// Real TTL measured from Qwen: auth token = 30 days, shortest cookie (acw_tc) = 24 min.
-// 20 min is safe: under the 24-min acw_tc, and bx-ua expiry is handled by 403 retry.
-const HEADER_CACHE_TTL = 20 * 60 * 1000; // 20 minutes
-const HEADER_REFRESH_THRESHOLD = 0.8; // Background refresh at 80% of TTL (16 min)
+// Real TTL measured from Qwen: auth token = 30 days. Anti-bot tokens remain stable
+// across the browser session; cookies are dynamically updated from the browser context.
+const HEADER_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const HEADER_REFRESH_THRESHOLD = 0.8; // Background refresh at 80% of TTL
 const COOKIE_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 const cookieCaches = new Map<string, { cookie: string; timestamp: number }>();
 const lastAccountActivity = new Map<string, number>();
@@ -518,7 +1035,7 @@ const HEADER_CAPTURE_TRIGGER_GRACE_MS = 15_000;
  * send. Fail it fast and let the retry loop reload + re-send against the warm
  * SDK instead of stalling the boot for the full 15s.
  */
-const FIRST_TRIGGER_GRACE_MS = 3_000;
+const FIRST_TRIGGER_GRACE_MS = 8_000;
 /**
  * Sends (the initial one plus re-triggers) header capture may spend on getting a
  * completion request that actually carries the bx headers. The in-page SDK can
@@ -545,15 +1062,42 @@ const CHAT_INPUT_ACTION_TIMEOUT_MS = 10_000;
  * account for five minutes.
  */
 async function clearVisibleChallenge(page: Page): Promise<void> {
-  if (!config.captcha.enabled) return;
-  // waitForMs 0: a single detection pass, so the common no-challenge case adds
-  // no measurable cost to header capture.
-  await solveBaxiaCaptcha(page, {
-    waitForMs: 0,
-    maxAttempts: config.captcha.maxAttempts,
-    retryDelayMs: config.captcha.retryDelayMs,
-    settleMs: config.captcha.settleMs,
-  }).catch(() => false);
+  if (page.isClosed()) return;
+  // 1. Solve slider puzzle captcha if present
+  if (config.captcha.enabled) {
+    await solveBaxiaCaptcha(page, {
+      waitForMs: 0,
+      maxAttempts: config.captcha.maxAttempts,
+      retryDelayMs: config.captcha.retryDelayMs,
+      settleMs: config.captcha.settleMs,
+    }).catch(() => false);
+  }
+
+  // 2. Dismiss any overlay modals (Welcome to Qwen, Terms/Consent, Whats New, etc.)
+  // that can block the chat textarea or send button
+  try {
+    const modalCloseSelectors = [
+      ".ant-modal-close",
+      ".ant-modal-close-x",
+      "button.ant-modal-close",
+      "button[aria-label*='Close' i]",
+      "button[aria-label*='Fechar' i]",
+      ".index-module__whats-new-modal-close",
+      "button:has-text('Cancel')",
+      "button:has-text('Cancelar')",
+      "button:has-text('I understand')",
+      "button:has-text('Entendi')",
+      "button:has-text('OK')",
+    ];
+    for (const sel of modalCloseSelectors) {
+      if (page.isClosed()) return;
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 150 }).catch(() => false)) {
+        await btn.click({ timeout: 500 }).catch(() => {});
+        await sleep(200);
+      }
+    }
+  } catch {}
 }
 
 function getErrorMessage(error: unknown): string {
@@ -1009,8 +1553,176 @@ export function getStealthScript(profile: FingerprintProfile): string {
           spoofedFunctions.add(window.performance.getEntriesByType);
         }
       } catch(e) {}
+
+      // --- Auto-resolve birthday compliance & eliminate false logout markers ---
+      try {
+        localStorage.removeItem("qwen_token_logged_out_marker");
+        const b = localStorage.getItem("qwen_account_birthday");
+        if (b) {
+          try {
+            const parsed = JSON.parse(b);
+            if (!parsed.birthday) {
+              parsed.birthday = "1995-06-15";
+              localStorage.setItem("qwen_account_birthday", JSON.stringify(parsed));
+            }
+          } catch {}
+        }
+      } catch(e) {}
     })();
   `;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC: read-only copy of the cached header set for an
+ * account (values stay server-side; probes log names only).
+ */
+export function getCachedQwenHeaders(
+  accountId: string,
+): Record<string, string> | null {
+  const cache = headerCaches.get(accountId);
+  if (!cache || !cache.headers) return null;
+  return { ...cache.headers };
+}
+
+/**
+ * Push a freshly-refreshed jar (no-browser refresh) into the in-memory
+ * header/cookie caches so the next request serves the new token instead of
+ * healing through a 401. Memory-only: persistence is the caller's job.
+ * No-op when the account has no cache entry (cold account).
+ */
+export function updateCachedCookieHeader(
+  accountId: string,
+  cookie: string,
+): boolean {
+  if (!accountId || !cookie) return false;
+  let updated = false;
+  const cache = headerCaches.get(accountId);
+  if (cache?.headers && hasRequiredQwenHeaders(cache.headers)) {
+    cache.headers["cookie"] = cookie;
+    updated = true;
+  }
+  if (cookieCaches.has(accountId)) {
+    cookieCaches.set(accountId, { cookie, timestamp: Date.now() });
+    updated = true;
+  }
+  return updated;
+}
+
+/**
+ * Read-only snapshot of an account's LIVE cookie jar (already-open context
+ * only). Non-mutating IPC: no navigation, no reload, no profile open, no
+ * Chromium launch — null when the account has no live page. This is NOT a
+ * cold profile read (which destroys undecryptable cookie DBs); it only
+ * observes a context the service itself keeps warm.
+ *
+ * The live jar is the freshest refresh material: in-page heals rotate
+ * cookies without persisting to SQLite immediately, so the persisted jar can
+ * lag the live one. Preferring live material when available is what keeps a
+ * proactive refresh from sending a superseded refresh_token.
+ */
+export async function peekLiveCookieJar(
+  accountId: string,
+): Promise<{ jar: string; userAgent: string } | null> {
+  try {
+    const page = accountPages.get(accountId);
+    if (!page || page.isClosed()) return null;
+    const cookies = await page.context().cookies();
+    if (!cookies || cookies.length === 0) return null;
+    const applicable = cookies.filter((c) => {
+      const d = String(c.domain || "").replace(/^\./, "");
+      return (
+        d === "qwen.ai" ||
+        d.endsWith(".qwen.ai") ||
+        d === "chat.qwen.ai" ||
+        d.endsWith(".alicdn.com") ||
+        d.endsWith(".aliyuncs.com") ||
+        d.endsWith(".taobao.com") ||
+        d.endsWith(".mmstat.com")
+      );
+    });
+    if (applicable.length === 0) return null;
+    const jar = applicable.map((c) => `${c.name}=${c.value}`).join("; ");
+    let userAgent = "";
+    try {
+      userAgent = cachedUserAgents.get(accountId) || "";
+      if (!userAgent) {
+        userAgent =
+          (await page.evaluate(() => navigator.userAgent).catch(() => "")) ||
+          "";
+      }
+    } catch {
+      // UA is best-effort; the caller falls back to config.
+    }
+    return { jar, userAgent };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Propagate a no-browser-refreshed jar into the LIVE browser context
+ * (continued): rewrite the context cookies from the jar, align
+ * localStorage.token with the new access token, and refresh the in-memory
+ * caches. Without this the hot-account fast path would keep serving the
+ * stale live cookies until the next reactive heal.
+ *
+ * Strictly additive and best-effort: no navigation, no reload, no profile
+ * open, no login — and any failure is swallowed, leaving the persisted
+ * session (already fresh) plus the existing reactive paths as the fallback.
+ * Never throws.
+ */
+export async function pushRefreshedJarToLiveContext(
+  accountId: string,
+  jar: string,
+): Promise<boolean> {
+  if (!accountId || !jar) return false;
+  try {
+    const page = accountPages.get(accountId);
+    if (!page || page.isClosed()) {
+      updateCachedCookieHeader(accountId, jar);
+      return false;
+    }
+    try {
+      const forBrowser = parseCookiesForBrowser(jar);
+      if (forBrowser.length > 0) {
+        await page.context().addCookies(forBrowser as never).catch(() => {});
+      }
+    } catch {
+      // Cookie push is optional; the cache update below still helps.
+    }
+    try {
+      const token = getJarPair(jar, "token");
+      if (token) {
+        await page
+          .evaluate((t: string) => {
+            try {
+              localStorage.setItem("token", t);
+            } catch {}
+          }, token)
+          .catch(() => {});
+      }
+    } catch {
+      // localStorage alignment is optional.
+    }
+    updateCachedCookieHeader(accountId, jar);
+    cookieCaches.delete(accountId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getAccountPageSnapshotHandles(accountId: string): {
+  page: unknown;
+  context: unknown;
+} | null {
+  const page = accountPages.get(accountId);
+  if (!page || page.isClosed()) return null;
+  try {
+    return { page, context: page.context() };
+  } catch {
+    return null;
+  }
 }
 
 function getHeaderCache(accountId: string): AccountHeaderCache {
@@ -1085,6 +1797,9 @@ async function tryLightweightCookieRefresh(
     );
     const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     cookieCaches.set(accountId, { cookie: cookieStr, timestamp: Date.now() });
+    if (cache && cache.headers) {
+      cache.headers["cookie"] = cookieStr;
+    }
     return true;
   } catch {
     return false;
@@ -1093,24 +1808,32 @@ async function tryLightweightCookieRefresh(
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function getCookies(accountId: string): Promise<string> {
+export async function getCookies(accountId: string, forceFresh = false): Promise<string> {
   const now = Date.now();
-  const cached = cookieCaches.get(accountId);
-  if (cached && now - cached.timestamp < COOKIE_CACHE_TTL) {
-    return cached.cookie;
+  if (!forceFresh) {
+    const cached = cookieCaches.get(accountId);
+    if (cached && now - cached.timestamp < COOKIE_CACHE_TTL) {
+      return cached.cookie;
+    }
   }
 
   const page = accountPages.get(accountId);
-  if (!page) return "";
+  if (!page || typeof page.context !== "function") return "";
 
-  const cookies = await withTimeout(
-    page.context().cookies(),
-    config.timeouts.page,
-    `Cookie retrieval timed out for ${accountId}`,
-  );
-  const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-  cookieCaches.set(accountId, { cookie: cookieStr, timestamp: now });
-  return cookieStr;
+  try {
+    const context = page.context();
+    if (!context || typeof context.cookies !== "function") return "";
+    const cookies = await withTimeout(
+      context.cookies(),
+      config.timeouts.page,
+      `Cookie retrieval timed out for ${accountId}`,
+    );
+    const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    cookieCaches.set(accountId, { cookie: cookieStr, timestamp: now });
+    return cookieStr;
+  } catch {
+    return "";
+  }
 }
 
 export async function getBasicHeaders(accountId: string): Promise<{
@@ -1235,8 +1958,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       const cookieSnapshot = await getCookieSnapshot(accountId);
       if (
         cookieSnapshot &&
-        isAuthTokenValidFrom(cookieSnapshot) &&
-        isShortestCookieValidFrom(cookieSnapshot)
+        isAuthTokenValidFrom(cookieSnapshot)
       ) {
         // Token is still valid - just refresh cookies, keep cached headers
         const cookie = cookieSnapshot
@@ -1285,6 +2007,61 @@ export async function getBasicHeaders(accountId: string): Promise<{
     }
 
     if (!hasRequiredQwenHeaders(cache.headers)) {
+      try {
+        const { getValidAuthSession } = await import("../core/database.ts");
+        const persisted = getValidAuthSession(accountId);
+        if (persisted) {
+          const restoredHeaders: Record<string, string> = {
+            cookie: persisted.cookie,
+            "user-agent": persisted.userAgent,
+            "bx-v": persisted.bxV,
+            "bx-ua": persisted.bxUa,
+            "bx-umidtoken": persisted.bxUmidtoken,
+            ...(persisted.secChUa ? { "sec-ch-ua": persisted.secChUa } : {}),
+            ...(persisted.secChUaMobile ? { "sec-ch-ua-mobile": persisted.secChUaMobile } : {}),
+            ...(persisted.secChUaPlatform ? { "sec-ch-ua-platform": persisted.secChUaPlatform } : {}),
+            ...(persisted.version ? { version: persisted.version } : {}),
+          };
+          if (hasRequiredQwenHeaders(restoredHeaders) && hasValidAuthToken(restoredHeaders.cookie)) {
+            const page = accountPages.get(accountId);
+            if (page && !page.isClosed()) {
+              try {
+                const cookiesToAdd = parseCookiesForBrowser(restoredHeaders.cookie);
+                if (cookiesToAdd.length > 0) {
+                  await page.context().addCookies(cookiesToAdd).catch(() => {});
+                }
+                const tokenMatch = restoredHeaders.cookie.match(/(?:^|;\s*)token=([^;]+)/);
+                if (tokenMatch) {
+                  const tok = decodeURIComponent(tokenMatch[1].trim());
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(accountId, "db-restore-write-pre").catch(() => {}))
+                    .catch(() => {});
+                  await page.evaluate((t) => {
+                    try {
+                      localStorage.setItem("token", t);
+                      document.cookie = `token=${encodeURIComponent(t)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                    } catch {}
+                  }, tok).catch(() => {});
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(accountId, "db-restore-write-post").catch(() => {}))
+                    .catch(() => {});
+                }
+              } catch {}
+            }
+            cache.headers = restoredHeaders;
+            // Never feed the persisted version into the global bundle version:
+            // rows outlive frontend releases, and a stale bundle version sent
+            // on completions answers 401 Unauthorized (proven: version 0.3.11
+            // vs live 0.2.91). The global stays fresh-only (live scrape /
+            // live capture); the restored row's own headers are untouched.
+            cache.lastRefresh = persisted.capturedAt;
+            markAccountHeadersReady(accountId);
+          }
+        }
+      } catch {}
+    }
+
+    if (!hasRequiredQwenHeaders(cache.headers)) {
       console.log(
         `🔄 [Playwright] Missing required anti-bot headers for ${accountId}, triggering header interception...`,
       );
@@ -1309,7 +2086,11 @@ export async function getBasicHeaders(accountId: string): Promise<{
     const bxV = cache.headers["bx-v"] || "2.5.37";
 
     // Read cookie AFTER all refreshes (re-login may have updated it)
-    const cookie = await getCookies(accountId);
+    cookieCaches.delete(accountId);
+    const cookie = await getCookies(accountId, true);
+    if (cache.headers) {
+      cache.headers["cookie"] = cookie;
+    }
 
     return {
       cookie,
@@ -1340,7 +2121,7 @@ async function resolveAccountCredentials(account: QwenAccount): Promise<QwenAcco
 
 export async function initPlaywrightForAccount(
   rawAccount: QwenAccount,
-  headless = true,
+  headless = config.playwright.headless,
   browserType: BrowserType = "chromium",
   options: { skipHeaderCapture?: boolean } = {},
 ): Promise<void> {
@@ -1371,6 +2152,17 @@ export async function initPlaywrightForAccount(
 
     // If a context limit is configured, make room by closing idle contexts.
     await evictIdlePlaywrightContextsToLimit().catch(() => {});
+
+    // Modern auth: renew the persisted session WITHOUT a browser before the
+    // context opens, so the fast-boot DB restore below sees a fresh jar and
+    // skips the login flow. Best-effort and silent: failure falls through to
+    // the existing restore/login machinery unchanged. Never opens a profile
+    // for auth purposes — this is pure HTTPS against the refresh endpoint.
+    try {
+      await ensureAccountFresh(account.id);
+    } catch {
+      // ensureAccountFresh never throws; this guards future refactors.
+    }
 
     const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
@@ -1434,6 +2226,62 @@ export async function initPlaywrightForAccount(
         await hook(acctContext);
       }
 
+      // Block telemetry pixels, third-party trackers, ad scripts and heavy video/audio media to speed up page loads by 30-50%
+      // Invariant 5: NEVER abort image or stylesheet requests needed by Baxia slider (Canvas tiles on img.alicdn.com)
+      await acctContext.route("**/*", (route) => {
+        const req = route.request();
+        const url = req.url();
+        const type = req.resourceType();
+
+        // 1. Heavy video/audio media (never used for text completions)
+        if (type === "media") {
+          return route.abort().catch(() => {});
+        }
+
+        // 2. Google Tag Manager: fulfill with stub script to avoid runtime undefined errors
+        if (url.includes("googletagmanager.com/gtag/js") || url.includes("google-analytics.com")) {
+          return route.fulfill({
+            status: 200,
+            contentType: "application/javascript",
+            body: "window.dataLayer=window.dataLayer||[];window.gtag=window.gtag||function(){dataLayer.push(arguments)};",
+          }).catch(() => {});
+        }
+
+        // 3. Telemetry tracking pixels, ad networks and event monitors
+        const isTelemetryOrTracker =
+          url.includes("fourier.taobao.com") ||
+          url.includes("googletagmanager") ||
+          url.includes("analytics.google") ||
+          url.includes("doubleclick.net") ||
+          url.includes("connect.facebook") ||
+          url.includes("facebook.com") ||
+          url.includes("adjust.com") ||
+          url.includes("ucweb.com") ||
+          url.includes("hotjar.com") ||
+          url.includes("clarity.ms") ||
+          url.includes("/AWSC/et/"); // Alibaba Event Tracking (safe to block, verified)
+
+        if (isTelemetryOrTracker) {
+          if (type === "script") {
+            return route.fulfill({
+              status: 200,
+              contentType: "application/javascript",
+              body: "",
+            }).catch(() => {});
+          }
+          if (type === "image") {
+            return route.fulfill({
+              status: 200,
+              contentType: "image/gif",
+              body: Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"),
+            }).catch(() => {});
+          }
+          return route.abort().catch(() => {});
+        }
+
+        return route.continue().catch(() => {});
+      }).catch(() => {});
+
       // If native profile cookies are empty but a backup storage_state.json exists, restore cookies
       const storageState = loadStorageState(account.id);
       if (storageState) {
@@ -1471,9 +2319,113 @@ export async function initPlaywrightForAccount(
       accountContexts.set(account.id, acctContext);
       accountPages.set(account.id, acctPage);
       installContextDeathHandlers(account.id, acctContext, acctPage);
+      try {
+        const { snapshotSessionState, traceSessionEvent } = await import(
+          "./session-tracer.ts"
+        );
+        const snap = await snapshotSessionState(account.id, {
+          context: acctContext,
+          page: acctPage,
+        }).catch(() => null);
+        traceSessionEvent(account.id, "CONTEXT_CREATE", "", snap);
+      } catch {
+        // Tracing must never break init.
+      }
+      void import("./session-tracer.ts").then((m) =>
+        m.traceLsCheckpoint(account.id, "init-success").catch(() => {}),
+      ).catch(() => {});
       touchAccountActivity(account.id);
 
-      // Check if already logged in
+      // 1. Fast boot: if a valid session exists in SQLite, restore headers and cookies instantly.
+      // Eliminates redundant navigations, DOM probes, and fake UI typing on healthy accounts.
+      let restoredFromDb = false;
+      if (!options.skipHeaderCapture) {
+        try {
+          const { getValidAuthSession } = await import("../core/database.ts");
+          const persisted = getValidAuthSession(account.id);
+          if (persisted) {
+            const restoredHeaders: Record<string, string> = {
+              cookie: persisted.cookie,
+              "user-agent": persisted.userAgent,
+              "bx-v": persisted.bxV,
+              "bx-ua": persisted.bxUa,
+              "bx-umidtoken": persisted.bxUmidtoken,
+              ...(persisted.secChUa ? { "sec-ch-ua": persisted.secChUa } : {}),
+              ...(persisted.secChUaMobile ? { "sec-ch-ua-mobile": persisted.secChUaMobile } : {}),
+              ...(persisted.secChUaPlatform ? { "sec-ch-ua-platform": persisted.secChUaPlatform } : {}),
+              ...(persisted.version ? { version: persisted.version } : {}),
+            };
+            if (hasRequiredQwenHeaders(restoredHeaders) && hasValidAuthToken(restoredHeaders.cookie)) {
+              // Inject cookies into Chromium browser context so in-page requests are authenticated
+              try {
+                const cookiesToAdd = parseCookiesForBrowser(restoredHeaders.cookie);
+                if (cookiesToAdd.length > 0) {
+                  await acctContext.addCookies(cookiesToAdd).catch(() => {});
+                }
+                const tokenMatch = restoredHeaders.cookie.match(/(?:^|;\s*)token=([^;]+)/);
+                if (tokenMatch && !acctPage.isClosed()) {
+                  const tok = decodeURIComponent(tokenMatch[1].trim());
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(account.id, "db-restore-write-pre").catch(() => {}))
+                    .catch(() => {});
+                  await acctPage.evaluate((t) => {
+                    try {
+                      localStorage.setItem("token", t);
+                      document.cookie = `token=${encodeURIComponent(t)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                    } catch {}
+                  }, tok).catch(() => {});
+                  void import("./session-tracer.ts")
+                    .then((m) => m.traceLsCheckpoint(account.id, "db-restore-write-post").catch(() => {}))
+                    .catch(() => {});
+                }
+
+                // Read live cookies from browser context
+                const liveCookies = await acctContext.cookies();
+                if (liveCookies.length > 0 && liveCookies.some((c) => c.name === "token")) {
+                  restoredHeaders.cookie = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+                  cookieCaches.set(account.id, { cookie: restoredHeaders.cookie, timestamp: Date.now() });
+                }
+              } catch {}
+
+              const cache = getHeaderCache(account.id);
+              cache.headers = restoredHeaders;
+              // Same as above: a persisted row must never set the global web
+              // bundle version (stale bundle on completions → 401).
+              cache.lastRefresh = persisted.capturedAt;
+              markAccountHeadersReady(account.id);
+              restoredFromDb = true;
+              console.log(
+                `⚡ [Playwright] Restored anti-bot headers from database for ${maskEmail(account.email)} (age: ${Math.round((Date.now() - persisted.capturedAt) / 60000)}m, bypassed UI typing)`,
+              );
+            }
+          }
+        } catch {}
+      }
+
+      if (restoredFromDb) {
+        if (!acctPage.isClosed() && (acctPage.url() === "about:blank" || !acctPage.url().startsWith(qwenOrigin()))) {
+          // Awaited (not fire-and-forget): an overlapping background
+          // navigation used to race the next page.goto on this same page and
+          // abort it with net::ERR_ABORTED. A benign abort (page already home)
+          // is swallowed; anything else only warns — init stays non-fatal.
+          try {
+            await acctPage.goto(qwenUrl("/"), {
+              waitUntil: "domcontentloaded",
+              timeout: config.timeouts.navigation,
+            });
+            await sleep(300);
+          } catch (err: any) {
+            if (!err?.message?.includes("ERR_ABORTED")) {
+              console.warn(
+                `⚠️  [Playwright] Background navigation warning for ${maskEmail(account.email)}: ${err.message}`,
+              );
+            }
+          }
+        }
+        return;
+      }
+
+      // 2. Initial setup for fresh accounts without prior session: check cookies or authenticate
       const cookies = await acctContext.cookies();
       const hasAuthCookie = cookies.some(
         (c) =>
@@ -1482,7 +2434,7 @@ export async function initPlaywrightForAccount(
       );
 
       if (!hasAuthCookie && account.email && account.password) {
-        await loginToQwen(account.id, account.email, account.password);
+        await loginToQwen(account.id, account.email, account.password, "startup-init");
       }
 
       // Navigate to the stable chat page to validate the session and populate cookies.
@@ -1501,7 +2453,7 @@ export async function initPlaywrightForAccount(
               console.warn(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
-              const ok = await loginToQwen(account.id, account.email, account.password);
+              const ok = await loginToQwen(account.id, account.email, account.password, "startup-validation");
               if (!ok || !(await isPageLoggedIn(acctPage))) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
@@ -1533,7 +2485,9 @@ export async function initPlaywrightForAccount(
         );
         throw validationError;
       }
+
       if (!options.skipHeaderCapture) {
+        (acctPage as any).__qwenChatHomeLoaded = true;
         await captureQwenHeaders(account.id);
       }
 
@@ -1677,7 +2631,7 @@ export async function validateAccountLogin(
         // Need to register page temporarily for login functions
         accountPages.set(account.id, acctPage);
         try {
-          loggedIn = await loginToQwen(account.id, account.email, account.password);
+          loggedIn = await loginToQwen(account.id, account.email, account.password, "background-validation");
         } finally {
           accountPages.delete(account.id);
         }
@@ -1688,14 +2642,22 @@ export async function validateAccountLogin(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          loggedIn = await isPageLoggedIn(acctPage);
-          if (!loggedIn && account.email && account.password) {
-            accountPages.set(account.id, acctPage);
-            try {
-              loggedIn = await loginToQwen(account.id, account.email, account.password);
-            } finally {
-              accountPages.delete(account.id);
+          await sleep(1500);
+          const currentUrl = acctPage.url();
+          const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
+          if (isAuthUrl) {
+            if (account.email && account.password) {
+              accountPages.set(account.id, acctPage);
+              try {
+                loggedIn = await loginToQwen(account.id, account.email, account.password, "background-validation");
+              } finally {
+                accountPages.delete(account.id);
+              }
+            } else {
+              loggedIn = false;
             }
+          } else {
+            loggedIn = true;
           }
         } catch {
           loggedIn = false;
@@ -1773,7 +2735,63 @@ export function classifyQwenAuthError(
   };
 }
 
-async function loginToQwen(
+export async function loginToQwen(
+  accountId: string,
+  email: string,
+  password: string,
+  caller = "unknown",
+): Promise<boolean> {
+  try {
+    traceSessionEvent(accountId, "LOGIN_START", `caller=${caller}`);
+  } catch {}
+  void import("./session-tracer.ts")
+    .then((m) => m.traceLsCheckpoint(accountId, "login-start").catch(() => {}))
+    .catch(() => {});
+  // MODERN_AUTH_PRESENT: an account holding modern refresh material must never
+  // run the password machinery — password flows cannot restore a modern
+  // session, and their exhaustion parks the account 24h AuthFailed (proven
+  // live by the SessionKeeper proactive renewal). Silent refresh only; the
+  // boolean result flows to the caller with no cooldown side effects.
+  try {
+    const { getRefreshMaterial } = await import("../core/database.ts");
+    if (getRefreshMaterial(accountId)?.jar) {
+      try {
+        const { ensureAccountFresh } = await import(
+          "./qwen-token-refresh.ts"
+        );
+        const fresh = await ensureAccountFresh(accountId).catch(() => false);
+        try {
+          traceSessionEvent(accountId, "LOGIN_END", fresh ? "ok-modern" : "stale-modern");
+        } catch {}
+        return fresh;
+      } catch {
+        return false;
+      }
+    }
+  } catch {
+    // No readable material: fall through to the legacy password path.
+  }
+  try {
+    const ok = await loginToQwenInner(accountId, email, password);
+    try {
+      traceSessionEvent(accountId, "LOGIN_END", ok ? "ok" : "failed");
+    } catch {}
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "login-end").catch(() => {}))
+      .catch(() => {});
+    return ok;
+  } catch (err) {
+    try {
+      traceSessionEvent(accountId, "LOGIN_END", "error");
+    } catch {}
+    void import("./session-tracer.ts")
+      .then((m) => m.traceLsCheckpoint(accountId, "login-end-error").catch(() => {}))
+      .catch(() => {});
+    throw err;
+  }
+}
+
+async function loginToQwenInner(
   accountId: string,
   email: string,
   password: string,
@@ -1799,10 +2817,49 @@ async function loginToQwen(
 
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (page.isClosed()) {
+      console.warn(
+        `⚠️  [Playwright] Login aborted: page was closed for ${maskEmail(email)}`,
+      );
+      return false;
+    }
+
     // Try API login first
     const apiResult = await loginViaApi(page, email, password);
     if (apiResult.success) {
+      cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
+      // The refresh_token cookie can land a tick after the access token;
+      // persisting before it arrives writes a session that can never renew
+      // without a browser. Bounded wait, then persist once with everything.
+      await waitForRefreshTokenCookie(page.context()).catch(() => false);
+      try {
+        const liveCookies = await page.context().cookies();
+        const tokenCookie = liveCookies.find((c) => c.name === "token");
+        if (tokenCookie) {
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          const cache = getHeaderCache(accountId);
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+          const { saveAuthSession } = await import("../core/database.ts");
+          const exp = parseJwtExpiry(tokenCookie.value);
+          saveAuthSession(accountId, {
+            cookie: cookieStr,
+            userAgent: cache.headers["user-agent"] || "",
+            bxV: cache.headers["bx-v"] || "2.5.37",
+            bxUa: cache.headers["bx-ua"] || "",
+            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+            secChUa: cache.headers["sec-ch-ua"] || undefined,
+            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+            version: cache.headers["version"] || undefined,
+            tokenExpiresAt: exp || undefined,
+            capturedAt: Date.now(),
+            refreshToken: getJarPair(cookieStr, "refresh_token"),
+          });
+        }
+      } catch {}
       return true;
     }
 
@@ -1821,7 +2878,37 @@ async function loginToQwen(
     // Fallback to UI login
     const uiResult = await loginViaUi(page, email, password);
     if (uiResult.success) {
+      cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
+      // Same bounded refresh_token wait as the API-login path above.
+      await waitForRefreshTokenCookie(page.context()).catch(() => false);
+      try {
+        const liveCookies = await page.context().cookies();
+        const tokenCookie = liveCookies.find((c) => c.name === "token");
+        if (tokenCookie) {
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          const cache = getHeaderCache(accountId);
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+          const { saveAuthSession } = await import("../core/database.ts");
+          const exp = parseJwtExpiry(tokenCookie.value);
+          saveAuthSession(accountId, {
+            cookie: cookieStr,
+            userAgent: cache.headers["user-agent"] || "",
+            bxV: cache.headers["bx-v"] || "2.5.37",
+            bxUa: cache.headers["bx-ua"] || "",
+            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+            secChUa: cache.headers["sec-ch-ua"] || undefined,
+            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+            version: cache.headers["version"] || undefined,
+            tokenExpiresAt: exp || undefined,
+            capturedAt: Date.now(),
+            refreshToken: getJarPair(cookieStr, "refresh_token"),
+          });
+        }
+      } catch {}
       return true;
     }
 
@@ -1844,6 +2931,20 @@ async function loginToQwen(
       );
       await sleep(backoffMs);
     }
+
+    if (page.isClosed()) {
+      console.warn(
+        `⚠️  [Playwright] Login aborted: page was closed for ${maskEmail(email)}`,
+      );
+      return false;
+    }
+  }
+
+  if (page.isClosed()) {
+    console.warn(
+      `⚠️  [Playwright] Login aborted: page was closed for ${maskEmail(email)}`,
+    );
+    return false;
   }
 
   console.error(
@@ -1857,103 +2958,1054 @@ async function loginToQwen(
   return false;
 }
 
+/**
+ * Sanitized trace of the last loginViaApi signin attempt per account.
+ * Key names, counts, booleans and hashes only — never tokens, cookies,
+ * passwords, or bodies. Powers the single-shot login diagnostic probe.
+ */
+export interface LoginAttemptTrace {
+  accountId8: string;
+  ts: number;
+  httpStatus: number;
+  appSuccess: boolean;
+  appAuthFailure: boolean;
+  topKeys: string[];
+  dataKeys: string[];
+  tokenPathUsed: string | null;
+  installed: boolean;
+  cookieCountBefore: number;
+  cookieCountAfter: number;
+  cookieNamesChanged: boolean;
+  lsTokenPresentBefore: boolean;
+  lsTokenPresentAfter: boolean;
+  lsTokenChanged: boolean;
+  validated: boolean | null;
+  cookieInstallOk: boolean | null;
+  lsWriteOk: boolean | null;
+  reloadOk: boolean | null;
+  tokenHashBefore: string | null;
+  tokenHashAfter: string | null;
+  tokenChanged: boolean | null;
+  challengeSignals: string[];
+  postValidationReason: string;
+  postValidation: {
+    nonMutating: boolean;
+    settingsStatus: number;
+    settingsAppFail: boolean;
+    before: { lsPresent: boolean; cookiePresent: boolean; marker: boolean };
+    after: { lsPresent: boolean; cookiePresent: boolean; marker: boolean };
+    cookieRotated: boolean;
+    lsRemoved: boolean;
+    markerCreated: boolean;
+    invariant: "OK" | "VIOLATED";
+  };
+}
+
+const lastLoginTraces = new Map<string, LoginAttemptTrace>();
+
+export function getLastLoginTrace(
+  accountId: string,
+): LoginAttemptTrace | null {
+  return lastLoginTraces.get(accountId) ?? null;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC: exactly ONE loginViaApi invocation on the live
+ * account page, followed by same-context models/settings/create-chat reads.
+ * No cooldown changes, no rotation, no loops, no DB writes, no second login.
+ * Sanitized results only.
+ */
+export async function probeLoginOnce(accountId: string): Promise<{
+  trace: LoginAttemptTrace | null;
+  loginOk: boolean;
+  models: { status: number; appFail: boolean };
+  settings: { status: number; appFail: boolean };
+  createChat: { status: number; appFail: boolean; created: boolean };
+  snapPostLogin: unknown;
+  snapAfterMinimal: unknown;
+  fullHeaders: {
+    settings: { status: number; appFail: boolean };
+    createChat: { status: number; appFail: boolean; created: boolean };
+  };
+  snapAfterFull: unknown;
+  bisect: {
+    ran: boolean;
+    steps: Array<{ names: string[]; status: number; appFail: boolean }>;
+    causalHeader: string | null;
+    minimalCausalSet: string[] | null;
+    interactionCausal: boolean;
+    confirmed: boolean;
+    headerMeta: Array<{ name: string; hash: string; len: number }>;
+  };
+}> {
+  const { getAccountCredentials } = await import("../core/accounts.ts");
+  const creds = getAccountCredentials(accountId);
+  if (!creds?.email || !creds?.password) {
+    throw new Error("No stored credentials for account");
+  }
+  const page = accountPages.get(accountId);
+  if (!page || page.isClosed()) {
+    throw new Error("No live account page (not initialized)");
+  }
+  const loginOk = await loginViaApi(page, creds.email, creds.password, accountId);
+  const trace = getLastLoginTrace(accountId);
+  const empty = {
+    status: 0,
+    appFail: false,
+  };
+  const result = {
+    trace,
+    loginOk: loginOk.success,
+    models: { ...empty },
+    settings: { ...empty },
+    createChat: { status: 0, appFail: false, created: false },
+  };
+  const runFetch = async (
+    method: string,
+    url: string,
+    body?: string,
+    extraHeaders?: Record<string, string>,
+  ): Promise<{ status: number; appFail: boolean; created: boolean }> => {
+    try {
+      const r = await page.evaluate(
+        async (args: {
+          method: string;
+          url: string;
+          body?: string;
+          extra?: Array<{ name: string; value: string }>;
+        }) => {
+          try {
+            const hh: Record<string, string> = {
+              accept: "application/json, text/plain, */*",
+              "content-type": "application/json",
+              source: "web",
+            };
+            const extra = args.extra || [];
+            for (let i = 0; i < extra.length; i++) {
+              hh[extra[i].name] = extra[i].value;
+            }
+            const resp = await fetch(args.url, {
+              method: args.method,
+              credentials: "include",
+              headers: hh,
+              body: args.body,
+              signal: AbortSignal.timeout(25000),
+            });
+            const text = await resp.text().catch(() => "");
+            let appFail = false;
+            let created = false;
+            try {
+              const j: any = JSON.parse(text);
+              if (j && typeof j === "object") {
+                appFail =
+                  j.success === false &&
+                  (j.data?.code === "Unauthorized" || j.code === "Unauthorized");
+                created = Boolean(
+                  j.chat_id || j.id || j.data?.chat_id || j.data?.id,
+                );
+              }
+            } catch {
+              appFail = false;
+            }
+            return { status: resp.status, appFail, created };
+          } catch {
+            return { status: 0, appFail: false, created: false };
+          }
+        },
+        {
+          method,
+          url,
+          body,
+          extra: extraHeaders
+            ? Object.keys(extraHeaders).map((k) => ({
+                name: k,
+                value: extraHeaders[k],
+              }))
+            : [],
+        },
+      );
+      return r;
+    } catch {
+      return { status: 0, appFail: false, created: false };
+    }
+  };
+  const { snapshotSessionState: snapState } = await import(
+    "./session-tracer.ts"
+  ).catch(() => ({ snapshotSessionState: null as never }));
+  // Observational only: bracket each minimal reading so the exact operation
+  // that drops localStorage.token is attributable. Never gates, never writes.
+  const lsMark = async (label: string): Promise<void> => {
+    try {
+      const { traceLsCheckpoint } = await import("./session-tracer.ts");
+      await traceLsCheckpoint(accountId, label).catch(() => {});
+    } catch {
+      // Tracing must never break the probe.
+    }
+  };
+  const takeSnap = async () => {
+    try {
+      if (!snapState) return null;
+      return await snapState(accountId, {
+        context: page.context(),
+        page,
+      }).catch(() => null);
+    } catch {
+      return null;
+    }
+  };
+  await lsMark("probe-post-login");
+  const snap0 = await takeSnap();
+  await lsMark("probe-models-pre");
+  const m = await runFetch("GET", qwenUrl("/api/models"));
+  result.models = { status: m.status, appFail: m.appFail };
+  await lsMark("probe-models-post");
+  await lsMark("probe-settings-pre");
+  const s = await runFetch("GET", qwenUrl("/api/v2/users/user/settings"));
+  result.settings = { status: s.status, appFail: s.appFail };
+  await lsMark("probe-settings-post");
+  await lsMark("probe-create-chat-pre");
+  const cc = await runFetch(
+    "POST",
+    qwenUrl("/api/v2/chats/new"),
+    JSON.stringify({ chatId: "", models: ["qwen3.8-max"], project_id: "", timestamp: Date.now() }),
+  );
+  result.createChat = cc;
+  await lsMark("probe-create-chat-post");
+  const snap1 = await takeSnap();
+  await lsMark("probe-after-minimal");
+  // B: same page, full pipeline header set from the live runtime cache
+  // (minus cookie/Authorization values, which stay server-side; only names
+  // and outcomes are reported).
+  const cachedHeaders = headerCaches.get(accountId)?.headers || {};
+  const fullExtra: Record<string, string> = {};
+  for (const k of Object.keys(cachedHeaders)) {
+    const l = k.toLowerCase();
+    if (l === "cookie" || l === "authorization" || l === "user-agent") continue;
+    const v = cachedHeaders[k];
+    if (typeof v === "string" && v.length > 0) fullExtra[k] = v;
+  }
+  const bSettings = await runFetch(
+    "GET",
+    qwenUrl("/api/v2/users/user/settings"),
+    undefined,
+    fullExtra,
+  );
+  const bCreate = await runFetch(
+    "POST",
+    qwenUrl("/api/v2/chats/new"),
+    JSON.stringify({ chatId: "", models: ["qwen3.8-max"], project_id: "", timestamp: Date.now() }),
+    fullExtra,
+  );
+  const snap2 = await takeSnap();
+  // Bisect the full extra-header set when minimal passes but full fails.
+  // Same page/context/cookies/session throughout; single headers first,
+  // then minimal interaction search. Bounded request budget.
+  const bisect: {
+    ran: boolean;
+    steps: Array<{ names: string[]; status: number; appFail: boolean }>;
+    causalHeader: string | null;
+    minimalCausalSet: string[] | null;
+    interactionCausal: boolean;
+    confirmed: boolean;
+    headerMeta: Array<{ name: string; hash: string; len: number }>;
+  } = {
+    ran: false,
+    steps: [],
+    causalHeader: null,
+    minimalCausalSet: null,
+    interactionCausal: false,
+    confirmed: false,
+    headerMeta: [],
+  };
+  const fnv = (v: string): string => {
+    let h1 = 0x811c9dc5;
+    for (let i = 0; i < v.length; i++) {
+      h1 ^= v.charCodeAt(i);
+      h1 = Math.imul(h1, 0x01000193);
+    }
+    return (h1 >>> 0).toString(16);
+  };
+  const extraNames = Object.keys(fullExtra);
+  for (const n of extraNames) {
+    bisect.headerMeta.push({ name: n, hash: fnv(fullExtra[n]), len: fullExtra[n].length });
+  }
+  try {
+    console.log(
+      `[Bisect ${accountId.slice(0, 8)}] headers=[${extraNames.join(",")}]`,
+    );
+  } catch {}
+  const pickHeaders = (
+    names: string[],
+  ): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const n of names) {
+      if (fullExtra[n] !== undefined) out[n] = fullExtra[n];
+    }
+    return out;
+  };
+  const testSubset = async (
+    names: string[],
+  ): Promise<{ status: number; appFail: boolean }> => {
+    const r = await runFetch(
+      "GET",
+      qwenUrl("/api/v2/users/user/settings"),
+      undefined,
+      pickHeaders(names),
+    );
+    return { status: r.status, appFail: r.appFail };
+  };
+  const isFail = (r: { status: number; appFail: boolean }): boolean =>
+    r.status === 401 || r.appFail;
+  const aSettingsOk =
+    s.status === 200 && !s.appFail;
+  const bSettingsFail = (() => {
+    const b = { status: bSettings.status, appFail: bSettings.appFail };
+    return isFail(b);
+  })();
+  if (aSettingsOk && bSettingsFail && extraNames.length > 0) {
+    bisect.ran = true;
+    // Binary search for a single causal header.
+    let candidates = [...extraNames];
+    let budget = 12;
+    const stack: string[][] = [candidates];
+    const confirmedSingles: string[] = [];
+    while (stack.length > 0 && budget > 0) {
+      const cur = stack.pop() as string[];
+      if (cur.length === 0) continue;
+      if (cur.length === 1) {
+        const r = await testSubset(cur);
+        bisect.steps.push({ names: [...cur], status: r.status, appFail: r.appFail });
+        budget -= 1;
+        if (isFail(r)) confirmedSingles.push(cur[0]);
+        continue;
+      }
+      const mid = Math.floor(cur.length / 2);
+      const left = cur.slice(0, mid);
+      const right = cur.slice(mid);
+      const rL = await testSubset(left);
+      bisect.steps.push({ names: [...left], status: rL.status, appFail: rL.appFail });
+      budget -= 1;
+      const rR = await testSubset(right);
+      bisect.steps.push({ names: [...right], status: rR.status, appFail: rR.appFail });
+      budget -= 1;
+      const fL = isFail(rL);
+      const fR = isFail(rR);
+      if (fL && !fR) stack.push(left);
+      else if (fR && !fL) stack.push(right);
+      else if (fL && fR) {
+        stack.push(left);
+        stack.push(right);
+      } else {
+        bisect.interactionCausal = true;
+      }
+    }
+    if (confirmedSingles.length === 1) {
+      bisect.causalHeader = confirmedSingles[0];
+      // Confirm: PASS -> FAIL -> PASS.
+      const p1 = await testSubset([]);
+      const p2 = await testSubset([confirmedSingles[0]]);
+      const p3 = await testSubset([]);
+      bisect.steps.push({ names: [], status: p1.status, appFail: p1.appFail });
+      bisect.steps.push({ names: [confirmedSingles[0]], status: p2.status, appFail: p2.appFail });
+      bisect.steps.push({ names: [], status: p3.status, appFail: p3.appFail });
+      const ok1 = p1.status === 200 && !p1.appFail;
+      const bad2 = isFail(p2);
+      const ok3 = p3.status === 200 && !p3.appFail;
+      bisect.confirmed = ok1 && bad2 && ok3;
+      bisect.minimalCausalSet = bisect.confirmed ? [confirmedSingles[0]] : null;
+    } else if (confirmedSingles.length > 1) {
+      bisect.minimalCausalSet = [...confirmedSingles];
+      bisect.confirmed = true;
+    }
+    try {
+      console.log(
+        `[Bisect ${accountId.slice(0, 8)}] causalHeader=${bisect.causalHeader} ` +
+          `interaction=${bisect.interactionCausal} confirmed=${bisect.confirmed} ` +
+          `steps=${bisect.steps.length}`,
+      );
+    } catch {}
+  }
+  const stripSnap = (x: Awaited<ReturnType<typeof takeSnap>>) =>
+    x
+      ? {
+          contextId: x.contextId,
+          pageId: x.pageId,
+          url: x.url,
+          origin: x.origin,
+          tokenHash: x.tokenHash,
+          tokenPresent: x.tokenPresent,
+          tokenIat: x.tokenIat,
+          tokenExp: x.tokenExp,
+          lsKeys: x.lsKeys,
+          lsTokenHash: x.lsTokenHash,
+          ssKeys: x.ssKeys,
+          cookieNameHash: x.cookieNameHash,
+          cookieCount: x.cookieCount,
+          capturedAt: x.capturedAt,
+        }
+      : null;
+  return {
+    ...result,
+    snapPostLogin: stripSnap(snap0),
+    snapAfterMinimal: stripSnap(snap1),
+    fullHeaders: {
+      settings: { status: bSettings.status, appFail: bSettings.appFail },
+      createChat: {
+        status: bCreate.status,
+        appFail: bCreate.appFail,
+        created: bCreate.created,
+      },
+    },
+    snapAfterFull: stripSnap(snap2),
+    bisect,
+  };
+}
+
+/** Sanitized challenge-signal classification (names only, never values). */
+export function classifySigninChallenge(
+  code: unknown,
+  details: unknown,
+): string[] {
+  try {
+    const codeStr = String(code || "").toLowerCase();
+    const detStr = String(details || "").toLowerCase();
+    const sig: string[] = [];
+    if (/otp|verification|code|2fa|two-factor|mfa/.test(codeStr + " " + detStr)) {
+      sig.push("otp-required");
+    }
+    if (/captcha|slider|challenge|verify-human|tmd|baxia/.test(codeStr + " " + detStr)) {
+      sig.push("captcha-required");
+    }
+    if (/password|credential|login-type|logintype/.test(codeStr + " " + detStr)) {
+      sig.push("password-mode-rejected");
+    }
+    if (/forbidden|banned|suspend|restrict|risk|flagged|abnormal/.test(codeStr + " " + detStr)) {
+      sig.push("account-flag");
+    }
+    return sig;
+  } catch {
+    return [];
+  }
+}
+
+function topKeysOf(v: unknown): string[] {
+  if (!v || typeof v !== "object") return [];
+  return Object.keys(v as Record<string, unknown>).slice(0, 12);
+}
+
+function cookieNamesOf(
+  cookies: Array<{ name: string }>,
+): { count: number; hash: string } {
+  const names = cookies.map((c) => c.name).sort();
+  let h1 = 0x811c9dc5;
+  const joined = names.join(";");
+  for (let i = 0; i < joined.length; i++) {
+    h1 ^= joined.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
+  }
+  return { count: names.length, hash: (h1 >>> 0).toString(16) };
+}
+
+function traceHashStr(v: string): string {
+  let h1 = 0x811c9dc5;
+  for (let i = 0; i < v.length; i++) {
+    h1 ^= v.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
+  }
+  return (h1 >>> 0).toString(16);
+}
+
+/** Which token path fired inside extractAuthToken (structure only). */
+function authTokenPathUsed(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const levels: Array<{ label: string; v: unknown }> = [
+    { label: "top", v: data },
+    { label: "result", v: (data as { result?: unknown }).result },
+    { label: "data", v: (data as { data?: unknown }).data },
+  ];
+  for (const { label, v } of levels) {
+    if (!v || typeof v !== "object") continue;
+    const rec = v as Record<string, unknown>;
+    for (const key of ["accessToken", "access_token", "token"]) {
+      const val = rec[key];
+      if (typeof val === "string" && val.length > 0) return `${label}.${key}`;
+    }
+  }
+  return null;
+}
+
 async function loginViaApi(
   page: Page,
   email: string,
   password: string,
+  accountId?: string,
 ): Promise<LoginAttemptResult> {
+  const traceId8 = (accountId || "").slice(0, 8);
+  const trace: LoginAttemptTrace = {
+    accountId8: traceId8,
+    ts: Date.now(),
+    httpStatus: 0,
+    appSuccess: false,
+    appAuthFailure: false,
+    topKeys: [],
+    dataKeys: [],
+    tokenPathUsed: null,
+    installed: false,
+    cookieCountBefore: 0,
+    cookieCountAfter: 0,
+    cookieNamesChanged: false,
+    lsTokenPresentBefore: false,
+    lsTokenPresentAfter: false,
+    lsTokenChanged: false,
+    validated: null,
+    cookieInstallOk: null,
+    lsWriteOk: null,
+    reloadOk: null,
+    tokenHashBefore: null,
+    tokenHashAfter: null,
+    tokenChanged: null,
+    challengeSignals: [],
+    postValidationReason: "",
+    postValidation: {
+      nonMutating: true,
+      settingsStatus: 0,
+      settingsAppFail: false,
+      before: { lsPresent: false, cookiePresent: false, marker: false },
+      after: { lsPresent: false, cookiePresent: false, marker: false },
+      cookieRotated: false,
+      lsRemoved: false,
+      markerCreated: false,
+      invariant: "OK",
+    },
+  };
+  const storeTrace = (): void => {
+    if (accountId) lastLoginTraces.set(accountId, trace);
+  };
   try {
-    await page.goto(qwenUrl("/auth"), {
-      waitUntil: "domcontentloaded",
-      timeout: config.timeouts.navigation,
-    });
-    await sleep(2000);
-
-    // Check if already logged in
-    if (!page.url().includes("/auth")) {
-      return { success: true };
-    }
-
     const hashedPassword = crypto
       .createHash("sha256")
       .update(password)
       .digest("hex");
     const signinUrl = qwenUrl("/api/v2/auths/signin");
 
-    const requestId = crypto.randomUUID();
-    const result = await page.evaluate(
-      async ({ email, password, signinUrl, requestId }) => {
-        try {
-          const response = await fetch(signinUrl, {
-            method: "POST",
-            signal: AbortSignal.timeout(10_000),
-            credentials: "include",
-            headers: {
-              accept: "application/json, text/plain, */*",
-              "content-type": "application/json",
-              source: "web",
-              timezone: new Date().toString().split(" (")[0],
-              "x-request-id": requestId,
-            },
-            body: JSON.stringify({ email, password, login_type: "email" }),
-          });
-          const data = await response.json().catch(() => null);
-          const token = data?.data?.token || data?.token;
-          if (token) {
-            try {
-              localStorage.setItem("token", token);
-              document.cookie = `token=${encodeURIComponent(token)}; path=/; domain=.qwen.ai; max-age=31536000`;
-            } catch {}
+    let signinSuccess = false;
+    let data: any = null;
+    let signinHttpStatus = 0;
+    let preCookieHash = "";
+    let preLsToken: string | null = null;
+    try {
+      const preCookies = await page.context().cookies().catch(() => []);
+      const snap = cookieNamesOf(preCookies);
+      trace.cookieCountBefore = snap.count;
+      preCookieHash = snap.hash;
+      const preTok = preCookies.find(
+        (c: { name: string; value: string }) => c.name === "token",
+      );
+      trace.tokenHashBefore =
+        preTok && preTok.value ? traceHashStr(preTok.value) : null;
+    } catch {
+      // Best effort baseline.
+    }
+    try {
+      const t = await page
+        .evaluate((): string | null => {
+          try {
+            const v = localStorage.getItem("token");
+            return typeof v === "string" && v.length > 0 ? v : null;
+          } catch {
+            return null;
           }
-          return { ok: response.ok, status: response.status, data, token };
-        } catch (e: any) {
-          return { ok: false, error: e.message };
-        }
-      },
-      { email, password: hashedPassword, signinUrl, requestId },
-    );
+        })
+        .catch(() => null);
+      preLsToken = typeof t === "string" ? t : null;
+      trace.lsTokenPresentBefore = preLsToken !== null;
+    } catch {
+      // Best effort baseline.
+    }
 
-    if (result.data) {
-      if (result.data.success === true || result.token) {
-        await page.goto(qwenUrl("/"), {
-          waitUntil: "domcontentloaded",
-          timeout: config.timeouts.navigation,
+    if (page.request && typeof page.request.post === "function") {
+      try {
+        const response = await page.request.post(signinUrl, {
+          data: {
+            email,
+            password: hashedPassword,
+            login_type: "email",
+          },
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/plain, */*",
+            referer: qwenUrl("/auth"),
+            origin: qwenOrigin(),
+            source: "web",
+          },
+          timeout: 10_000,
         });
-        const loggedIn = await isPageLoggedIn(page);
-        if (loggedIn) {
-          return { success: true };
+        data = await response.json().catch(() => null);
+        signinSuccess = Boolean(
+          data && (data.success === true || extractAuthToken(data) !== null),
+        );
+        try {
+          signinHttpStatus =
+            typeof response.status === "function"
+              ? response.status()
+              : Number(response.status) || 0;
+        } catch {
+          signinHttpStatus = 0;
         }
-      } else if (result.data.success === false) {
-        const code = result.data?.data?.code || result.data?.code;
-        const details =
-          result.data?.data?.details || result.data?.details || result.data?.message;
-        const classified = classifyQwenAuthError(code, details);
-        return {
-          success: false,
-          permanentFailure: classified.isPermanent,
-          reason: classified.reason,
-        };
+      } catch {}
+    }
+
+    if (!signinSuccess && !data) {
+      // Fallback to in-page evaluate fetch if page.request was unavailable
+      const requestId = crypto.randomUUID();
+      const evalRes = await page
+        .evaluate(
+          async ({ email, password, signinUrl, requestId }) => {
+            try {
+              const response = await fetch(signinUrl, {
+                method: "POST",
+                signal: AbortSignal.timeout(10_000),
+                credentials: "include",
+                headers: {
+                  accept: "application/json, text/plain, */*",
+                  "content-type": "application/json",
+                  source: "web",
+                  timezone: new Date().toString().split(" (")[0],
+                  "x-request-id": requestId,
+                },
+                body: JSON.stringify({ email, password, login_type: "email" }),
+              });
+              const json = await response.json().catch(() => null);
+              return { ok: response.ok, status: response.status, data: json };
+            } catch (e: any) {
+              return { ok: false, error: e.message };
+            }
+          },
+          { email, password: hashedPassword, signinUrl, requestId },
+        )
+        .catch(() => null);
+
+      if (evalRes?.data) {
+        data = evalRes.data;
+        if (typeof evalRes.status === "number") signinHttpStatus = evalRes.status;
+        signinSuccess = Boolean(
+          data && (data.success === true || extractAuthToken(data) !== null),
+        );
       }
     }
 
-    if (result.ok) {
-      await page.goto(qwenUrl("/"), {
-        waitUntil: "domcontentloaded",
-        timeout: config.timeouts.navigation,
-      });
-      const loggedIn = await isPageLoggedIn(page);
+    if (data?.success === false) {
+      const code = data?.data?.code || data?.code;
+      const details = data?.data?.details || data?.details || data?.message;
+      const classified = classifyQwenAuthError(code, details);
+      trace.httpStatus = signinHttpStatus;
+      trace.appSuccess = false;
+      trace.appAuthFailure = true;
+      trace.topKeys = topKeysOf(data);
+      trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
+      trace.tokenPathUsed = authTokenPathUsed(data);
+      trace.challengeSignals = classifySigninChallenge(code, details);
+      storeTrace();
       return {
-        success: loggedIn,
-        reason: loggedIn ? undefined : "Sessão não autenticada após signin",
+        success: false,
+        permanentFailure: classified.isPermanent,
+        reason: classified.reason,
       };
     }
+
+    if (signinSuccess) {
+      const token = extractAuthToken(data);
+      trace.httpStatus = signinHttpStatus;
+      trace.appSuccess = true;
+      trace.appAuthFailure = false;
+      trace.topKeys = topKeysOf(data);
+      trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
+      trace.tokenPathUsed = authTokenPathUsed(data);
+      // Pre-install token hash baseline (cookie token before install).
+      try {
+        const preCookies = await page.context().cookies().catch(() => []);
+        const preTok = preCookies.find(
+          (c: { name: string; value: string }) => c.name === "token",
+        );
+        trace.tokenHashBefore =
+          preTok && preTok.value ? traceHashStr(preTok.value) : null;
+      } catch {
+        trace.tokenHashBefore = null;
+      }
+      if (token) {
+        try {
+          await page.context().addCookies([
+            {
+              name: "token",
+              value: token,
+              domain: ".qwen.ai",
+              path: "/",
+              expires: Math.floor(Date.now() / 1000) + 31536000,
+              httpOnly: false,
+              secure: true,
+              sameSite: "Lax",
+            },
+          ]);
+          trace.cookieInstallOk = true;
+        } catch {
+          trace.cookieInstallOk = false;
+        }
+      }
+
+      await page
+        .goto(qwenUrl("/"), {
+          waitUntil: "domcontentloaded",
+          timeout: config.timeouts.navigation,
+        })
+        .catch(() => {});
+
+      if (token) {
+        try {
+          await page
+            .evaluate((tok) => {
+              try {
+                localStorage.removeItem("qwen_token_logged_out_marker");
+                localStorage.setItem("token", tok);
+                document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+              } catch {}
+            }, token)
+            .catch(() => {
+              throw new Error("ls-write-failed");
+            });
+          trace.lsWriteOk = true;
+        } catch {
+          trace.lsWriteOk = false;
+        }
+        void import("./session-tracer.ts")
+          .then((m) => m.traceLsCheckpoint(accountId, "pre-reload").catch(() => {}))
+          .catch(() => {});
+        try {
+          await page
+            .reload({ waitUntil: "domcontentloaded" })
+            .catch(() => {
+              throw new Error("reload-failed");
+            });
+          trace.reloadOk = true;
+        } catch {
+          trace.reloadOk = false;
+        }
+        void import("./session-tracer.ts")
+          .then((m) => m.traceLsCheckpoint(accountId, "post-reload").catch(() => {}))
+          .catch(() => {});
+        try {
+          const postCookies = await page.context().cookies().catch(() => []);
+          const snap = cookieNamesOf(postCookies);
+          trace.cookieCountAfter = snap.count;
+          trace.cookieNamesChanged = snap.hash !== preCookieHash;
+          const postTok = postCookies.find(
+            (c: { name: string; value: string }) => c.name === "token",
+          );
+          trace.tokenHashAfter =
+            postTok && postTok.value ? traceHashStr(postTok.value) : null;
+          trace.tokenChanged =
+            trace.tokenHashBefore !== null && trace.tokenHashAfter !== null
+              ? trace.tokenHashBefore !== trace.tokenHashAfter
+              : trace.tokenHashBefore === null && trace.tokenHashAfter === null
+                ? null
+                : true;
+        } catch {
+          // Best effort.
+        }
+        try {
+          const t = await page
+            .evaluate((): string | null => {
+              try {
+                const v = localStorage.getItem("token");
+                return typeof v === "string" && v.length > 0 ? v : null;
+              } catch {
+                return null;
+              }
+            })
+            .catch(() => null);
+          const postLs = typeof t === "string" ? t : null;
+          trace.lsTokenPresentAfter = postLs !== null;
+          trace.lsTokenChanged =
+            (preLsToken === null) !== (postLs === null) ||
+            (preLsToken !== null && postLs !== null && preLsToken !== postLs);
+        } catch {
+          // Best effort.
+        }
+        trace.installed = true;
+        try {
+          const { traceLsCheckpoint } = await import("./session-tracer.ts");
+          await traceLsCheckpoint(accountId, "post-install").catch(() => {});
+        } catch {
+          // Tracing must never break login.
+        }
+        // Post-login validation MUST be non-mutating: the full probe calls
+        // /api/v1/auths/ and auth.qwen.ai/api/v2/auths/refresh, both of which
+        // rotate the session cookie, which makes the SPA drop
+        // localStorage.token and set qwen_token_logged_out_marker right after
+        // we installed it. The single settings read is enough to confirm the
+        // session and does not rotate anything.
+        const pvBefore = await readSessionPresence(page);
+        try {
+          // probePageLoggedIn (what isPageLoggedIn delegates to) is called
+          // directly so the validation reason is available for telemetry.
+          const pvRes = await probePageLoggedIn(page, 3000, {
+            nonMutating: true,
+          });
+          trace.validated = pvRes.ok;
+          const pv0 = trace.postValidation;
+          pv0.settingsStatus = pvRes.reason.startsWith("settings-")
+            ? pvRes.reason === "settings-401"
+              ? 401
+              : pvRes.reason === "settings-403"
+                ? 403
+                : 200
+            : pvRes.reason === "ok"
+              ? 200
+              : 0;
+          pv0.settingsAppFail = !pvRes.ok;
+          trace.postValidationReason = pvRes.reason;
+        } catch {
+          trace.validated = false;
+        }
+        try {
+          const pvAfter = await readSessionPresence(page);
+          const pv = trace.postValidation;
+          pv.before = {
+            lsPresent: pvBefore.lsPresent,
+            cookiePresent: pvBefore.cookiePresent,
+            marker: pvBefore.marker,
+          };
+          pv.after = {
+            lsPresent: pvAfter.lsPresent,
+            cookiePresent: pvAfter.cookiePresent,
+            marker: pvAfter.marker,
+          };
+          pv.cookieRotated =
+            pvBefore.cookiePresent && pvAfter.cookiePresent
+              ? pvBefore.cookieHash !== pvAfter.cookieHash
+              : pvBefore.cookiePresent !== pvAfter.cookiePresent;
+          pv.lsRemoved = pvBefore.lsPresent && !pvAfter.lsPresent;
+          pv.markerCreated = !pvBefore.marker && pvAfter.marker;
+          pv.invariant =
+            pv.cookieRotated || pv.lsRemoved || pv.markerCreated
+              ? "VIOLATED"
+              : "OK";
+          if (pv.invariant === "VIOLATED") {
+            console.warn(
+              `[Playwright] post-login validation invariant VIOLATED for ` +
+                `${accountId?.slice(0, 8)}: cookieRotated=${pv.cookieRotated} ` +
+                `lsRemoved=${pv.lsRemoved} markerCreated=${pv.markerCreated}`,
+            );
+          }
+        } catch {
+          // Best effort: the invariant is a tripwire, never a gate.
+        }
+        try {
+          const { snapshotSessionState, traceSessionEvent } = await import(
+            "./session-tracer.ts"
+          );
+          const snap = await snapshotSessionState(accountId || "", {
+            context: page.context(),
+            page,
+          }).catch(() => null);
+          if (accountId) {
+            traceSessionEvent(accountId, "LOGIN_END", "installed", snap);
+          }
+        } catch {
+          // Tracing must never break login.
+        }
+        storeTrace();
+        return { success: true };
+      }
+    }
+
+    trace.httpStatus = signinHttpStatus;
+    trace.appSuccess = false;
+    trace.topKeys = topKeysOf(data);
+    trace.dataKeys = topKeysOf((data as { data?: unknown })?.data);
+    trace.tokenPathUsed = authTokenPathUsed(data);
+    storeTrace();
     return {
       success: false,
-      reason: result.error || `HTTP ${result.status || "desconhecido"} sem corpo JSON válido`,
+      reason: "API signin não confirmou sessão autenticada",
     };
   } catch (err: any) {
-    console.warn(`⚠️  [Playwright] API login error: ${err?.message || err}`);
-    return { success: false, reason: err?.message || String(err) };
+    const errMsg = err?.message || String(err);
+    if (page && !page.isClosed()) {
+      try {
+        await sleep(1500);
+        if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+          trace.validated = true;
+          storeTrace();
+          return { success: true };
+        }
+      } catch {}
+    }
+    console.warn(`⚠️  [Playwright] API login error: ${errMsg}`);
+    trace.validated = false;
+    storeTrace();
+    return { success: false, reason: errMsg };
+  }
+}
+
+/**
+ * Extract an auth token from a signin/refresh payload following the official
+ * SPA contract: accessToken/access_token at top/result/data levels, with
+ * legacy plain `token` as fallback. Pure and unit-tested. Never logs values.
+ */
+export function extractAuthToken(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const levels: unknown[] = [
+    data,
+    (data as { result?: unknown }).result,
+    (data as { data?: unknown }).data,
+  ];
+  for (const level of levels) {
+    if (!level || typeof level !== "object") continue;
+    const rec = level as Record<string, unknown>;
+    for (const key of ["accessToken", "access_token", "token"]) {
+      const v = rec[key];
+      if (typeof v === "string" && v.length > 0) return v;
+    }
+  }
+  return null;
+}
+export interface AutofillResult {
+  /** Credentials were submitted (or session already valid). */
+  submitted: boolean;
+  /** No login needed at all. */
+  alreadyLoggedIn: boolean;
+  /** Sanitized machine reason (never contains credentials or DOM text). */
+  reason:
+    | "already-logged-in"
+    | "submitted"
+    | "no-credentials"
+    | "no-form"
+    | "challenge-wall"
+    | "no-password-field"
+    | "submit-failed";
+}
+
+/**
+ * Backend-only credential autofill for manual verification windows.
+ * Fills email + password from the account store and submits. NEVER solves
+ * captchas/sliders (the user does that by hand) and NEVER logs credentials.
+ * Returns quickly; the caller keeps the window open for manual completion.
+ */
+export async function autofillQwenLoginForm(
+  page: Page,
+  email: string,
+  password: string,
+): Promise<AutofillResult> {
+  if (!email || !password) {
+    return { submitted: false, alreadyLoggedIn: false, reason: "no-credentials" };
+  }
+  try {
+    if (await isPageLoggedIn(page, 5000)) {
+      return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
+    }
+  } catch {
+    // Fall through to form fill on probe failure.
+  }
+  try {
+    const url = typeof page.url === "function" ? page.url() : "";
+    const onAuthPage = url.includes("/auth") || url.includes("/login");
+    if (!onAuthPage) {
+      // Chat home in logged-out state shows a sign-in entry point; prefer
+      // structural selectors over locale text.
+      const entrySelectors = [
+        'a[href*="/auth"]',
+        'button:has-text("Log in")',
+        'button:has-text("Sign in")',
+        ".header-right-auth-button",
+        ".auth-buttons",
+      ];
+      for (const sel of entrySelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 1200 }).catch(() => false)) {
+            await btn.click({ timeout: 3000 }).catch(() => {});
+            await sleep(1500);
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+      const nowUrl = typeof page.url === "function" ? page.url() : "";
+      if (!nowUrl.includes("/auth") && !nowUrl.includes("/login")) {
+        await page.goto(qwenUrl("/auth"), {
+          waitUntil: "domcontentloaded",
+          timeout: config.timeouts.navigation,
+        }).catch(() => {});
+        await sleep(1500);
+      }
+    }
+
+    const emailSelector = [
+      'input[type="email"]',
+      'input[name="email"]',
+      'input[autocomplete="email"]',
+      'input[placeholder*="Email" i]',
+      'input[placeholder*="email" i]',
+      'input[placeholder*="correo" i]',
+    ].join(", ");
+    try {
+      await page.waitForSelector(emailSelector, { timeout: 8_000 });
+    } catch {
+      // No form at all: distinguish a challenge wall (user may still solve
+      // it by hand) from a truly missing form.
+      try {
+        const wall = await page.evaluate(() => {
+          const html = document.documentElement.innerHTML.slice(0, 20000).toLowerCase();
+          return (
+            html.includes("captcha") ||
+            html.includes("challenge") ||
+            html.includes("verify you are human") ||
+            html.includes("slider") ||
+            document.querySelector('iframe[src*="captcha" i],iframe[src*="challenge" i]') !== null
+          );
+        }).catch(() => false);
+        if (wall) {
+          return { submitted: false, alreadyLoggedIn: false, reason: "challenge-wall" };
+        }
+      } catch {}
+      return { submitted: false, alreadyLoggedIn: false, reason: "no-form" };
+    }
+    try {
+      const pwdModeBtn = page.getByText(/Log in with a password|Iniciar sesi\u00f3n con contrase\u00f1a/i).first();
+      if (await pwdModeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await pwdModeBtn.click().catch(() => {});
+        await sleep(500);
+      }
+    } catch {}
+    await page.fill(emailSelector, email).catch(() => {});
+    await sleep(300);
+
+    const passwordSelector = 'input[type="password"], input[name="password"]';
+    const pwdVisible = await page
+      .waitForSelector(passwordSelector, { timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!pwdVisible) {
+      // Leave the window open: the user may continue manually (OTP etc.).
+      return { submitted: false, alreadyLoggedIn: false, reason: "no-password-field" };
+    }
+    await page.fill(passwordSelector, password).catch(() => {});
+    await sleep(500);
+    const submitSelector =
+      'button.qwenchat-auth-pc-submit-button, button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")';
+    try {
+      await page.waitForSelector('button[type="submit"]:not([disabled])', {
+        timeout: 5_000,
+      });
+      await page.locator(submitSelector).first().click().catch(() => {});
+    } catch {
+      await page.keyboard.press("Enter").catch(() => {});
+    }
+    await sleep(2000);
+    return { submitted: true, alreadyLoggedIn: false, reason: "submitted" };
+  } catch {
+    return { submitted: false, alreadyLoggedIn: false, reason: "submit-failed" };
   }
 }
 
@@ -1967,12 +4019,7 @@ async function loginViaUi(
       waitUntil: "domcontentloaded",
       timeout: config.timeouts.navigation,
     });
-    await sleep(2000);
-
-    // Check if already logged in
-    if (!page.url().includes("/auth")) {
-      return { success: true };
-    }
+    await sleep(1500);
 
     // Wait for email input
     const emailSelector = [
@@ -1984,9 +4031,12 @@ async function loginViaUi(
     ].join(", ");
     try {
       await page.waitForSelector(emailSelector, {
-        timeout: config.timeouts.page,
+        timeout: Math.min(config.timeouts.page, 8_000),
       });
     } catch {
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+        return { success: true };
+      }
       if (!page.url().includes("/auth")) return { success: true };
       console.warn(
         `⚠️  [Playwright] Email input not found on ${page.url()} (possible captcha or anti-bot challenge)`,
@@ -1994,34 +4044,59 @@ async function loginViaUi(
       return { success: false, reason: "Campo de e-mail não encontrado (possível captcha)" };
     }
 
+    // In Qwen Web, if the page opens on the default email OTP panel, click "Log in with a password"
+    // to reveal the standard email + password form.
+    try {
+      const pwdModeBtn = page.getByText(/Log in with a password/i).first();
+      if (await pwdModeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await pwdModeBtn.click().catch(() => {});
+        await sleep(500);
+      }
+    } catch {}
+
     // Fill email
     await page.fill(emailSelector, email);
+    await sleep(300);
 
-    // The password field may already be visible (single-step form) or only
-    // appear after submitting the email (two-step flow).
+    // If "Log in with a password" button appeared after typing email, click it
+    try {
+      const pwdModeBtn = page.getByText(/Log in with a password/i).first();
+      if (await pwdModeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await pwdModeBtn.click().catch(() => {});
+        await sleep(500);
+      }
+    } catch {}
+
+    // In Qwen Web, the password field is present on the same form.
+    // NEVER press Enter after filling email alone, as Qwen interprets that
+    // as a request to sign in via email verification code (passwordless OTP).
     const passwordSelector =
       'input[type="password"], input[name="password"]';
-    const passwordAlreadyVisible = await page
-      .locator(passwordSelector)
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    if (!passwordAlreadyVisible) {
-      await page.keyboard.press("Enter");
+    try {
       await page.waitForSelector(passwordSelector, {
-        timeout: config.timeouts.page,
+        timeout: 10_000,
       });
+    } catch {
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+        return { success: true };
+      }
+      console.warn(
+        `⚠️  [Playwright] Password input not found on ${page.url()}`,
+      );
+      return {
+        success: false,
+        reason: "Campo de senha não encontrado na tela de autenticação",
+      };
     }
-    await sleep(500);
 
     // Fill password
     await page.fill(passwordSelector, password);
+    await sleep(500);
 
     // Prefer clicking the submit button; fall back to pressing Enter.
     // The button starts disabled and only enables once both fields are filled.
     const submitSelector =
-      'button[type="submit"].qwenchat-auth-pc-submit-button, button[type="submit"]';
+      'button.qwenchat-auth-pc-submit-button, button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")';
     const submitButton = page.locator(submitSelector).first();
     try {
       await page.waitForSelector('button[type="submit"]:not([disabled])', {
@@ -2039,6 +4114,18 @@ async function loginViaUi(
       maxAttempts: config.captcha.maxAttempts,
       retryDelayMs: config.captcha.retryDelayMs,
     }).catch(() => {});
+
+    // Check if an OTP code verification screen appeared (e.g. 2FA / email verification code)
+    const codeSelector =
+      'input[placeholder*="code" i], input[placeholder*="código" i], input[name*="code" i]';
+    const codeInput = page.locator(codeSelector).first();
+    if (await codeInput.isVisible().catch(() => false)) {
+      return {
+        success: false,
+        reason: "Conta requer código de verificação enviado por e-mail (2FA/OTP)",
+      };
+    }
+
     // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
     const errorSelector = [
       ".qwen-chat-v2-toast-text",
@@ -2096,11 +4183,22 @@ export async function captureQwenHeaders(
   pageOverride?: Page,
   timeoutMs = config.timeouts.headers,
   triggerGraceMs = HEADER_CAPTURE_TRIGGER_GRACE_MS,
+  options: { persistSession?: boolean } = {},
 ): Promise<void> {
+  // persistSession=false: refresh runtime/header cache only, NEVER touch
+  // qwen_auth_sessions (used by manual verification, whose fresh snapshot is
+  // already durable). Default true preserves existing behavior everywhere.
+  const persistSession = options.persistSession !== false;
   const page = pageOverride ?? accountPages.get(accountId);
   if (!page || page.isClosed()) {
     throw new Error(`Playwright page unavailable for header capture: ${accountId}`);
   }
+  void import("./session-tracer.ts").then((m) =>
+    m.traceLsCheckpoint(accountId, "capture-entry").catch(() => {}),
+  ).catch(() => {});
+  try {
+    traceSessionEvent(accountId, "CAPTURE_START");
+  } catch {}
 
   touchAccountActivity(accountId);
   const cache = getHeaderCache(accountId);
@@ -2171,6 +4269,9 @@ export async function captureQwenHeaders(
               `❌ [Playwright] Header capture failed for ${accountId} after ${graceTimeoutCount} silent send(s): ${error?.message ?? "no completion request"}`,
             );
           }
+        }
+        if (!headersCaptured) {
+          unmarkAccountHeadersReady(accountId);
         }
         if (error) reject(error);
         else resolve();
@@ -2285,7 +4386,10 @@ export async function captureQwenHeaders(
         // Ignore parse errors or missing postData
       }
 
-      if (!hasRequiredQwenHeaders(capturedHeaders)) {
+      if (
+        !hasRequiredQwenHeaders(capturedHeaders) ||
+        !hasValidAuthToken(capturedHeaders.cookie)
+      ) {
         // Not evidence the page is broken: the SDK also fires completions
         // before it has computed its token. The request still must never reach
         // Qwen, but the capture keeps its route and spends another send —
@@ -2300,6 +4404,21 @@ export async function captureQwenHeaders(
       }
 
       headersCaptured = true;
+      void import("./session-tracer.ts").then((m) =>
+        m.traceLsCheckpoint(accountId, "capture-success").catch(() => {}),
+      ).catch(() => {});
+      try {
+        const { snapshotSessionState, traceSessionEvent } = await import(
+          "./session-tracer.ts"
+        );
+        const snap = await snapshotSessionState(accountId, {
+          context: page.context(),
+          page,
+        }).catch(() => null);
+        traceSessionEvent(accountId, "CAPTURE_END", "intercept", snap);
+      } catch {
+        // Tracing must never break capture.
+      }
       if (timeout) clearTimeout(timeout);
       cache.headers = capturedHeaders;
       if (capturedHeaders["version"]) {
@@ -2311,6 +4430,35 @@ export async function captureQwenHeaders(
       // a cookie snapshot taken before this browser request.
       cookieCaches.delete(accountId);
       touchAccountActivity(accountId);
+
+      // Persist captured anti-bot headers to SQLite for instant boot.
+      // Skipped when persistSession=false (manual verification owns the
+      // durable row; capture only refreshes runtime cache here).
+      if (persistSession) {
+      try {
+        const { saveAuthSession } = await import("../core/database.ts");
+        const { parseJwtExpiry } = await import("../utils/jwt.ts");
+        const tokenExpiry = parseJwtExpiry(capturedHeaders.cookie);
+        saveAuthSession(accountId, {
+          cookie: capturedHeaders.cookie,
+          userAgent: capturedHeaders["user-agent"],
+          bxV: capturedHeaders["bx-v"],
+          bxUa: capturedHeaders["bx-ua"],
+          bxUmidtoken: capturedHeaders["bx-umidtoken"],
+          secChUa: capturedHeaders["sec-ch-ua"],
+          secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
+          secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
+          version: capturedHeaders["version"],
+          tokenExpiresAt: tokenExpiry || undefined,
+          capturedAt: Date.now(),
+          // Opportunistic: keep the refresh bookkeeping fresh when the
+          // captured jar carries it. Absence keeps the stored value
+          // (saveAuthSession preserves on undefined).
+          refreshToken:
+            getJarPair(capturedHeaders.cookie, "refresh_token") ?? undefined,
+        });
+      } catch {}
+      }
 
       await route.abort("aborted").catch(() => {});
       routeResult = "abort";
@@ -2324,8 +4472,15 @@ export async function captureQwenHeaders(
     // Navigate to the stable chat page. Only the first attempt pays for this:
     // a re-trigger types into the page that is already loaded, and reloading
     // would throw away the bx SDK state that just finished warming up.
-    const openChatPage = async () => {
+    const openChatPage = async (forceReload = false) => {
       if (settled || page.isClosed()) return;
+      // Demand-only fast-boot: if init already loaded chat home on this page,
+      // skip the redundant navigation (preserves warm bx-SDK state).
+      if (!forceReload && (page as any).__qwenChatHomeLoaded) {
+        delete (page as any).__qwenChatHomeLoaded;
+        await sleep(500);
+        return;
+      }
       captureStageEnter("capture_goto");
       try {
         await page.goto(qwenUrl("/"), {
@@ -2350,24 +4505,40 @@ export async function captureQwenHeaders(
       await clearVisibleChallenge(page);
       if (settled || page.isClosed()) return;
 
-      // Session-expiry fast path: if the page landed on the auth/login screen
-      // (redirection after a dead session), typing into the chat input would
-      // burn every trigger attempt on a textarea that does not exist. Re-login
-      // immediately when credentials are available; otherwise fail fast with a
-      // clear diagnosis instead of 3 pointless grace timeouts.
-      const loggedIn = await isPageLoggedIn(
-        page,
-        Math.max(1_000, Math.min(remainingBudgetMs(), SESSION_PROBE_NAVIGATION_TIMEOUT_MS)),
-      );
-      if (!loggedIn) {
+      // Session-expiry check: if the page redirected to /auth or /login,
+      // re-login immediately.
+      // On attempt 1, skip probe because the session was just verified during init.
+      // On attempt 2+, probe isPageLoggedIn to catch revoked sessions or guest state
+      // immediately without waiting for repeated silent timeouts.
+      const currentUrl = typeof page.url === "function" ? page.url() : "";
+      const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
+      // Non-mutating on attempt 2+: the full probe reads /api/v1/auths/ and
+      // auth.qwen.ai/api/v2/auths/refresh (both rotate the session cookie) and
+      // fails closed on qwen_token_logged_out_marker, which our own login
+      // sequence sets asynchronously. Using it here turned a healthy page into
+      // "re-login after session expiry did not succeed".
+      const isSuspectedGuest =
+        isAuthUrl ||
+        (attempt >= 2 && !(await isPageLoggedIn(page, 5000, { nonMutating: true })));
+      if (isSuspectedGuest) {
         const { getAccountCredentials } = await import("../core/accounts.ts");
         const creds = getAccountCredentials(accountId);
         if (creds && creds.email && creds.password) {
           console.warn(
-            `⚠️  [Playwright] Session expired during header capture for ${accountId}; re-authenticating...`,
+            `⚠️  [Playwright] Session expired or guest state detected during header capture for ${accountId}; re-authenticating...`,
           );
-          const ok = await loginToQwen(accountId, creds.email, creds.password);
-          if (!ok || !(await isPageLoggedIn(page))) {
+          armOverallDeadline();
+          const ok = await loginToQwen(accountId, creds.email, creds.password, "capture-recovery");
+          if (ok) {
+            // Re-login navigated; load the chat page and wait for hydration so
+            // the check below probes a live authenticated chat page.
+            await page.goto(qwenUrl("/"), {
+              waitUntil: "domcontentloaded",
+              timeout: Math.min(config.timeouts.navigation, timeoutMs),
+            });
+            await sleep(2000);
+          }
+          if (!ok || !(await isPageLoggedIn(page, 6000, { nonMutating: true }))) {
             settle(
               new Error(
                 `Header capture failed for ${accountId}: re-login after session expiry did not succeed`,
@@ -2375,9 +4546,7 @@ export async function captureQwenHeaders(
             );
             return;
           }
-          // Re-login navigated away; reload the chat page so the send below
-          // types into a live chat input (never leave the loop parked).
-          await openChatPage();
+          armOverallDeadline();
           if (settled || page.isClosed()) return;
         } else {
           settle(
@@ -2395,23 +4564,21 @@ export async function captureQwenHeaders(
       // picking a sibling textarea/contenteditable), then fall back to generic.
       // Mirrors upstream 5b3fd3e (robust account header capture).
       const inputSelector =
-        'textarea.message-input-textarea:visible, textarea:visible, [contenteditable="true"]:visible';
+        "textarea.message-input-textarea, textarea[placeholder*='Ask' i], textarea[placeholder*='Pergunte' i], textarea";
       // Bound the appearance wait: a page that never renders the chat input is
       // blocked (WAF interstitial, punish document, or failed SPA hydration).
       // Unbounded, page.focus would burn its 60s default timeout on every
       // attempt, freezing the whole capture and cooling a healthy account with
       // AuthInitFailed. A miss marks the attempt for a reload instead.
+      const inputLocator = page.locator(inputSelector).first();
       try {
-        await page
-          .locator(inputSelector)
-          .first()
-          .waitFor({
-            state: "visible",
-            timeout: Math.max(
-              1,
-              Math.min(CHAT_INPUT_APPEAR_TIMEOUT_MS, remainingBudgetMs()),
-            ),
-          });
+        await inputLocator.waitFor({
+          state: "visible",
+          timeout: Math.max(
+            1,
+            Math.min(CHAT_INPUT_APPEAR_TIMEOUT_MS, remainingBudgetMs()),
+          ),
+        });
       } catch {
         if (settled || page.isClosed()) return;
         console.warn(
@@ -2431,14 +4598,48 @@ export async function captureQwenHeaders(
       for (let interactionTry = 1; interactionTry <= 2; interactionTry++) {
         if (settled || page.isClosed()) return;
         try {
-          await page.focus(inputSelector, { timeout: inputActionTimeoutMs });
+          // Upstream-tolerant interaction (locator API + native setter for
+          // React-controlled inputs), gated by the local probe check: the
+          // steps below swallow errors, so verify the character landed and
+          // throw to trigger the reload path when it did not.
+          if (typeof (inputLocator as any).focus === "function") {
+            await (inputLocator as any).focus({ timeout: inputActionTimeoutMs }).catch(() => {});
+          } else {
+            await page.focus(inputSelector, { timeout: inputActionTimeoutMs }).catch(() => {});
+          }
           if (settled || page.isClosed()) return;
-          await page.fill(inputSelector, "", { timeout: inputActionTimeoutMs });
-          if (settled || page.isClosed()) return;
-          await page.type(inputSelector, "a", {
-            delay: 100,
-            timeout: inputActionTimeoutMs,
-          });
+          if (typeof (inputLocator as any).fill === "function") {
+            await (inputLocator as any).fill("a", { timeout: inputActionTimeoutMs }).catch(() => {});
+          } else {
+            await page.fill(inputSelector, "a", { timeout: inputActionTimeoutMs }).catch(() => {});
+          }
+
+          if (typeof page.evaluate === "function") {
+            await page.evaluate((sel) => {
+              const el = document.querySelector(sel) as HTMLTextAreaElement | null;
+              if (el) {
+                el.focus();
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLTextAreaElement.prototype,
+                  "value",
+                )?.set;
+                if (nativeSetter) {
+                  nativeSetter.call(el, "a");
+                } else {
+                  el.value = "a";
+                }
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+              }
+            }, inputSelector).catch(() => {});
+          }
+          const probeLanded = typeof page.evaluate === "function"
+            ? await page.evaluate((sel) => {
+                const el = document.querySelector(sel) as HTMLTextAreaElement | null;
+                return Boolean(el && typeof el.value === "string" && el.value.includes("a"));
+              }, inputSelector).catch(() => false)
+            : true;
+          if (!probeLanded) throw new Error("chat input probe character not present");
           interactionSucceeded = true;
           break;
         } catch {
@@ -2461,13 +4662,28 @@ export async function captureQwenHeaders(
         return;
       }
       if (settled || page.isClosed()) return;
-      await sleep(2000);
+
+      // Wait up to 3s for React to enable the send button after typing
+      try {
+        await page.waitForFunction(() => {
+          const btn = document.querySelector(
+            ".message-input-right-button-send .send-button, .message-input-right-button-send button, .chat-prompt-send-button, button.send-button, button[aria-label*='Send' i], button[aria-label*='Enviar' i], .send-button-container button"
+          ) as HTMLButtonElement | null;
+          return btn && !btn.disabled && !btn.classList.contains("disabled") && btn.getAttribute("aria-disabled") !== "true";
+        }, { timeout: 3000 });
+      } catch {
+        await sleep(500);
+      }
       if (settled || page.isClosed()) return;
 
       const sendSelectors = [
         ".message-input-right-button-send .send-button",
+        ".message-input-right-button-send button",
         ".chat-prompt-send-button",
         "button.send-button",
+        "button[aria-label*='Send' i]",
+        "button[aria-label*='Enviar' i]",
+        ".send-button-container button",
       ];
 
       let clicked = false;
@@ -2476,18 +4692,19 @@ export async function captureQwenHeaders(
         try {
           const btn = await page.$(selector);
           if (btn && (await btn.isVisible())) {
-            await page.evaluate((sel) => {
-              const element = document.querySelector(sel) as HTMLElement;
-              if (element) {
-                element.focus();
-                element.click();
-              }
-            }, selector);
-            if (!settled && !page.isClosed()) {
-              await btn.click({ force: true, delay: 50 }).catch(() => {});
+            const isDisabled = await page.evaluate((el) => {
+              const b = el as HTMLButtonElement;
+              return (
+                b.disabled ||
+                b.classList.contains("disabled") ||
+                b.getAttribute("aria-disabled") === "true"
+              );
+            }, btn);
+            if (!isDisabled) {
+              await btn.click({ delay: 50 }).catch(() => {});
+              clicked = true;
+              break;
             }
-            clicked = true;
-            break;
           }
         } catch {
           // Try the next selector.
@@ -2531,14 +4748,13 @@ export async function captureQwenHeaders(
           // A missing chat input is the exception: the page never rendered the
           // chat UI, so there is no warm SDK state to protect and only a fresh
           // load can recover it.
-          if (
-            attempt === 1 ||
+          const needReload =
             lastAttemptInputMissing ||
-            (lastAttemptGraceTimedOut && attempt >= 3)
-          ) {
+            (lastAttemptGraceTimedOut && attempt >= 3);
+          if (attempt === 1 || needReload) {
             lastAttemptGraceTimedOut = false;
             lastAttemptInputMissing = false;
-            await openChatPage();
+            await openChatPage(needReload);
           }
           if (settled) return;
           await withCaptureStage("trigger_send", () => triggerSend(attempt));
@@ -2630,24 +4846,120 @@ async function getCookieSnapshot(
 }
 
 /**
+ * Wait for the `refresh_token` cookie to land in a browser context after a
+ * login. Qwen emits the access token (localStorage + `token` cookie) and the
+ * `refresh_token` cookie in the same sign-in, but not always in the same
+ * tick — persisting on the first token sighting writes refresh-less sessions
+ * that can never renew without a browser. Polls the live jar (no fixed
+ * sleep) with a bounded deadline so a missing cookie cannot hold login open.
+ *
+ * @returns true when the jar contains refresh_token (already or on arrival).
+ */
+export async function waitForRefreshTokenCookie(
+  context: Pick<BrowserContext, "cookies">,
+  timeoutMs = 10_000,
+  pollMs = 500,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    try {
+      const cookies = await context.cookies();
+      if (
+        cookies.some(
+          (c) => c.name === "refresh_token" && c.value && c.value.length > 0,
+        )
+      ) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    if (Date.now() >= deadline) return false;
+    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+  }
+}
+
+/**
+ * Check whether a raw cookie header string contains a valid, non-empty auth token.
+ */
+export function hasValidAuthToken(cookieHeader?: string): boolean {
+  if (!cookieHeader || typeof cookieHeader !== "string") return false;
+  const match = cookieHeader.match(/(?:^|;\s*)token=([^;]+)/);
+  if (!match || !match[1]) return false;
+  const value = match[1].trim();
+  if (
+    value === "" ||
+    value === '""' ||
+    value === "''" ||
+    value === "null" ||
+    value === "undefined"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function parseCookiesForBrowser(cookieHeader: string): Array<{ name: string; value: string; domain: string; path: string; expires: number }> {
+  if (!cookieHeader) return [];
+  const pairs = cookieHeader.split(";").map((s) => s.trim()).filter(Boolean);
+  const result: Array<{ name: string; value: string; domain: string; path: string; expires: number }> = [];
+  const expires = Math.floor(Date.now() / 1000) + 3600 * 24 * 365;
+  for (const pair of pairs) {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx !== -1) {
+      const name = pair.slice(0, eqIdx).trim();
+      const value = pair.slice(eqIdx + 1).trim();
+      if (name) {
+        result.push({
+          name,
+          value,
+          domain: ".qwen.ai",
+          path: "/",
+          expires,
+        });
+      }
+    }
+  }
+  return result;
+}
+
+/**
  * Check if the auth token cookie is still valid.
  * Used to skip unnecessary header recaptures when the token is still fresh.
+ * Inspects the JWT exp claim when present rather than relying on cookie Max-Age.
  * Returns true if the token cookie exists and is not expired.
  */
-function isAuthTokenValidFrom(cookies: CookieSnapshot): boolean {
+export function isAuthTokenValidFrom(
+  cookies: CookieSnapshot,
+  safetyMarginMs = 5 * 60 * 1000,
+): boolean {
   const tokenCookie = cookies.find(
     (c) =>
       c.name === "token" && (c.domain === ".qwen.ai" || c.domain === "qwen.ai"),
   );
 
-  if (!tokenCookie) return false;
+  if (
+    !tokenCookie ||
+    !tokenCookie.value ||
+    tokenCookie.value.trim() === "" ||
+    tokenCookie.value.trim() === '""'
+  ) {
+    return false;
+  }
+
+  // If the token is a JWT, check its exp claim rather than the 1-year cookie Max-Age
+  const jwtExpSec = parseJwtExpiry(tokenCookie.value);
+  if (typeof jwtExpSec === "number" && Number.isFinite(jwtExpSec)) {
+    const expMs = jwtExpSec * 1000;
+    return expMs > Date.now() + safetyMarginMs;
+  }
 
   // Session cookie (expires = -1) is valid as long as browser is open
   if (tokenCookie.expires === -1) return true;
 
-  // Check if expired (with 5-min safety margin)
+  // Opaque token fallback: check cookie expiration with safety margin
   const expiresAt = tokenCookie.expires * 1000;
-  return expiresAt > Date.now() + 5 * 60 * 1000;
+  return expiresAt > Date.now() + safetyMarginMs;
 }
 
 /**
@@ -2670,6 +4982,7 @@ function isShortestCookieValidFrom(cookies: CookieSnapshot): boolean {
 async function refreshHeadersInternal(
   accountId: string,
   timeoutMs = config.timeouts.headers,
+  forceReauth = false,
 ): Promise<void> {
   const cache = getHeaderCache(accountId);
   if (cache.refreshInProgress) return;
@@ -2680,48 +4993,115 @@ async function refreshHeadersInternal(
   try {
     // Check if session is expired before capturing headers
     const page = accountPages.get(accountId);
+    let reauthExecuted = false;
     if (page) {
-      try {
-        captureStageEnter("refresh_goto");
-        await page.goto(qwenUrl("/"), {
-          waitUntil: "domcontentloaded",
-          timeout: Math.min(
-            config.timeouts.navigation,
-            boundedTimeoutMs,
-            SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
-          ),
-        });
-        captureStageExit("refresh_goto");
-        const url = page.url();
-        const isAuthUrl = url.includes("auth") || url.includes("login");
-        const isLoggedIn = isAuthUrl ? false : await isPageLoggedIn(page, 5_000);
-        if (isAuthUrl || !isLoggedIn) {
-          console.warn(
-            `⚠️  [Playwright] Session expired during refresh for ${accountId}, re-authenticating...`,
-          );
-          const { getAccountCredentials } = await import("../core/accounts.ts");
-          const creds = getAccountCredentials(accountId);
-          if (creds && creds.email && creds.password) {
-            await loginToQwen(accountId, creds.email, creds.password);
-            cookieCaches.delete(accountId);
-            if (!(await isPageLoggedIn(page, 5_000))) {
-              throw new Error(`Re-login for ${accountId} did not restore an authenticated session`);
-            }
-          } else {
-            console.warn(
-              `[Playwright] No credentials available for re-login of ${accountId}`,
+      const executeReauth = async () => {
+        try {
+          traceSessionEvent(accountId, "REAUTH_START");
+        } catch {}
+        void import("./session-tracer.ts").then((m) =>
+          m.traceLsCheckpoint(accountId, "reauth-start").catch(() => {}),
+        ).catch(() => {});
+        console.warn(
+          `⚠️  [Playwright] Session expired or forced re-auth for ${accountId}, re-authenticating...`,
+        );
+        const { getAccountCredentials } = await import("../core/accounts.ts");
+        const creds = getAccountCredentials(accountId);
+        if (creds && creds.email && creds.password) {
+          const ok = await loginToQwen(accountId, creds.email, creds.password, "request-reauth");
+          cookieCaches.delete(accountId);
+          // Confirm with the NON-MUTATING probe. The full probe reads
+          // /api/v1/auths/ and auth.qwen.ai/api/v2/auths/refresh (both rotate
+          // the session cookie) and additionally fails closed on
+          // qwen_token_logged_out_marker, which the login sequence itself sets
+          // asynchronously. That combination produced the misleading
+          // "did not restore an authenticated session" on a session that was
+          // valid (settings 200, cookie present) and aborted the whole header
+          // capture with intercept_count=0.
+          const confirmed = ok
+            ? await isPageLoggedIn(page, 5_000, { nonMutating: true })
+            : false;
+          if (!confirmed) {
+            unmarkAccountHeadersReady(accountId);
+            throw new Error(
+              `Re-login for ${accountId} did not restore an authenticated session`,
             );
           }
+          reauthExecuted = true;
+          try {
+            traceSessionEvent(accountId, "REAUTH_END", "ok");
+          } catch {}
+        } else {
+          unmarkAccountHeadersReady(accountId);
+          throw new Error(
+            `No credentials available for re-login of ${accountId}`,
+          );
         }
-      } catch (navErr) {
-        captureStageError(
-          "refresh_goto",
-          navErr instanceof Error ? navErr.name : "Error",
-        );
-        console.warn(
-          `[Playwright] Navigation check failed during refresh for ${accountId}:`,
-          (navErr as Error).message,
-        );
+      };
+
+      if (forceReauth) {
+        await executeReauth();
+      } else {
+        try {
+          captureStageEnter("refresh_goto");
+          await page.goto(qwenUrl("/"), {
+            waitUntil: "domcontentloaded",
+            timeout: Math.min(
+              config.timeouts.navigation,
+              boundedTimeoutMs,
+              SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+            ),
+          });
+          captureStageExit("refresh_goto");
+          await sleep(2000);
+          const url = page.url();
+          const isAuthUrl = url.includes("auth") || url.includes("login");
+          if (isAuthUrl) {
+            await executeReauth();
+          }
+        } catch (navErr) {
+          captureStageError(
+            "refresh_goto",
+            navErr instanceof Error ? navErr.name : "Error",
+          );
+          console.warn(
+            `[Playwright] Navigation check failed during refresh for ${accountId}:`,
+            (navErr as Error).message,
+          );
+          await executeReauth();
+        }
+      }
+
+      // Fast re-auth completion: if re-auth succeeded and required anti-bot tokens are already cached,
+      // refresh cookies directly without running slow UI typing interception.
+      if (reauthExecuted && hasRequiredQwenHeaders(cache.headers)) {
+        const liveCookies = await page.context().cookies();
+        if (liveCookies.some((c) => c.name === "token")) {
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+          try {
+            const { saveAuthSession } = await import("../core/database.ts");
+            const tokenCookie = liveCookies.find((c) => c.name === "token");
+            const exp = tokenCookie ? parseJwtExpiry(tokenCookie.value) : undefined;
+            saveAuthSession(accountId, {
+              cookie: cookieStr,
+              userAgent: cache.headers["user-agent"] || "",
+              bxV: cache.headers["bx-v"] || "2.5.37",
+              bxUa: cache.headers["bx-ua"] || "",
+              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+              secChUa: cache.headers["sec-ch-ua"] || undefined,
+              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+              version: cache.headers["version"] || undefined,
+              tokenExpiresAt: exp || undefined,
+              capturedAt: Date.now(),
+              refreshToken: getJarPair(cookieStr, "refresh_token") ?? undefined,
+            });
+          } catch {}
+          return;
+        }
       }
     }
 
@@ -2751,6 +5131,7 @@ async function refreshHeadersInternal(
 export async function refreshHeaders(
   accountId: string,
   timeoutMs = config.timeouts.headers,
+  forceReauth = false,
 ): Promise<void> {
   const boundedTimeoutMs = Math.max(1_000, timeoutMs);
   captureStageEnter("mutex_acquire");
@@ -2770,7 +5151,7 @@ export async function refreshHeaders(
   }
   captureStageExit("mutex_acquire");
   try {
-    await refreshHeadersInternal(accountId, timeoutMs);
+    await refreshHeadersInternal(accountId, timeoutMs, forceReauth);
   } finally {
     release();
   }
@@ -2787,6 +5168,11 @@ export async function withAccountPage<T>(
   mutexTimeoutMs = PLAYWRIGHT_MUTEX_WAIT_MS,
   recoverOnTimeout = true,
 ): Promise<T> {
+  const inFlightInit = inFlightAccountInits.get(accountId);
+  if (inFlightInit) {
+    await inFlightInit.catch(() => {});
+  }
+
   const page = accountPages.get(accountId);
   if (!page || page.isClosed()) {
     throw new Error(`Playwright page unavailable for account: ${accountId}`);
@@ -3208,6 +5594,12 @@ export async function closeIdlePlaywrightAccounts(
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
+    try {
+      traceSessionEvent(candidate.accountId, "SESSIONKEEPER_CLOSE");
+    } catch {}
+    void import("./session-tracer.ts").then((m) =>
+      m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
+    ).catch(() => {});
     await closePlaywrightForAccount(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
@@ -3246,6 +5638,12 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
+    try {
+      traceSessionEvent(candidate.accountId, "SESSIONKEEPER_CLOSE");
+    } catch {}
+    void import("./session-tracer.ts").then((m) =>
+      m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
+    ).catch(() => {});
     await closePlaywrightForAccount(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
@@ -3282,6 +5680,45 @@ export async function keepAlivePlaywrightAccount(
 
     const now = Date.now();
     const currentUrl = page.url();
+
+    // Proactive session check: if token expires within 45 minutes, refresh proactively
+    const cookie = await getCookies(accountId);
+    if (cookie && isTokenExpiringSoon(cookie, 45)) {
+      console.log(
+        `💓 [SessionKeeper] Account ${accountId} token expires within 45m; proactively renewing session...`,
+      );
+      // MODERN_AUTH_PRESENT: silent refresh only. A forced password re-auth
+      // cannot restore a modern session and its failure parks the account 24h
+      // AuthFailed; a stale modern session is left for classification, never
+      // password retried.
+      try {
+        const { getRefreshMaterial } = await import("../core/database.ts");
+        if (getRefreshMaterial(accountId)?.jar) {
+          const { ensureAccountFresh } = await import(
+            "./qwen-token-refresh.ts"
+          );
+          if (await ensureAccountFresh(accountId).catch(() => false)) {
+            lastKeepAliveNavigation.set(accountId, now);
+            touchAccountActivity(accountId);
+            return true;
+          }
+          return false;
+        }
+      } catch {
+        // Fall through to the legacy forced re-auth below.
+      }
+      try {
+        await refreshHeadersInternal(accountId, config.timeouts.headers, true);
+        lastKeepAliveNavigation.set(accountId, now);
+        touchAccountActivity(accountId);
+        return true;
+      } catch (err) {
+        console.warn(
+          `[SessionKeeper] Proactive session renewal failed for ${accountId}: ${getErrorMessage(err)}`,
+        );
+      }
+    }
+
     const lastNavigation = lastKeepAliveNavigation.get(accountId) ?? 0;
     const shouldNavigate =
       !currentUrl.startsWith(qwenOrigin()) ||
@@ -3327,6 +5764,12 @@ export function installContextDeathHandlers(
 }
 
 function cleanupPlaywrightAccountState(accountId: string): void {
+  try {
+    traceSessionEvent(accountId, "CONTEXT_CLOSE");
+  } catch {}
+  void import("./session-tracer.ts")
+    .then((m) => m.traceLsCheckpoint(accountId, "context-close").catch(() => {}))
+    .catch(() => {});
   accountContexts.delete(accountId);
   accountPages.delete(accountId);
   headerCaches.delete(accountId);

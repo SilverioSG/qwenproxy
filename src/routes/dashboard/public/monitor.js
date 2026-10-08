@@ -46,8 +46,17 @@ async function refreshMonitor() {
   setText('kpiTotalReqsSub', (t.totalRequests || 0) + ' total');
   setText('kpiSuccess', fmtNumber(t.totalSuccess));
   setText('kpiSuccessSub', t.totalRequests > 0 ? Math.round((t.totalSuccess / t.totalRequests) * 100) + '% rate' : '');
-  setText('kpiErrors', fmtNumber(t.totalErrors));
-  setText('kpiErrorsSub', (t.overallErrorRate != null ? t.overallErrorRate : '—') + '% err rate');
+  // Principal failure metric excludes client aborts: failed = terminal
+  // backend/protection failures (protection included — a WAF 429 is terminal).
+  // Client aborts are shown separately, never hidden.
+  var failed = t.failedRequests != null ? t.failedRequests : t.totalErrors;
+  var aborts = t.clientAborts || 0;
+  var prot = t.protectionEvents || 0;
+  setText('kpiErrors', fmtNumber(failed));
+  var errSub = (t.failureRate != null ? t.failureRate : t.overallErrorRate) + '% fail rate (excl. aborts)';
+  if (aborts > 0) errSub += ' · ' + aborts + ' aborted';
+  if (prot > 0) errSub += ' · ' + prot + ' protection';
+  setText('kpiErrorsSub', errSub);
   setText('kpiAvgLat', fmtLatency(t.overallAvgLatencyMs));
   setText('kpiAvgLatSub', t.overallAvgLatencyMs != null ? 'avg response time' : 'not collected');
   setText('kpiP95Lat', fmtLatency(t.p95LatencyMs));
@@ -144,7 +153,9 @@ function renderAccountRows(accts) {
     rows +=
       '<tr>' +
       '<td class="email-cell mono" title="' +
-      escHtml(a.email) +
+      (a.accountId === 'unknown'
+        ? 'Unassigned: request finished before account attribution (pre-lease failure, global protection, client abort) or media-bypass. Not necessarily an error.'
+        : escHtml(a.email)) +
       '">' +
       escHtml(a.email) +
       '</td>' +
@@ -221,10 +232,25 @@ function renderErrorSummary(errors) {
   if (emptyEl) emptyEl.style.display = 'none';
   if (listEl) listEl.style.display = '';
 
+  // Semantic class badges: CLIENT_ABORT / PROTECTION / BACKEND /
+  // ACCOUNT_HEALTH / QUOTA / UNKNOWN. Nothing is hidden by classification.
+  var classBadge = {
+    CLIENT_ABORT: 'badge-neutral',
+    PROTECTION: 'badge-warning',
+    BACKEND: 'badge-danger',
+    ACCOUNT_HEALTH: 'badge-warning',
+    QUOTA: 'badge-warning',
+    UNKNOWN: 'badge-neutral',
+  };
   var html = '';
   for (var i = 0; i < errors.length; i++) {
     var e = errors[i];
     var badgeCls = e.count > 5 ? 'badge-danger' : e.count > 2 ? 'badge-warning' : 'badge-neutral';
+    var semCls = e.semanticClass || 'UNKNOWN';
+    var semBadge = classBadge[semCls] || 'badge-neutral';
+    var reasonHtml = e.errorReason
+      ? '<span class="badge badge-neutral" style="font-size:0.62rem" title="errorReason">' + escHtml(e.errorReason) + '</span>'
+      : '';
     html +=
       '<li class="error-item">' +
       '<span class="badge ' +
@@ -232,8 +258,14 @@ function renderErrorSummary(errors) {
       '" style="font-size:0.72rem;min-width:30px;text-align:center">' +
       e.count +
       '</span>' +
+      '<span class="badge ' +
+      semBadge +
+      '" style="font-size:0.62rem" title="semantic class">' +
+      escHtml(semCls) +
+      '</span>' +
+      reasonHtml +
       '<span class="error-msg">' +
-      escHtml(e.message) +
+      escHtml(e.message || e.error) +
       '</span>' +
       '</li>';
   }

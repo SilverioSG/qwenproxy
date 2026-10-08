@@ -34,6 +34,14 @@ export function parseQwenErrorPayload(
 
   try {
     const payload = JSON.parse(text);
+    if (payload && (payload.update_member || payload.data?.update_member)) {
+      return {
+        code: "MembershipLimit",
+        details: "Account membership limit reached",
+        message: "Qwen upstream error: MembershipLimit: Account membership limit reached",
+        status: 429,
+      };
+    }
     if (payload && payload.success === false) {
       const code = payload.data?.code || payload.code || "UpstreamError";
       const details =

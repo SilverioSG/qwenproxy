@@ -27,10 +27,27 @@ const CHALLENGE_PATH_MARKER = "_____tmd_____";
 const FAILED_RECOVERY_BACKOFF_MS = 30_000;
 const lastFailedRecoveryAt = new Map<string, number>();
 
+let recoveryNavCounter = 0;
+
+function recoveryNavId(): string {
+  recoveryNavCounter += 1;
+  return `recnav${recoveryNavCounter}`;
+}
+
 async function gotoBestEffort(page: Page, url: string): Promise<void> {
+  const navId = recoveryNavId();
+  const closedBefore =
+    typeof page.isClosed === "function" ? page.isClosed() : false;
+  if (closedBefore) {
+    // Dead renderer/page: navigating is hopeless (ERR_ABORTED on a corpse)
+    // and burns the solver budget. Fail fast so the caller fails over.
+    logBaxiaCaptcha("recovery_nav_dead_page", { navId });
+    return;
+  }
+  const startedAt = Date.now();
   // A WAF-blocked navigation can time out while still having rendered the
   // challenge, so a failure here must not abort the solve attempt.
-  await page
+  const result = await page
     .goto(url, {
       waitUntil: "domcontentloaded",
       timeout: Math.min(
@@ -38,7 +55,40 @@ async function gotoBestEffort(page: Page, url: string): Promise<void> {
         CHALLENGE_NAVIGATION_TIMEOUT_MS,
       ),
     })
-    .catch(() => undefined);
+    .then(() => "ok" as const)
+    .catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      const aborted =
+        msg.includes("ERR_ABORTED") || msg.includes("aborted");
+      const dead =
+        msg.includes("Target crashed") ||
+        msg.includes("Page crashed") ||
+        msg.includes("has been closed") ||
+        msg.includes("Browser has been closed");
+      return (aborted ? "aborted:" : dead ? "dead:" : "error:") +
+        msg.slice(0, 80);
+    });
+  const closedAfter =
+    typeof page.isClosed === "function" ? page.isClosed() : false;
+  let currentUrl = "";
+  try {
+    currentUrl = typeof page.url === "function" ? page.url() : "";
+  } catch {
+    currentUrl = "";
+  }
+  logBaxiaCaptcha("recovery_nav", {
+    navId,
+    result,
+    ms: Date.now() - startedAt,
+    closedAfter,
+    urlHost: (() => {
+      try {
+        return new URL(currentUrl).host;
+      } catch {
+        return "";
+      }
+    })(),
+  });
 }
 
 /**
@@ -51,6 +101,11 @@ export async function solveChallengeOnPage(
   challengeUrl: string | null,
   waitForMs = config.captcha.timeoutMs,
 ): Promise<boolean> {
+  if (typeof page.isClosed === "function" && page.isClosed()) {
+    // Renderer already dead: no solve budget spent on a corpse.
+    logBaxiaCaptcha("recovery_dead_page_entry");
+    return false;
+  }
   const solverOptions = {
     maxAttempts: config.captcha.maxAttempts,
     retryDelayMs: config.captcha.retryDelayMs,

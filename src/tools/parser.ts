@@ -412,7 +412,13 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       if (!tailLower.includes(">")) {
         for (const name of openNames) {
           const full = `<${name.toLowerCase()}`;
-          if (full.startsWith(tailLower)) {
+          if (
+            full.startsWith(tailLower) ||
+            tailLower.startsWith(full + "=") ||
+            tailLower.startsWith(full + " ") ||
+            tailLower.startsWith(full + "\t") ||
+            tailLower.startsWith(full + ":")
+          ) {
             return i;
           }
         }
@@ -629,6 +635,9 @@ function coerceParameterValue(rawValue: string): unknown {
  */
 function extractToolName(openTag: string, block: string): string {
   const combined = `${openTag}\n${block}`;
+  const fnMatch = combined.match(/<function=([^\s>]+)>/i);
+  if (fnMatch) return fnMatch[1].trim();
+
   const attrMatch = combined.match(
     /<tool_call(?:s)?\b[^>]*\bname\s*=\s*["']([^"']+)["']/i,
   );
@@ -638,6 +647,48 @@ function extractToolName(openTag: string, block: string): string {
   if (nameTagMatch) return decodeXmlEntities(nameTagMatch[1].trim());
 
   return "";
+}
+
+/**
+ * Parse function shorthand XML <function=name><parameter=key>value</parameter></function> format.
+ */
+function parseFunctionShorthandToolCall(
+  block: string,
+  openTag: string,
+  tools: ToolDefinitionLike[],
+): { name: string; arguments: Record<string, unknown> } | null {
+  const combined = `${openTag}\n${block}`;
+  const fnMatch = combined.match(/<function=([^\s>]+)>/i);
+  let toolName = fnMatch ? fnMatch[1].trim() : "";
+
+  const args: Record<string, unknown> = {};
+  const parameterRe = /<parameter=([^\s>]+)>([\s\S]*?)<\/parameter>/gi;
+  let match: RegExpExecArray | null = parameterRe.exec(block);
+  while (match !== null) {
+    args[match[1]] = coerceParameterValue(match[2]);
+    match = parameterRe.exec(block);
+  }
+
+  // Also support <parameter name="..."> inside <function=...>
+  if (Object.keys(args).length === 0) {
+    const namedParamRe =
+      /<parameter\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
+    let namedMatch: RegExpExecArray | null = namedParamRe.exec(block);
+    while (namedMatch !== null) {
+      args[namedMatch[1]] = coerceParameterValue(namedMatch[2]);
+      namedMatch = namedParamRe.exec(block);
+    }
+  }
+
+  if (Object.keys(args).length === 0) return null;
+
+  if (!toolName) {
+    toolName =
+      extractToolName(openTag, block) || inferToolNameFromParameters(args, tools);
+  }
+  if (!toolName) return null;
+
+  return { name: toolName, arguments: args };
 }
 
 /**
@@ -2193,6 +2244,47 @@ export class StreamingToolParser {
       });
     }
 
+    // 0) Try function shorthand format (<function=name><parameter=k>v</parameter></function>)
+    const fnShorthand = parseFunctionShorthandToolCall(
+      t,
+      this.currentOpenTag,
+      this.tools,
+    );
+    if (fnShorthand) {
+      const resolvedName = this.resolveDeclaredToolName(fnShorthand.name);
+      if (!resolvedName) {
+        this.recordMalformedToolCall(content, {
+          undeclaredNames: [fnShorthand.name],
+          category: "undeclared",
+        });
+        this.preserveLiteralToolCall(
+          content,
+          result,
+          `undeclared tool name: ${fnShorthand.name}`,
+        );
+        return;
+      }
+      fnShorthand.name = resolvedName;
+      if (isToolcallDebugEnabled()) {
+        logger.debug(
+          "[parser] processToolContent: function shorthand parsed successfully",
+          {
+            name: fnShorthand.name,
+            arguments: fnShorthand.arguments,
+          },
+        );
+      }
+      this.finalizeSuccessfulToolCall(
+        {
+          id: `call_${crypto.randomUUID()}`,
+          name: fnShorthand.name,
+          arguments: fnShorthand.arguments,
+        },
+        result,
+      );
+      return;
+    }
+
     // 1) Try Hermes-style XML <parameter> format first
     const xmlParsed = parseXmlParameterToolCall(
       t,
@@ -2486,6 +2578,23 @@ export class StreamingToolParser {
         blockLength: block.length,
         blockPreview: block.substring(0, 300),
       });
+    }
+
+    // Try function shorthand format first
+    const fnShorthand = parseFunctionShorthandToolCall(
+      block,
+      this.currentOpenTag,
+      this.tools,
+    );
+    if (fnShorthand) {
+      const resolvedName = this.resolveDeclaredToolName(fnShorthand.name);
+      if (resolvedName) {
+        return {
+          id: `call_${crypto.randomUUID()}`,
+          name: resolvedName,
+          arguments: fnShorthand.arguments,
+        };
+      }
     }
 
     // Try full parse first

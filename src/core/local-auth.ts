@@ -43,6 +43,58 @@ export function assertBindAllowed(host: string, apiKey: string): void {
   );
 }
 
+export function updateEnvVariable(
+  key: string,
+  value: string,
+  envPath = getEnvFilePath(),
+): void {
+  try {
+    const existing = fs.existsSync(envPath)
+      ? fs.readFileSync(envPath, "utf-8")
+      : "";
+    const regex = new RegExp(`^([ \\t]*)${key}[ \\t]*=.*$`, "m");
+    const assignment = regex.exec(existing);
+
+    let updated: string;
+    if (assignment) {
+      const start = assignment.index;
+      const end = start + assignment[0].length;
+      updated =
+        existing.slice(0, start) +
+        `${assignment[1]}${key}=${value}` +
+        existing.slice(end);
+    } else {
+      const lineEnding = existing.includes("\r\n") ? "\r\n" : "\n";
+      const prefix =
+        existing.length === 0 || existing.endsWith("\n") ? "" : lineEnding;
+      updated = `${existing}${prefix}${key}=${value}${lineEnding}`;
+    }
+
+    fs.writeFileSync(envPath, updated, { encoding: "utf-8", mode: 0o600 });
+  } catch (err) {
+    console.warn(
+      `⚠️  [Config] Could not update ${key} in .env:`,
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+export function persistServerPort(
+  port: number,
+  envPath = getEnvFilePath(),
+): void {
+  updateEnvVariable("PORT", String(port), envPath);
+  process.env.PORT = String(port);
+}
+
+export function persistCustomApiKey(
+  apiKey: string,
+  envPath = getEnvFilePath(),
+): void {
+  updateEnvVariable("API_KEY", apiKey.trim(), envPath);
+  process.env.API_KEY = apiKey.trim();
+}
+
 export function persistApiKey(
   apiKey: string,
   envPath = getEnvFilePath(),

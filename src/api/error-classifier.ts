@@ -9,6 +9,7 @@ import {
   UpstreamTimeout,
   ServiceUnavailable,
   ClientAbortedError,
+  isKnownClientAbortMessage,
 } from "../core/errors.js";
 import {
   QwenNetworkError,
@@ -80,7 +81,9 @@ export function classifyError(err: unknown): QwenProxyError {
   // Client disconnected before the stream could be created. This is not a
   // server fault: the request has no listener anymore. Classify it as a silent
   // abort (499) so callers neither emit a 500 nor count it as an error.
-  if (err instanceof Error && err.message.includes("client aborted")) {
+  // Exact abort markers included (pre-lease "Aborted before acquiring account
+  // lease" is only rejected on an already-aborted signal; see errors.ts).
+  if (err instanceof Error && isKnownClientAbortMessage(err.message)) {
     return new ClientAbortedError(err.message);
   }
 

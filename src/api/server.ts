@@ -242,7 +242,13 @@ app.use("*", async (c, next) => {
     c.req.path === "/logs" ||
     c.req.path.startsWith("/logs") ||
     c.req.path.startsWith("/diagnostics") ||
-    c.req.path === "/favicon.ico";
+    c.req.path === "/favicon.ico" ||
+    c.req.path === "/v1/models" ||
+    c.req.path.startsWith("/v1/models/") ||
+    c.req.path === "/models" ||
+    c.req.path.startsWith("/models/") ||
+    c.req.path === "/v1/chat/mode" ||
+    c.req.path === "/chat/mode";
 
   if (!isProbe) {
     metrics.increment("requests.total");
@@ -503,6 +509,45 @@ app.get("/diagnostics/tokens", async (c) => {
   }
 });
 
+// Modern-auth diagnostic: run one no-browser session renewal for an account
+// and report the outcome. Same API-key gate as /diagnostics/tokens. Returns
+// status fields only — never tokens, cookies or jars. On success the fresh
+// session is persisted (the designed refresh behavior); on failure nothing
+// is wiped. Never opens a browser profile: only an already-warm context is
+// observed, otherwise the persisted jar is used.
+app.post("/diagnostics/refresh", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+
+  const accountId = c.req.query("accountId") || "";
+  if (!accountId) {
+    return c.json({ error: "accountId query param is required" }, 400);
+  }
+  try {
+    const { tryRefreshToken } = await import(
+      "../services/qwen-token-refresh.ts"
+    );
+    const result = await tryRefreshToken(accountId);
+    return c.json({
+      accountId8: accountId.slice(0, 8),
+      ok: result.ok,
+      code: result.code ?? null,
+      details: result.details ?? null,
+      rotated: result.rotated ?? null,
+    });
+  } catch (err) {
+    return c.json(
+      {
+        accountId8: accountId.slice(0, 8),
+        ok: false,
+        code: "DiagnosticError",
+        details: err instanceof Error ? err.message : String(err),
+      },
+      500,
+    );
+  }
+});
+
 app.get("/metrics", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
@@ -559,7 +604,13 @@ app.onError((err, c) => {
     c.req.path === "/health" ||
     c.req.path === "/metrics" ||
     c.req.path.startsWith("/diagnostics") ||
-    c.req.path === "/favicon.ico";
+    c.req.path === "/favicon.ico" ||
+    c.req.path === "/v1/models" ||
+    c.req.path.startsWith("/v1/models/") ||
+    c.req.path === "/models" ||
+    c.req.path.startsWith("/models/") ||
+    c.req.path === "/v1/chat/mode" ||
+    c.req.path === "/chat/mode";
   if (!isProbe) {
     metrics.increment("requests.errors");
   }
@@ -600,6 +651,7 @@ async function warmConfiguredChatPools(
   ) => Promise<void>,
   accountId?: string,
 ): Promise<void> {
+  if (config.qwen.chatPoolSize <= 0) return;
   await Promise.all(
     config.qwen.chatPoolModels.map((model) =>
       warmQwenChatPool(accountId, model).catch(() => {}),
@@ -890,6 +942,12 @@ export async function startServer(options?: {
   }
 
   startPromise = (async () => {
+    const { getAppVersion } = await import("../core/version.ts");
+    const appVersion = getAppVersion();
+    if (options?.showBanner !== false && !isAuthMockEnabled()) {
+      console.log(`🚀 [Server] Iniciando QwenProxy ${appVersion} na porta ${config.server.port}...`);
+    }
+
     cache = new MemoryCache();
     await cache.connect();
 
@@ -936,13 +994,19 @@ export async function startServer(options?: {
     if (accounts.length > 0) {
       const totalAccounts = accounts.length;
 
-      // Warm accounts in priority order (recently successful accounts first),
+      // Warm accounts in priority order, giving top precedence to accounts
+      // that already have valid, non-expired sessions in SQLite (restores in ~0.5s),
       // skipping accounts still on cooldown. Warm the primary account first so
-      // the server binds the port and goes online immediately (~15-20s).
+      // the server binds the port and goes online immediately (~5-10s).
       // Reserve account(s) and standby validations run seamlessly in background.
-      const warmOrder = getAccountsByPriority(accounts).filter(
-        (account) => !getAccountCooldownInfo(account.id),
-      );
+      const { getValidAuthSession } = await import("../core/database.ts");
+      const warmOrder = getAccountsByPriority(accounts)
+        .filter((account) => !getAccountCooldownInfo(account.id))
+        .sort((a, b) => {
+          const aHasSession = getValidAuthSession(a.id) !== null ? 1 : 0;
+          const bHasSession = getValidAuthSession(b.id) !== null ? 1 : 0;
+          return bHasSession - aHasSession;
+        });
       const readyAccountIds = new Set<string>();
 
       for (let i = 0; i < warmOrder.length; i++) {
@@ -966,9 +1030,13 @@ export async function startServer(options?: {
         }
       }
 
-      const remainingAccounts = accounts.filter(
-        (account) => !readyAccountIds.has(account.id),
-      );
+      const remainingAccounts = accounts
+        .filter((account) => !readyAccountIds.has(account.id))
+        .sort((a, b) => {
+          const aHasSession = getValidAuthSession(a.id) !== null ? 1 : 0;
+          const bHasSession = getValidAuthSession(b.id) !== null ? 1 : 0;
+          return bHasSession - aHasSession;
+        });
       if (readyAccountIds.size === 0) {
         console.warn(
           `⚠️  [Server] No account ready during startup; continuing in background`,
@@ -1208,11 +1276,11 @@ export async function startServer(options?: {
 
     const endpoint = `${started.url}/v1`;
 
-    if (options?.showBanner !== false) {
+    if (options?.showBanner !== false && !isAuthMockEnabled()) {
       console.log(`
 +${"-".repeat(W)}+
 |${blank()}|
-|${center("QwenProxy")}|
+|${center(`QwenProxy ${appVersion}`)}|
 |${center("OpenAI & Anthropic Compatible API")}|
 |${blank()}|
 +${"-".repeat(W)}+

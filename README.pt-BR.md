@@ -300,6 +300,12 @@ O QwenProxy inicializa o servidor de alta performance em segundo plano e abre a 
 
 ### 3. Adicionar Contas Qwen
 
+> 🌐 **Onde criar as contas?**  
+> Crie suas contas gratuitas diretamente no portal oficial do Qwen: **[https://chat.qwen.ai](https://chat.qwen.ai)**  
+> 1. Acesse **[chat.qwen.ai](https://chat.qwen.ai)** e clique no botão **Sign up** (Cadastrar-se).
+> 2. Cadastre-se com seu e-mail e defina uma senha (ou use login via Google).
+> 3. *Dica de Ouro:* Crie de 3 a 10 contas gratuitas. O QwenProxy rotaciona automaticamente entre elas quando a cota diária de uma atinge o limite, garantindo uso contínuo e sem pausas no seu fluxo de desenvolvimento!
+
 Na TUI, você pode gerenciar suas contas na aba **`[5] Contas`** de duas formas simples:
 
 - **Importação em Lote (`B`):** Pressione a tecla **`B`** (ou clique em `[ B ] Em Lote`). Cole suas contas de uma só vez (aceita formato `email:senha`, formato bruto do `.env` com vírgulas ou copiado de planilhas). O sistema calcula a contagem em tempo real, valida duplicatas e grava tudo no SQLite criptografado em milissegundos.

@@ -113,7 +113,7 @@ test("chat_in_progress budget exhaustion escalates ONCE with a full replay, then
   // + full prompt) and the 8th attempt succeeds. The ~1MB replay that used to
   // happen on EVERY stuck turn is now bounded: once, and only after ~35s of
   // same-chat settle retries (observed: a 2.1MB turn held a chat busy ~9min).
-  const bigPrompt = "user: " + "lorem ipsum dolor sit amet. ".repeat(20000);
+  const bigPrompt = "user: " + "lorem ipsum dolor sit amet. ".repeat(5000);
   const mock = installMockFetch(7);
   const capture = captureWarns();
   try {

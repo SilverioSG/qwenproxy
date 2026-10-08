@@ -9,6 +9,7 @@ import {
 import { mapClientModelToQwen } from "../core/model-alias.ts";
 import { qwenUrl } from "./qwen-url.ts";
 import { QwenUpstreamError } from "./qwen-errors.ts";
+import { looksLikeAntiBotChallengeText } from "./media-generation.ts";
 import {
   requestQwenTextInBrowser,
   buildCapturedQwenHeaders,
@@ -27,13 +28,20 @@ async function createQwenChatSession(
     return process.env.TEST_SESSION_ID || "mock-session";
   }
 
+  const chatHeaders = buildCapturedQwenHeaders(headers, {
+    referer: qwenUrl("/"),
+  });
+  // Bisect-proven on identical session state: the cached `version` header
+  // turns create-chat into appUnauthorized; cookie/session material governs.
+  // Scoped to chats/new only; personalization strips it at its own call
+  // sites, everything else keeps current behavior.
+  delete chatHeaders["version"];
+  delete chatHeaders["Version"];
   const response = await requestQwenTextInBrowser(
     accountId,
     "POST",
     "/api/v2/chats/new",
-    buildCapturedQwenHeaders(headers, {
-      referer: qwenUrl("/"),
-    }),
+    chatHeaders,
     JSON.stringify(buildChatNewBody(model, chatMode)),
     { referrer: qwenUrl("/") },
   );
@@ -57,6 +65,38 @@ async function createQwenChatSession(
     json?.data?.chat?.id;
 
   if (!chatId || typeof chatId !== "string") {
+    const rawLower = raw.toLowerCase();
+    if (looksLikeAntiBotChallengeText(raw)) {
+      try {
+        const { recoverBaxiaCaptcha } = await import("./captcha-coordinator.ts");
+        const solved = await recoverBaxiaCaptcha(accountId, "createQwenChatSession", {
+          challengeBody: raw,
+        });
+        if (solved) {
+          return createQwenChatSession(headers, model, accountId, chatMode);
+        }
+      } catch {}
+    }
+
+    if (
+      json?.data?.code === "Unauthorized" ||
+      json?.code === "Unauthorized" ||
+      rawLower.includes("unauthorized") ||
+      rawLower.includes("permission to access")
+    ) {
+      try {
+        const { noteUpstreamAuthResult, snapshotForAccount } = await import("./session-tracer.ts");
+        const snap = await snapshotForAccount(accountId || "").catch(() => null);
+        noteUpstreamAuthResult(accountId, "create-chat", response.ok ? 200 : response.status, true, snap);
+      } catch {
+        // Tracing must never break flows.
+      }
+      throw new QwenUpstreamError(
+        `Qwen create chat unauthorized: ${raw.substring(0, 300)}`,
+        "Unauthorized",
+        401,
+      );
+    }
     throw new QwenUpstreamError(
       `Qwen create chat returned unexpected payload: ${raw.substring(0, 300)}`,
       "CreateChatInvalidResponse",
@@ -64,6 +104,13 @@ async function createQwenChatSession(
     );
   }
 
+  try {
+    const { noteUpstreamAuthResult, snapshotForAccount } = await import("./session-tracer.ts");
+    const snap = await snapshotForAccount(accountId || "").catch(() => null);
+    noteUpstreamAuthResult(accountId, "create-chat", 200, false, snap);
+  } catch {
+    // Tracing must never break flows.
+  }
   return chatId;
 }
 

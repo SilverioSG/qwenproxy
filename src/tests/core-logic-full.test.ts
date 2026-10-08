@@ -21,6 +21,9 @@ const originalCwd = process.cwd();
 const originalMaxPromptBytes = process.env.QWEN_MAX_PROMPT_BYTES;
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "qwen-core-logic-"));
+fs.mkdirSync(path.join(tmpDir, "data-test", "account-priority.json"), {
+  recursive: true,
+});
 fs.mkdirSync(path.join(tmpDir, "data", "account-priority.json"), {
   recursive: true,
 });
@@ -125,7 +128,7 @@ test("memory-usage: getHeapUsageSnapshot falls back when limit is invalid", () =
 /* ------------------------------------------------------------------ */
 
 test("crypto-utils: first encrypt creates the key file, roundtrip decrypts", () => {
-  const keyFile = path.join(tmpDir, "data", "db", ".encryption_key");
+  const keyFile = path.join(tmpDir, "data-test", "db", ".encryption_key");
   assert.strictEqual(fs.existsSync(keyFile), false);
 
   const ciphertext = encrypt("hello world");

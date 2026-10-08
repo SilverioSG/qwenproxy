@@ -116,3 +116,29 @@ export class ServiceUnavailable extends QwenProxyError {
   readonly type = "service_unavailable";
   readonly code = "service_degraded";
 }
+
+/**
+ * Exact client-abort marker messages produced by our own pipeline. Each is
+ * only ever emitted on a proven client-abort path, so matching them exactly
+ * (never by broad substring) is safe:
+ * - "Aborted before acquiring account lease": account-concurrency.ts rejects
+ *   with this ONLY when the acquire signal is already aborted.
+ * - "Aborted while waiting for account lease": rejected ONLY from the signal
+ *   abort handler while queued for a slot.
+ * - "client disconnected before stream completed": terminal stream
+ *   observation when the client left before [DONE] (streaming.ts).
+ * The legacy "client aborted" substring covers ClientAbortedError and the
+ * "client aborted before/during/after stream creation" markers.
+ * Real lease failures (e.g. "Account X busy: timed out...") never match.
+ */
+export function isKnownClientAbortMessage(
+  message: string | null | undefined,
+): boolean {
+  if (typeof message !== "string" || message.length === 0) return false;
+  if (message.includes("client aborted")) return true;
+  return (
+    message === "Aborted before acquiring account lease" ||
+    message === "Aborted while waiting for account lease" ||
+    message === "client disconnected before stream completed"
+  );
+}

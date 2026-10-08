@@ -18,7 +18,7 @@ import {
   setToolCapNotice,
 } from "../../services/qwen.ts";
 import { acquireUpstreamStream } from "./account.ts";
-import { markAccountRateLimited } from "../../core/account-manager.ts";
+import { markAccountRateLimited, computeQuotaCooldownMs } from "../../core/account-manager.ts";
 import {
   clearTemporaryBusy,
   markAccountTemporarilyBusy,
@@ -453,6 +453,20 @@ export async function processNonStreamingResponse(
               chunk.response_id === targetResponseId)
           ) {
             const delta = chunk.choices[0].delta;
+
+            if (delta.extra?.update_member || chunk.update_member) {
+              throw toRetryableStreamError(
+                "membership_limit",
+                "Qwen upstream membership limit reached (update_member); rotating account",
+                {
+                  switchAccount: true,
+                  forceNewChat: true,
+                  reason: "membership_limit",
+                  accountCooldownMs: computeQuotaCooldownMs(Date.now()),
+                  accountCooldownReason: "MembershipLimit",
+                },
+              );
+            }
 
             if (isThinkingPhase(delta.phase)) {
               isThinkingChunk = true;
@@ -996,6 +1010,11 @@ export async function processStreamingResponse(
 
       // Release the lease immediately. The stop request below is best-effort
       // and must never hold the account slot or block the next tool turn.
+      if (onStreamComplete) {
+        try {
+          onStreamComplete();
+        } catch {}
+      }
       retryContext.releaseAccountLease?.();
       retryContext.releaseAccountLease = null;
       removeStream(completionId);
@@ -1786,6 +1805,20 @@ export async function processStreamingResponse(
                 chunk.response_id === targetResponseId)
             ) {
               const delta = chunk.choices[0].delta;
+
+              if (delta.extra?.update_member || chunk.update_member) {
+                throw toRetryableStreamError(
+                  "membership_limit",
+                  "Qwen upstream membership limit reached (update_member); rotating account",
+                  {
+                    switchAccount: true,
+                    forceNewChat: true,
+                    reason: "membership_limit",
+                    accountCooldownMs: computeQuotaCooldownMs(Date.now()),
+                    accountCooldownReason: "MembershipLimit",
+                  },
+                );
+              }
 
               // Qwen streams may end with a {"status":"finished",
               // "phase":"answer"} delta and NO trailing [DONE]. Treat it as
@@ -2699,7 +2732,11 @@ export async function processStreamingResponse(
       }
 
       // Release locks now that the stream is fully done
-      if (onStreamComplete) onStreamComplete();
+      if (onStreamComplete) {
+        try {
+          onStreamComplete();
+        } catch {}
+      }
       // Diagnostic T7, after the logical stop (T6 / [DONE]) and after the
       // local cleanup above. latencyMs was already frozen at T6, so this is
       // not part of it. No-op when the trace flag is off. A thrown retry
@@ -2711,7 +2748,9 @@ export async function processStreamingResponse(
 
       // Release account lease from transparent retry if active
       if (retryContext.releaseAccountLease) {
-        retryContext.releaseAccountLease();
+        try {
+          retryContext.releaseAccountLease();
+        } catch {}
         retryContext.releaseAccountLease = null;
       }
     }
@@ -2785,10 +2824,12 @@ export async function processStreamingResponse(
       // Terminal stream error: the outer retry loop already gave up (it only
       // reaches this onError when the callback throws past the retry budget).
       // One record, after the error [DONE], before the stream is closed.
+      // The dashboard reason comes from the mid-stream resolver (must stay
+      // consistent with the pre-response classifier in index.ts).
       observeStreamEnd({
         success: false,
         error: err.message,
-        errorReason: errorCode,
+        errorReason: resolveMidStreamDashboardReason(err),
       });
     } catch {
       // Stream already closed — client already disconnected or the stream
@@ -2798,6 +2839,24 @@ export async function processStreamingResponse(
 }
 
 // ─── Top-level error wrapper ───────────────────────────────────────────────────
+
+/**
+ * Dashboard errorReason for a terminal mid-stream (SSE) failure.
+ *
+ * Reuses the canonical classifier also used pre-response (index.ts), so one
+ * logical cause yields one terminal taxonomy wherever it surfaces:
+ * SharedWafCircuitError -> "shared_waf_circuit_open" (PROTECTION),
+ * ClientAbortedError / known abort markers -> "client_abort" (CLIENT_ABORT),
+ * account_busy -> "account_busy" (ACCOUNT_HEALTH), etc.
+ * (Deriving the reason from the client-visible error code instead lost the
+ * semantic cause for errors without a usable upstream code, e.g. WAF
+ * mid-stream recorded stream_error / UNKNOWN.)
+ * Pure: no retry, failover, WAF, auth or streaming side effects. The SSE
+ * error payload (`code`) is intentionally untouched.
+ */
+export function resolveMidStreamDashboardReason(err: unknown): string {
+  return classifyRetryAction(err).reason;
+}
 
 export function handleChatCompletionsError(c: Context, err: unknown): Response {
   const classified = classifyError(err);

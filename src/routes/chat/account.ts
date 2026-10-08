@@ -8,6 +8,13 @@ import {
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
+import {
+  getWafCircuitSignature,
+  isSharedWafCircuitError,
+  isWafCircuitOpen,
+  SharedWafCircuitError,
+  wafCircuitTtlRemainingMs,
+} from "../../core/waf-circuit.ts";
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { ClientAbortedError, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
@@ -57,6 +64,7 @@ import {
 	syncQwenRequestPersonalization,
 	updateLogicalThreadState,
 } from "../../services/qwen.ts";
+import { createStreamForAccount } from "../../services/qwen-transport-dispatch.ts";
 import type { TokenEstimationContext } from "../../services/token-estimation-metrics.ts";
 import {
   buildContextMeterSnapshot,
@@ -304,8 +312,13 @@ export function resolveInitialAccount(
 	);
 }
 
-function isAccountUnavailableError(err: any): boolean {
+/** @internal exported for tests: quota/unavailable classification. */
+export function isAccountUnavailableError(err: any): boolean {
 	// Quota/rate-limit style failures that should cool the account and rotate.
+	// A shared-WAF circuit error carries an external 429 for the client, but
+	// says nothing about this account's quota or auth health: an account that
+	// merely confirmed a shared punish must never be cooled as quota-exceeded.
+	if (isSharedWafCircuitError(err)) return false;
 	if (isQuotaLikeError(err)) return true;
 	return (
 		(err instanceof UpstreamRateLimit &&
@@ -317,6 +330,59 @@ function isAccountUnavailableError(err: any): boolean {
 
 function isAntiBotError(err: any): boolean {
 	return isAntiBotPolicyError(err);
+}
+
+/**
+ * Single-timer attempt deadline with one coherent policy: normal budget
+ * until human captcha recovery starts, human budget while it is active.
+ * Re-arming REPLACES the timer (clear + set), so two timers never compete.
+ * The waiter it guards is abort-coupled (see qwen-human-captcha.ts), so an
+ * expired attempt also stops the polling instead of orphaning it.
+ */
+export interface AttemptDeadlineController {
+	extend(ms: number): void;
+	clear(): void;
+}
+
+export function createAttemptDeadline(onFire: () => void): AttemptDeadlineController {
+	let timer: NodeJS.Timeout | undefined;
+	return {
+		extend(ms: number) {
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(onFire, Math.max(0, ms));
+			timer.unref?.();
+		},
+		clear() {
+			if (timer) clearTimeout(timer);
+			timer = undefined;
+		},
+	};
+}
+
+/**
+ * Sticky-thread rotation decision for the outer account loop.
+ *
+ * The retry policy is the single source of truth for "this account must be
+ * abandoned": a raw QwenUpstreamError(unauthorized) matches none of the
+ * error-class predicates, yet classifyRetryAction already mapped it to
+ * account_initialization_failed (and the inner loop already parked the
+ * account with AuthInitFailed). Without consulting the policy here, a 401
+ * on the sticky account breaks the loop into a terminal 502 without ever
+ * trying account B. Scoped to account_initialization_failed only: terminal,
+ * quota, personalization and healthy paths keep their existing behavior.
+ */
+export function shouldRotateStickyAccount(
+	lastError: unknown,
+	requestAborted = false,
+): boolean {
+	if (!lastError) return false;
+	return (
+		isAccountUnavailableError(lastError) ||
+		isAccountInitializationError(lastError) ||
+		isAntiBotError(lastError) ||
+		classifyRetryAction(lastError, { requestAborted }).reason ===
+			"account_initialization_failed"
+	);
 }
 
 function hasFreeAlternateAccount(
@@ -370,6 +436,28 @@ async function attemptRelogin(
 	accountId: string,
 	accountEmail: string,
 ): Promise<boolean> {
+	// MODERN_AUTH_PRESENT first: an account with usable modern persisted auth
+	// must never run the password-login machinery just because no browser
+	// context exists. Fresh → retry serves it via the cold bridge/direct path;
+	// stale modern material → return false so the request rotates with
+	// classification instead of paying password retries. LEGACY_ONLY accounts
+	// fall through to the existing password path unchanged.
+	try {
+		const { revalidateModernAccountSession } = await import(
+			"../../services/qwen-account-session.ts"
+		);
+		const modern = await revalidateModernAccountSession(accountId).catch(
+			() => null,
+		);
+		if (modern !== null) {
+			console.warn(
+				`🔄 [Chat] Modern session revalidation for ${maskEmail(accountEmail)} (${accountId.slice(0, 8)}): fresh=${modern}, no legacy login attempted`,
+			);
+			return modern;
+		}
+	} catch {
+		// Fall through to the legacy path.
+	}
 	try {
 		await refreshHeaders(accountId);
 		console.log(
@@ -389,6 +477,9 @@ async function attemptRelogin(
 	}
 	return false;
 }
+
+/** @internal test seam: modern-first relogin without the request loop. */
+export const _attemptReloginForTests = attemptRelogin;
 
 export async function acquireUpstreamStream(
 	params: AcquireParams,
@@ -413,6 +504,21 @@ export async function acquireUpstreamStream(
 	const latencyReqId = params.reqId;
 
 	const completionId = "chatcmpl-" + uuidv4();
+	// Shared-WAF circuit: while open, fail fast with a retryable 429 before
+	// touching any account. No selection, no cooldown, no rotation — the pool
+	// is protected until the TTL lapses.
+	if (isWafCircuitOpen()) {
+		const signature = getWafCircuitSignature() ?? "waf-challenge";
+		console.warn(
+			`⛔ [Chat] Shared WAF circuit open | signature=${signature} | ttl=${wafCircuitTtlRemainingMs()}ms | failing fast without consuming accounts`,
+		);
+		return {
+			error: new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs()),
+			completionId,
+			allOnCooldown: false,
+			retryAfterMs: wafCircuitTtlRemainingMs(),
+		};
+	}
 	// Sticky thread binding is independent of forceNewChat. forceNewChat only
 	// means "open a fresh upstream chat", not "forget which account owned the
 	// logical conversation".
@@ -492,6 +598,16 @@ export async function acquireUpstreamStream(
 	let antiBotRotations = 0;
 
 	while (account) {
+		// Shared-WAF circuit may have opened mid-request (a second account
+		// confirmed the punish). Stop before consuming a third account: fail
+		// fast with the retryable circuit error instead of rotating.
+		if (isWafCircuitOpen()) {
+			lastError = new SharedWafCircuitError(
+				getWafCircuitSignature() ?? "waf-challenge",
+				wafCircuitTtlRemainingMs(),
+			);
+			break;
+		}
 		const accountId = account.id;
 		const accountEmail = maskEmail(account.email);
 
@@ -735,10 +851,10 @@ export async function acquireUpstreamStream(
 			// A challenged sticky account must be allowed to fall through to the
 			// anti-bot handling below; otherwise the whole conversation dies on the
 			// account the WAF happened to pick.
-			const stickyAccountMustRotate =
-				isAccountUnavailableError(lastError) ||
-				isAccountInitializationError(lastError) ||
-				isAntiBotError(lastError);
+			const stickyAccountMustRotate = shouldRotateStickyAccount(
+				lastError,
+				params.requestSignal?.aborted === true,
+			);
 			if (stickyAccountMustRotate) {
 				if (!quotaInfo) {
 					console.warn(
@@ -1280,9 +1396,12 @@ async function tryCreateStreamWithRetry(
 				// fails fast and retryable instead of blocking the request for minutes
 				// with zero log output.
 				const acquireDeadlineMs = config.concurrency.acquireDeadlineMs;
-				let acquireDeadlineTimer: NodeJS.Timeout | undefined;
+				let attemptSettled = false;
+				const attemptDeadlineBox: { current: AttemptDeadlineController | null } = {
+					current: null,
+				};
 				const acquireDeadline = new Promise<never>((_, reject) => {
-					acquireDeadlineTimer = setTimeout(() => {
+					const fire = () => {
 						// Abort the losing createQwenStream (it is still queued on the
 						// stream lock or mid-create); the post-lock signal re-check in
 						// createQwenStream then throws instead of letting the orphan
@@ -1293,11 +1412,40 @@ async function tryCreateStreamWithRetry(
 						) as Error & { code?: string };
 						err.code = "acquire_deadline";
 						reject(err);
-					}, acquireDeadlineMs);
-					acquireDeadlineTimer.unref?.();
+					};
+					attemptDeadlineBox.current = createAttemptDeadline(fire);
+					attemptDeadlineBox.current.extend(acquireDeadlineMs);
 				});
 				result = await Promise.race([
-					runWithLatencyRequest(params.reqId, () => createQwenStream(
+					runWithLatencyRequest(params.reqId, () => createStreamForAccount({
+						prompt: promptForUpstream,
+						isThinkingModel: params.isThinkingModel,
+						model: params.model,
+						threadParentId,
+						accountId: currentAccountId === "global" ? undefined : currentAccountId,
+						files: params.allFiles.length > 0 ? params.allFiles : undefined,
+						options: params.forceNewChat || params.useThreadNative || params.parallelEscape
+							? {
+									chatSessionId:
+										params.forceNewChat || params.parallelEscape
+											? null
+											: (params.existingThread?.chatSessionId ?? null),
+									forceNewChat: false,
+									reasoningMode: params.reasoningMode,
+									parallelEscape: params.parallelEscape,
+									chatMode: params.chatMode,
+								}
+							: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
+						signal: combinedSignal,
+						onCaptchaStart: ({ budgetMs }) => {
+							// Single coherent policy, no competing timers: while
+							// human captcha recovery is active the attempt budget
+							// is the human budget, replacing the normal deadline.
+							// A settled attempt never re-arms (the hook only fires
+							// while createStreamForAccount is still running).
+							if (!attemptSettled) attemptDeadlineBox.current?.extend(Math.max(0, budgetMs));
+						},
+					}, () => createQwenStream(
 						promptForUpstream,
 						params.isThinkingModel,
 						params.model,
@@ -1317,12 +1465,14 @@ async function tryCreateStreamWithRetry(
 								}
 							: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
 						combinedSignal,
-					)),
+					))),
 					acquireDeadline,
 				]);
-				// The acquire won: stop the deadline so it cannot fire later and
-				// abort a signal nobody observes anymore.
-				if (acquireDeadlineTimer) clearTimeout(acquireDeadlineTimer);
+				// The acquire settled (won or lost): stop the deadline so it cannot
+				// fire later and abort a signal nobody observes anymore.
+				attemptSettled = true;
+				attemptDeadlineBox.current?.clear();
+				attemptDeadlineBox.current = null;
 
 				if (logger.isLevelEnabled("info")) {
 					console.log(

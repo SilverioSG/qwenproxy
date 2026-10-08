@@ -64,7 +64,10 @@ export function resolveApiKey(
     }
     return overrideKey.trim();
   }
-  const envKey = process.env.API_KEY || process.env.ADMIN_PASSWORD || configKey;
+  const envKey =
+    (!isPlaceholderApiKey(process.env.API_KEY) ? process.env.API_KEY : undefined) ||
+    (!isPlaceholderApiKey(process.env.ADMIN_PASSWORD) ? process.env.ADMIN_PASSWORD : undefined) ||
+    configKey;
   if (envKey && !isPlaceholderApiKey(envKey)) {
     return envKey.trim();
   }
@@ -165,7 +168,9 @@ export function getDefaultPaths(): {
 
   return {
     claudeCode: path.join(home, ".claude", "settings.json"),
-    codex: process.env.CODEX_HOME
+    codex: fs.existsSync(path.join(home, ".codex", "config.toml"))
+      ? path.join(home, ".codex", "config.toml")
+      : process.env.CODEX_HOME
       ? path.join(process.env.CODEX_HOME, "config.toml")
       : path.join(home, ".codex", "config.toml"),
     openCode: existingOpenCode || openCodeCandidates[0],

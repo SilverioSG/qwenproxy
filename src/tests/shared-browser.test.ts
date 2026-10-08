@@ -85,14 +85,14 @@ test("isPageLoggedIn detects authenticated session via API/DOM and rejects unaut
   const loggedOutApiPage: any = {
     isClosed: () => false,
     url: () => "https://chat.qwen.ai/",
-    evaluate: async (fn: any) => false,
+    evaluate: async (fn: any) => "auths-status",
   };
   assert.equal(await isPageLoggedIn(loggedOutApiPage), false);
 
   const loggedInApiPage: any = {
     isClosed: () => false,
     url: () => "https://chat.qwen.ai/",
-    evaluate: async (fn: any) => true,
+    evaluate: async (fn: any) => "ok",
   };
   assert.equal(await isPageLoggedIn(loggedInApiPage), true);
 

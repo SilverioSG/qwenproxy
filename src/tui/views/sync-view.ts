@@ -61,6 +61,13 @@ export class SyncView implements TuiView {
     } catch {}
   }
 
+  private appendLog(msg: string): void {
+    this.actionLog.push(msg);
+    if (this.actionLog.length > 500) {
+      this.actionLog.shift();
+    }
+  }
+
   private detectClients(): void {
     const paths = getDefaultPaths();
     const defs: Array<{ id: SyncClientName; name: string; path: string }> = [
@@ -260,7 +267,7 @@ export class SyncView implements TuiView {
       for (const c of this.clients) {
         c.selected = !allSelected;
       }
-      this.actionLog.unshift(
+      this.appendLog(
         allSelected ? "Desmarcados todos os clientes." : "Selecionados todos os clientes.",
       );
       return true;
@@ -289,11 +296,11 @@ export class SyncView implements TuiView {
       .map((c) => c.id);
 
     if (selectedTargets.length === 0) {
-      this.actionLog.unshift(theme.yellow("⚠ Nenhum cliente selecionado para sincronizar."));
+      this.appendLog(theme.yellow("⚠ Nenhum cliente selecionado para sincronizar."));
       return;
     }
     const currentModel = this.availableModels[this.modelIndex] || "qwen3.8-max";
-    this.actionLog.unshift(
+    this.appendLog(
       theme.cyan(`⏳ Sincronizando [${selectedTargets.join(", ")}] com modelo ${currentModel}...`),
     );
     try {
@@ -308,21 +315,24 @@ export class SyncView implements TuiView {
       for (const [key, clientRes] of Object.entries(res.clients)) {
         if (clientRes && clientRes.success) {
           successCount++;
-          this.actionLog.unshift(
+          this.appendLog(
             theme.green(`✓ [${key}] ${clientRes.message || "Configurado com sucesso"}`),
           );
         } else if (clientRes) {
-          this.actionLog.unshift(
+          this.appendLog(
             theme.red(`✗ [${key}] Falha: ${clientRes.error || "Erro desconhecido"}`),
           );
         }
       }
 
-      this.actionLog.unshift(
+      this.appendLog(
         theme.green(`🎉 Concluído: ${successCount} cliente(s) sincronizado(s) com zero perdas!`),
       );
       this.detectClients();
     } catch (err: any) {
+      this.appendLog(
+        theme.red(`✗ Erro na sincronização: ${err?.message || String(err)}`),
+      );
     }
   }
 
@@ -332,17 +342,17 @@ export class SyncView implements TuiView {
       .map((c) => c.id);
 
     const targetDesc = selectedTargets.length > 0 ? `[${selectedTargets.join(", ")}]` : "todos os clientes";
-    this.actionLog.unshift(theme.yellow(`⏳ Restaurando backups anteriores de ${targetDesc}...`));
+    this.appendLog(theme.yellow(`⏳ Restaurando backups anteriores de ${targetDesc}...`));
     try {
       const res = restoreAllClients({
         targets: selectedTargets.length > 0 ? selectedTargets : undefined,
       });
-      this.actionLog.unshift(
+      this.appendLog(
         theme.green(`✓ Rollback concluído: ${res.restoredCount} arquivo(s) restaurados com sucesso.`),
       );
       this.detectClients();
     } catch (err: any) {
-      this.actionLog.unshift(theme.red(`✗ Erro ao restaurar backups: ${err?.message || String(err)}`));
+      this.appendLog(theme.red(`✗ Erro ao restaurar backups: ${err?.message || String(err)}`));
     }
   }
 
@@ -446,7 +456,9 @@ export class SyncView implements TuiView {
         theme.muted("  Backups (.bak) são criados automaticamente antes de cada alteração."),
       );
     } else {
-      for (const log of this.actionLog.slice(0, contentH - 5)) {
+      const maxLogs = Math.max(5, contentH - 5);
+      const visibleLogs = this.actionLog.slice(-maxLogs);
+      for (const log of visibleLogs) {
         rightContent.push(`  ${log}`);
       }
     }

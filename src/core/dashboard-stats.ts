@@ -33,6 +33,71 @@ export const ERROR_TEXT_MAX = 200;
 /** Dimension bucket for null/empty account, model or route. Not a real id. */
 export const UNKNOWN_DIMENSION = "unknown";
 
+/**
+ * Failure taxonomy for the dashboard (additive facets, never a recount).
+ *
+ * Base accounting is untouched: TOTAL = every AIRequestRecord, SUCCESS =
+ * success=true, ERRORS = success=false. The facets below only re-slice the
+ * error population using the already-stored `errorReason`:
+ * - CLIENT_ABORTS: success=false AND errorReason === "client_abort".
+ * - FAILED_REQUESTS: success=false AND errorReason !== "client_abort"
+ *   (protection events stay inside: a WAF 429 is still terminal).
+ * Invariant: ERRORS === FAILED_REQUESTS + CLIENT_ABORTS, and
+ * PROTECTION_EVENTS ⊆ FAILED_REQUESTS.
+ */
+export const CLIENT_ABORT_REASON = "client_abort";
+
+/** errorReason values denoting shared/global WAF + circuit protection. */
+export const PROTECTION_ERROR_REASONS: ReadonlySet<string> = new Set([
+  "shared_waf_circuit_open",
+  "waf_probe_rotate",
+  "direct_waf_clearance_timeout",
+  "direct_waf_recovery_unavailable",
+  "anti_bot",
+]);
+
+export type ErrorSemanticClass =
+  | "CLIENT_ABORT"
+  | "PROTECTION"
+  | "BACKEND"
+  | "ACCOUNT_HEALTH"
+  | "QUOTA"
+  | "UNKNOWN";
+
+/**
+ * Map a terminal errorReason to its dashboard semantic class. Only families
+ * with in-code evidence are mapped; everything else (deterministic request
+ * rejections, unlisted or missing reasons) falls back to UNKNOWN rather
+ * than inventing a class.
+ */
+export function classifyErrorSemantic(
+  reason: string | null | undefined,
+): ErrorSemanticClass {
+  if (reason === CLIENT_ABORT_REASON) return "CLIENT_ABORT";
+  if (typeof reason === "string" && PROTECTION_ERROR_REASONS.has(reason)) {
+    return "PROTECTION";
+  }
+  if (reason === "quota_or_rate_limit") return "QUOTA";
+  if (
+    reason === "personalization_sync_failed" ||
+    reason === "account_initialization_failed" ||
+    reason === "account_busy"
+  ) {
+    return "ACCOUNT_HEALTH";
+  }
+  if (
+    reason === "network" ||
+    reason === "upstream_error" ||
+    reason === "upstream_unavailable" ||
+    reason === "stream_aborted" ||
+    reason === "explicit_retryable" ||
+    reason === "unknown_upstream_default_retry"
+  ) {
+    return "BACKEND";
+  }
+  return "UNKNOWN";
+}
+
 const bootTime = Date.now();
 
 export interface NetworkEvent {
@@ -343,7 +408,15 @@ export function getMonitorSummary(): {
     totalRequests: number;
     totalSuccess: number;
     totalErrors: number;
+    /** success=false AND errorReason !== "client_abort" (protection incl.). */
+    failedRequests: number;
+    /** success=false AND errorReason === "client_abort". */
+    clientAborts: number;
+    /** Subset of failedRequests with a protection-family errorReason. */
+    protectionEvents: number;
     overallErrorRate: number;
+    /** failedRequests / (success + failedRequests): aborts excluded. */
+    failureRate: number;
     overallAvgLatencyMs: number | null;
     medianLatencyMs: number | null;
     p95LatencyMs: number | null;
@@ -360,12 +433,24 @@ export function getMonitorSummary(): {
       };
     }
   >;
-  topErrors: Array<{ message: string; count: number }>;
+  topErrors: Array<{
+    /** Full cleaned message (existing field, preserved for compatibility). */
+    message: string;
+    /** Alias of message (spec shape); same string, no new information. */
+    error: string;
+    /** Raw errorReason of the grouped records (null when unrecorded). */
+    errorReason: string | null;
+    semanticClass: ErrorSemanticClass;
+    count: number;
+  }>;
   timeRange: { from: number; to: number } | null;
   totalEntries: number;
 } {
   let success = 0;
   let errors = 0;
+  let failedRequests = 0;
+  let clientAborts = 0;
+  let protectionEvents = 0;
   let streamCount = 0;
   let streamSuccess = 0;
   let streamSum = 0;
@@ -377,11 +462,32 @@ export function getMonitorSummary(): {
   let latencySum = 0;
   let latencyCount = 0;
   const ringLatencies: number[] = [];
-  const ringErrors = new Map<string, number>();
+  const ringFailures = new Map<
+    string,
+    {
+      message: string;
+      error: string;
+      errorReason: string | null;
+      semanticClass: ErrorSemanticClass;
+      count: number;
+    }
+  >();
   const ringAccounts = new Map<string, RingAccountBucket>();
   for (const r of aiRing) {
     if (r.success) success += 1;
-    else errors += 1;
+    else {
+      errors += 1;
+      if (r.errorReason === CLIENT_ABORT_REASON) clientAborts += 1;
+      else {
+        failedRequests += 1;
+        if (
+          typeof r.errorReason === "string" &&
+          PROTECTION_ERROR_REASONS.has(r.errorReason)
+        ) {
+          protectionEvents += 1;
+        }
+      }
+    }
     const hasLatency = Number.isFinite(r.latencyMs);
     if (hasLatency) {
       latencySum += r.latencyMs;
@@ -427,7 +533,22 @@ export function getMonitorSummary(): {
       }
     }
     if (r.error) {
-      ringErrors.set(r.error, (ringErrors.get(r.error) ?? 0) + 1);
+      // Group by (errorReason, message): the same text with a different
+      // semantic origin must never merge into one row.
+      const reasonKey = r.errorReason ?? "";
+      const failureKey = `${reasonKey} ${r.error}`;
+      let failure = ringFailures.get(failureKey);
+      if (!failure) {
+        failure = {
+          message: r.error,
+          error: r.error,
+          errorReason: r.errorReason,
+          semanticClass: classifyErrorSemantic(r.errorReason),
+          count: 0,
+        };
+        ringFailures.set(failureKey, failure);
+      }
+      failure.count += 1;
     }
   }
   const total = aiRing.length;
@@ -450,8 +571,7 @@ export function getMonitorSummary(): {
   }));
   accounts.sort((x, y) => y.lastActivity - x.lastActivity);
 
-  const topErrors = [...ringErrors.entries()]
-    .map(([message, count]) => ({ message, count }))
+  const topErrors = [...ringFailures.values()]
     .sort((a, b) => b.count - a.count)
     .slice(0, TOP_ERRORS_LIMIT);
 
@@ -460,7 +580,11 @@ export function getMonitorSummary(): {
       totalRequests: total,
       totalSuccess: success,
       totalErrors: errors,
+      failedRequests,
+      clientAborts,
+      protectionEvents,
       overallErrorRate: errorRate(errors, total),
+      failureRate: errorRate(failedRequests, success + failedRequests),
       overallAvgLatencyMs: avgOf(latencyCount, latencySum),
       medianLatencyMs: medianOf(ringLatencies),
       p95LatencyMs: p95Of(ringLatencies),

@@ -14,13 +14,14 @@ import {
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
+import { setCookiePairInJar } from "./qwen-token-refresh.ts";
 import { logger } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
 import type {
   PersonalizationEstimationInfo,
   TokenEstimationContext,
 } from "./token-estimation-metrics.ts";
-import { getDatabase } from "../core/database.ts";
+import { getDatabase, getPersistedBearerToken } from "../core/database.ts";
 import { mapClientModelToQwen } from "../core/model-alias.ts";
 import {
   MAX_PAYLOAD_SIZE,
@@ -751,8 +752,18 @@ const QWEN_SAFE_SETTINGS_PATCH = {
     autoTags: false,
     largeTextAsFile: false,
     splitLargeChunks: false,
+    title: {
+      auto: false,
+    },
+    notificationEnabled: false,
   },
   mcp_remind: false,
+  mcp: {
+    "code-interpreter": false,
+    "fire-crawl": false,
+    amap: false,
+    "image-generation": false,
+  },
   memory: {
     enable_memory: false,
     enable_history_memory: false,
@@ -768,6 +779,10 @@ const QWEN_SAFE_SETTINGS_PATCH = {
     image_edit_tool: false,
     bio: false,
     image_zoom_in_tool: false,
+    image_search: false,
+  },
+  extension: {
+    show_guide: false,
   },
 } as const;
 
@@ -839,6 +854,27 @@ export async function readJsonTextResponse(
   }
 }
 
+/**
+ * True only for a benign same-origin navigation abort: Playwright's
+ * `net::ERR_ABORTED` fired while the page already sits on the expected
+ * target origin (redirect/superseded navigation that still landed home).
+ * Every other failure — Target/context/browser closed, timeouts,
+ * connection errors, off-origin aborts — returns false and must rethrow.
+ */
+export function isBenignNavigationAbort(
+  err: unknown,
+  pageUrl: string,
+  targetOrigin: string,
+): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  if (!message.includes("ERR_ABORTED")) return false;
+  try {
+    return pageUrl.startsWith(targetOrigin);
+  } catch {
+    return false;
+  }
+}
+
 async function withQwenBrowserPage<T>(
   accountId: string,
   fn: (page: Page) => Promise<T>,
@@ -874,10 +910,22 @@ async function withQwenBrowserPage<T>(
         (normalizedTargetPath !== null && currentPath !== normalizedTargetPath);
 
       if (needsNavigation) {
-        await page.goto(targetUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
-        });
+        try {
+          await page.goto(targetUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
+          });
+        } catch (err: unknown) {
+          // A benign navigation interruption (net::ERR_ABORTED) happens when
+          // the page already reached the target origin or a redirect finished
+          // first — the page is where it needs to be, so continue instead of
+          // failing the whole operation (which used to surface as
+          // PersonalizationFailed + 300s account cooldown). Anything else
+          // (Target closed, timeouts, connection errors) still throws.
+          if (!isBenignNavigationAbort(err, page.url(), targetOrigin)) {
+            throw err;
+          }
+        }
       }
 
       return fn(page);
@@ -887,6 +935,9 @@ async function withQwenBrowserPage<T>(
     recoverOnTimeout,
   );
 }
+
+/** Test seam: exercise the navigation-abort tolerance without a browser. */
+export const _withQwenBrowserPageForTests = withQwenBrowserPage;
 
 
 
@@ -901,6 +952,7 @@ function getBrowserFetchHeaders(
   const browserAllowedHeaders = new Set([
     "accept",
     "content-type",
+    "authorization",
     "bx-ua",
     "bx-umidtoken",
     "bx-v",
@@ -922,6 +974,1073 @@ interface BrowserTextResponse {
   status: number;
   contentType: string;
   raw: string;
+}
+
+/** Sanitized result of the settings A/B auth experiment. No secrets. */
+export interface SettingsAuthABResult {
+  bearerStatus: number;
+  bearerAppAuthFailure: boolean;
+  cookieStatus: number;
+  cookieAppAuthFailure: boolean;
+  liveTokenPresent: boolean;
+  cookieCount: number;
+  cookieNameHash: string;
+  liveTokenStable: boolean | null;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC (read-only): compare settings auth with live
+ * bearer (A) vs cookie-only (B) on the SAME live page/context, back to
+ * back. No heal, no refresh, no login, no DB writes, no cooldown changes.
+ * Single attempt each. Inline statements only (__name constraints).
+ */
+export async function probeSettingsAuthAB(
+  accountId: string,
+): Promise<SettingsAuthABResult> {
+  const { withAccountPage } = await import("./playwright.ts");
+  return withAccountPage(
+    accountId,
+    async (page: Page): Promise<SettingsAuthABResult> => {
+      return page.evaluate(async (): Promise<SettingsAuthABResult> => {
+        try {
+          let liveToken: string | null = null;
+          try {
+            const t = localStorage.getItem("token");
+            liveToken = typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            liveToken = null;
+          }
+          const base: Record<string, string> = {
+            accept: "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "x-request-id":
+              Math.random().toString(36).slice(2) +
+              Math.random().toString(36).slice(2),
+            source: "web",
+          };
+          // A: live bearer.
+          const headersA: Record<string, string> = { ...base };
+          if (liveToken) {
+            headersA["authorization"] = "Bearer " + liveToken;
+            headersA["Authorization"] = "Bearer " + liveToken;
+          }
+          const resA = await fetch(
+            "https://chat.qwen.ai/api/v2/users/user/settings",
+            {
+              method: "GET",
+              credentials: "include",
+              headers: headersA,
+              signal: AbortSignal.timeout(20000),
+            },
+          );
+          const textA = await resA.text().catch(() => "");
+          let appFailA = false;
+          try {
+            const p: any = JSON.parse(textA);
+            appFailA =
+              p &&
+              p.success === false &&
+              (p.data?.code === "Unauthorized" || p.code === "Unauthorized");
+          } catch {
+            appFailA = false;
+          }
+          // B: cookie-only (no Authorization at all).
+          const headersB: Record<string, string> = { ...base };
+          const resB = await fetch(
+            "https://chat.qwen.ai/api/v2/users/user/settings",
+            {
+              method: "GET",
+              credentials: "include",
+              headers: headersB,
+              signal: AbortSignal.timeout(20000),
+            },
+          );
+          const textB = await resB.text().catch(() => "");
+          let appFailB = false;
+          try {
+            const p2: any = JSON.parse(textB);
+            appFailB =
+              p2 &&
+              p2.success === false &&
+              (p2.data?.code === "Unauthorized" || p2.code === "Unauthorized");
+          } catch {
+            appFailB = false;
+          }
+          let liveStable: boolean | null = null;
+          try {
+            const t2 = localStorage.getItem("token");
+            const now2 = typeof t2 === "string" && t2.length > 0 ? t2 : null;
+            liveStable =
+              liveToken !== null && now2 !== null
+                ? liveToken === now2
+                : null;
+          } catch {
+            liveStable = null;
+          }
+          let cookieCount = 0;
+          let cookieNameHash = "";
+          try {
+            const rawParts = document.cookie.split(";");
+            const names: string[] = [];
+            for (let i = 0; i < rawParts.length; i++) {
+              const trimmed = rawParts[i].trim();
+              if (!trimmed) continue;
+              cookieCount += 1;
+              const eq = trimmed.indexOf("=");
+              names.push(eq >= 0 ? trimmed.slice(0, eq) : trimmed);
+            }
+            names.sort();
+            let joined = "";
+            for (let i = 0; i < names.length; i++) {
+              joined += (i > 0 ? ";" : "") + names[i];
+            }
+            let h1 = 0x811c9dc5;
+            for (let i = 0; i < joined.length; i++) {
+              h1 ^= joined.charCodeAt(i);
+              h1 = Math.imul(h1, 0x01000193);
+            }
+            cookieNameHash = (h1 >>> 0).toString(16);
+          } catch {
+            cookieCount = 0;
+            cookieNameHash = "";
+          }
+          return {
+            bearerStatus: resA.status,
+            bearerAppAuthFailure: appFailA,
+            cookieStatus: resB.status,
+            cookieAppAuthFailure: appFailB,
+            liveTokenPresent: liveToken !== null,
+            cookieCount,
+            cookieNameHash,
+            liveTokenStable: liveStable,
+          };
+        } catch {
+          return {
+            bearerStatus: 0,
+            bearerAppAuthFailure: false,
+            cookieStatus: 0,
+            cookieAppAuthFailure: false,
+            liveTokenPresent: false,
+            cookieCount: 0,
+            cookieNameHash: "",
+            liveTokenStable: null,
+          };
+        }
+      });
+    },
+    60_000,
+    30_000,
+    false,
+  );
+}
+
+/** Sanitized refresh-endpoint structure. Names/lengths/booleans only. */
+export interface RefreshStructureResult {
+  httpStatus: number;
+  contentType: string;
+  topKeys: string[];
+  dataKeys: string[];
+  nestedKeys: string[];
+  appSuccess: boolean;
+  appAuthFailure: boolean;
+  tokenCandidates: Array<{
+    path: string;
+    present: boolean;
+    valueType: string;
+    valueLength: number;
+  }>;
+  cookiesChanged: boolean;
+  cookieCountBefore: number;
+  cookieCountAfter: number;
+  liveTokenPresentBefore: boolean;
+  liveTokenPresentAfter: boolean;
+  liveTokenChanged: boolean;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC, single controlled refresh execution. Calls the
+ * auth refresh endpoint ONCE in-page and reports response STRUCTURE only
+ * (key names, value types/lengths, presence booleans). NEVER logs values,
+ * tokens, cookies, or bodies. Performs NO writes (no setItem, no cookies,
+ * no retry, no login, no DB, no cooldown).
+ * Inline statements only (__name constraints).
+ */
+export async function probeRefreshStructure(
+  accountId: string,
+): Promise<RefreshStructureResult> {
+  const { withAccountPage } = await import("./playwright.ts");
+  return withAccountPage(
+    accountId,
+    async (page: Page): Promise<RefreshStructureResult> => {
+      return page.evaluate(async (): Promise<RefreshStructureResult> => {
+        const empty: RefreshStructureResult = {
+          httpStatus: 0,
+          contentType: "",
+          topKeys: [],
+          dataKeys: [],
+          nestedKeys: [],
+          appSuccess: false,
+          appAuthFailure: false,
+          tokenCandidates: [],
+          cookiesChanged: false,
+          cookieCountBefore: 0,
+          cookieCountAfter: 0,
+          liveTokenPresentBefore: false,
+          liveTokenPresentAfter: false,
+          liveTokenChanged: false,
+        };
+        try {
+          let preCookies = "";
+          try {
+            preCookies = document.cookie || "";
+          } catch {
+            preCookies = "";
+          }
+          let preCount = 0;
+          try {
+            const parts = preCookies.split(";");
+            for (let i = 0; i < parts.length; i++) {
+              if (parts[i].trim()) preCount += 1;
+            }
+          } catch {
+            preCount = 0;
+          }
+          empty.cookieCountBefore = preCount;
+          let preToken: string | null = null;
+          try {
+            const t = localStorage.getItem("token");
+            preToken = typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            preToken = null;
+          }
+          empty.liveTokenPresentBefore = preToken !== null;
+          let resStatus = 0;
+          let resContentType = "";
+          let rawText = "";
+          try {
+            const refreshRes = await fetch(
+              "https://auth.qwen.ai/api/v2/auths/refresh",
+              {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(10000),
+              },
+            );
+            resStatus = refreshRes.status;
+            try {
+              resContentType = refreshRes.headers.get("content-type") || "";
+            } catch {
+              resContentType = "";
+            }
+            try {
+              rawText = await refreshRes.text();
+            } catch {
+              rawText = "";
+            }
+          } catch {
+            empty.httpStatus = 0;
+            return empty;
+          }
+          empty.httpStatus = resStatus;
+          empty.contentType = resContentType.slice(0, 80);
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(rawText);
+          } catch {
+            parsed = null;
+          }
+          if (parsed && typeof parsed === "object") {
+            for (const k in parsed) {
+              if (Object.prototype.hasOwnProperty.call(parsed, k)) {
+                empty.topKeys.push(k);
+              }
+            }
+            if (parsed.success === true) empty.appSuccess = true;
+            const code = String(parsed.data?.code || parsed.code || "");
+            const details = String(
+              parsed.data?.details || parsed.details || parsed.message || "",
+            );
+            if (
+              parsed.success === false &&
+              (code === "Unauthorized" ||
+                code.toLowerCase().indexOf("unauthorized") >= 0 ||
+                details.toLowerCase().indexOf("unauthorized") >= 0 ||
+                details.indexOf("401") >= 0)
+            ) {
+              empty.appAuthFailure = true;
+            }
+            const data = parsed.data;
+            if (data && typeof data === "object") {
+              for (const k in data) {
+                if (Object.prototype.hasOwnProperty.call(data, k)) {
+                  empty.dataKeys.push(k);
+                }
+              }
+              for (const k in data) {
+                if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
+                const v = (data as Record<string, unknown>)[k];
+                const t = v === null ? "null" : Array.isArray(v) ? "array" : typeof v;
+                let extra = "";
+                if (typeof v === "string") extra = " len=" + v.length;
+                else if (Array.isArray(v)) extra = " len=" + v.length;
+                else if (v && typeof v === "object") {
+                  let nk = 0;
+                  for (const kk in v as Record<string, unknown>) {
+                    if (Object.prototype.hasOwnProperty.call(v, kk)) nk += 1;
+                  }
+                  extra = " keys=" + nk;
+                }
+                empty.nestedKeys.push("data." + k + ":" + t + extra);
+              }
+            }
+            const paths = [
+              "data.token",
+              "data.access_token",
+              "data.accessToken",
+              "data.id_token",
+              "data.idToken",
+              "token",
+              "access_token",
+              "accessToken",
+              "data.session",
+              "data.ticket",
+              "data.refresh_token",
+            ];
+            for (let i = 0; i < paths.length; i++) {
+              const segs = paths[i].split(".");
+              let cur: unknown = parsed;
+              let ok = true;
+              for (let s = 0; s < segs.length; s++) {
+                if (cur && typeof cur === "object" && segs[s] in (cur as Record<string, unknown>)) {
+                  cur = (cur as Record<string, unknown>)[segs[s]];
+                } else {
+                  ok = false;
+                  break;
+                }
+              }
+              empty.tokenCandidates.push({
+                path: paths[i],
+                present: ok,
+                valueType: ok ? (cur === null ? "null" : Array.isArray(cur) ? "array" : typeof cur) : "absent",
+                valueLength:
+                  ok && typeof cur === "string"
+                    ? cur.length
+                    : ok && Array.isArray(cur)
+                      ? cur.length
+                      : 0,
+              });
+            }
+          }
+          try {
+            const postCookies = document.cookie || "";
+            let postCount = 0;
+            try {
+              const parts = postCookies.split(";");
+              for (let i = 0; i < parts.length; i++) {
+                if (parts[i].trim()) postCount += 1;
+              }
+            } catch {
+              postCount = 0;
+            }
+            empty.cookieCountAfter = postCount;
+            empty.cookiesChanged = postCount !== preCount;
+          } catch {
+            empty.cookieCountAfter = preCount;
+            empty.cookiesChanged = false;
+          }
+          try {
+            const t2 = localStorage.getItem("token");
+            const now2 = typeof t2 === "string" && t2.length > 0 ? t2 : null;
+            empty.liveTokenPresentAfter = now2 !== null;
+            empty.liveTokenChanged =
+              (preToken === null) !== (now2 === null) ||
+              (preToken !== null && now2 !== null && preToken !== now2);
+          } catch {
+            empty.liveTokenPresentAfter = empty.liveTokenPresentBefore;
+            empty.liveTokenChanged = false;
+          }
+          return empty;
+        } catch {
+          return empty;
+        }
+      });
+    },
+    60_000,
+    30_000,
+    false,
+  );
+}
+/** Sanitized shape of a chats/new response. Structure only, never values. */
+export interface ChatResponseShape {
+  topKeys: string[];
+  dataType: string;
+  dataKeys: string[];
+  nestedKeys: string[];
+  arrayLengths: string[];
+  successPresent: boolean;
+  successValue: boolean | null;
+  codePresent: boolean;
+  codeLen: number;
+  chatIdCandidates: string[];
+}
+export interface ShapingHeaderResult {
+  name: string;
+  status: number;
+  appAuthFailure: boolean;
+}
+
+/** Sanitized shaping-probe outcome. No secrets, no bodies. */
+export interface ChatShapingResult {
+  baseline: { status: number; appAuthFailure: boolean; created: boolean };
+  baselineShape: ChatResponseShape | null;
+  stoppedEarly: boolean;
+  headerTests: ShapingHeaderResult[];
+  causalHeader: string | null;
+  groupTests: Array<{ group: string; status: number; appAuthFailure: boolean }>;
+  causalGroup: string | null;
+  preCreate: { status: number; appAuthFailure: boolean };
+  settingsUpdate: { status: number; appAuthFailure: boolean };
+  postCreate: { status: number; appAuthFailure: boolean };
+  loginOk: boolean;
+}
+
+/**
+ * EXPERIMENTAL DIAGNOSTIC: isolate which pipeline request shaping turns a
+ * valid session into appUnauthorized/401. Same live page/context throughout:
+ * fresh loginViaApi first, then baseline minimal create-chat, then single
+ * headers added one by one (stop at first failure), then group tests, then
+ * settings/update pre/post create-chat comparison. No re-auth, no refresh,
+ * no cooldown/DB changes, no rotation, no context recreation.
+ * In-page code uses inline statements only (__name constraints).
+ */
+export async function probeChatShaping(
+  accountId: string,
+): Promise<ChatShapingResult> {
+  const { withAccountPage, getCachedQwenHeaders } = await import("./playwright.ts");
+  const { probeLoginOnce } = await import("./playwright.ts");
+  const login = await probeLoginOnce(accountId);
+  const failResult: ChatShapingResult = {
+    baseline: { status: 0, appAuthFailure: false, created: false },
+    baselineShape: null,
+    stoppedEarly: true,
+    headerTests: [],
+    causalHeader: null,
+    groupTests: [],
+    causalGroup: null,
+    preCreate: { status: 0, appAuthFailure: false },
+    settingsUpdate: { status: 0, appAuthFailure: false },
+    postCreate: { status: 0, appAuthFailure: false },
+    loginOk: login.loginOk,
+  };
+  if (!login.loginOk) return failResult;
+  const cached = getCachedQwenHeaders(accountId) || {};
+  const { qwenUrl } = await import("./qwen-url.ts");
+  const referer = qwenUrl("/");
+  const baseEntries: Array<{ name: string; value: string }> = [
+    { name: "accept", value: "application/json, text/plain, */*" },
+    { name: "content-type", value: "application/json" },
+    { name: "source", value: "web" },
+  ];
+  const baseNames = new Set(baseEntries.map((e) => e.name));
+  const singleNames = [
+    "Version",
+    "Timezone",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "bx-v",
+    "bx-ua",
+    "bx-umidtoken",
+  ];
+  const tests: Array<{
+    name: string;
+    headers: Array<{ name: string; value: string }>;
+  }> = [{ name: "baseline-minimal", headers: baseEntries.map((e) => ({ ...e })) }];
+  const pickCached = (name: string): string | null => {
+    for (const k of Object.keys(cached)) {
+      if (k.toLowerCase() === name.toLowerCase()) {
+        const v = cached[k];
+        if (typeof v === "string" && v.length > 0) return v;
+      }
+    }
+    return null;
+  };
+  for (const hname of singleNames) {
+    if (hname === "Referer") continue;
+    const v = pickCached(hname);
+    if (v === null) continue;
+    tests.push({
+      name: `+${hname}`,
+      headers: [...baseEntries.map((e) => ({ ...e })), { name: hname, value: v }],
+    });
+  }
+  // Referer variant goes through the fetch referrer option, not a header.
+  tests.push({ name: "+Referer", headers: baseEntries.map((e) => ({ ...e })), referer: true } as unknown as {
+    name: string;
+    headers: Array<{ name: string; value: string }>;
+  });
+  const groupOf = (names: string[]): Array<{ name: string; value: string }> | null => {
+    const out: Array<{ name: string; value: string }> = baseEntries.map((e) => ({ ...e }));
+    for (const hname of names) {
+      const v = pickCached(hname);
+      if (v === null) return null;
+      out.push({ name: hname, value: v });
+    }
+    return out;
+  };
+  const groups: Array<{ group: string; headers: Array<{ name: string; value: string }> }> = [];
+  const gh = groupOf(["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"]);
+  if (gh) groups.push({ group: "client-hints", headers: gh });
+  const ab: Array<{ name: string; value: string }> = baseEntries.map((e) => ({ ...e }));
+  let abAny = false;
+  for (const hname of ["bx-v", "bx-ua", "bx-umidtoken"]) {
+    const v = pickCached(hname);
+    if (v !== null) {
+      ab.push({ name: hname, value: v });
+      abAny = true;
+    }
+  }
+  if (abAny) groups.push({ group: "antibot", headers: ab });
+  const spa = groupOf(["Version", "Timezone"]);
+  if (spa) groups.push({ group: "spa-headers", headers: spa });
+  groups.push({
+    group: "full-pipeline",
+    headers: [...baseEntries.map((e) => ({ ...e }))].concat(
+      Object.keys(cached)
+        .filter((k) => {
+          const l = k.toLowerCase();
+          return (
+            !baseNames.has(l) &&
+            l !== "cookie" &&
+            l !== "authorization" &&
+            l !== "user-agent"
+          );
+        })
+        .map((k) => ({ name: k, value: cached[k] })),
+    ),
+  });
+  try {
+    console.log(
+      `[Shaping] account=${accountId.slice(0, 8)} loginOk=true baseline-next singles=${tests.length - 1} groups=${groups.length}`,
+    );
+  } catch {
+    // Diagnostics must never break the probe.
+  }
+  const shaping = await withAccountPage(
+    accountId,
+    async (page: Page): Promise<ChatShapingResult> => {
+      return page.evaluate(
+        async (args: {
+          tests: Array<{
+            name: string;
+            headers: Array<{ name: string; value: string }>;
+            referer?: boolean;
+          }>;
+          groups: Array<{
+            group: string;
+            headers: Array<{ name: string; value: string }>;
+          }>;
+          referer: string;
+          createUrl: string;
+          settingsUrl: string;
+          updateUrl: string;
+        }): Promise<ChatShapingResult> => {
+          const result: ChatShapingResult = {
+            baseline: { status: 0, appAuthFailure: false, created: false },
+    baselineShape: null,
+            stoppedEarly: true,
+            headerTests: [],
+            causalHeader: null,
+            groupTests: [],
+            causalGroup: null,
+            preCreate: { status: 0, appAuthFailure: false },
+            settingsUpdate: { status: 0, appAuthFailure: false },
+            postCreate: { status: 0, appAuthFailure: false },
+            loginOk: true,
+          };
+          const newBody = JSON.stringify({
+            chatId: "",
+            models: ["qwen3.8-max"],
+            project_id: "",
+            timestamp: Date.now(),
+          });
+          for (let ti = 0; ti < args.tests.length; ti++) {
+            const t = args.tests[ti];
+            const hh: Record<string, string> = {};
+            for (let hi = 0; hi < t.headers.length; hi++) {
+              hh[t.headers[hi].name] = t.headers[hi].value;
+            }
+            let status = 0;
+            let appFail = false;
+            let created = false;
+            let shape: ChatResponseShape | null = null;
+            try {
+              const fetchInit: RequestInit = {
+                method: "POST",
+                credentials: "include",
+                headers: hh,
+                body: newBody,
+                signal: AbortSignal.timeout(25000),
+              };
+              if (t.referer) {
+                (fetchInit as Record<string, unknown>)["referrer"] = args.referer;
+              }
+              const resp = await fetch(args.createUrl, fetchInit);
+              status = resp.status;
+              const text = await resp.text().catch(() => "");
+              try {
+                const j: any = JSON.parse(text);
+                if (j && typeof j === "object") {
+                  created = Boolean(
+                    j.chat_id || j.id || j.data?.chat_id || j.data?.id || j.data?.chat?.id,
+                  );
+                  appFail =
+                    j.success === false &&
+                    (j.data?.code === "Unauthorized" ||
+                      j.code === "Unauthorized");
+                  if (ti === 0) {
+                    // Sanitized shape recording, inline (no helpers: __name).
+                    const topKeys: string[] = [];
+                    for (const k in j) {
+                      if (Object.prototype.hasOwnProperty.call(j, k)) {
+                        topKeys.push(k);
+                      }
+                    }
+                    const dv = j.data;
+                    const dataType =
+                      dv === null ? "null" : Array.isArray(dv) ? "array" : typeof dv;
+                    const dataKeys: string[] = [];
+                    const nestedKeys: string[] = [];
+                    const arrayLengths: string[] = [];
+                    if (dv && typeof dv === "object" && !Array.isArray(dv)) {
+                      for (const k in dv) {
+                        if (!Object.prototype.hasOwnProperty.call(dv, k)) continue;
+                        dataKeys.push(k);
+                        const vv = (dv as Record<string, unknown>)[k];
+                        const vt =
+                          vv === null ? "null" : Array.isArray(vv) ? "array" : typeof vv;
+                        if (Array.isArray(vv)) {
+                          arrayLengths.push(k + "=" + vv.length);
+                        } else if (vv && typeof vv === "object") {
+                          let nk = 0;
+                          for (const kk in vv as Record<string, unknown>) {
+                            if (Object.prototype.hasOwnProperty.call(vv, kk)) nk += 1;
+                          }
+                          nestedKeys.push(k + "{keys=" + nk + "}");
+                        } else {
+                          nestedKeys.push(k + ":" + vt);
+                        }
+                      }
+                    } else if (Array.isArray(dv)) {
+                      arrayLengths.push("data=" + dv.length);
+                    }
+                    const found: string[] = [];
+                    const cands = [
+                      "chat_id",
+                      "id",
+                      "data.chat_id",
+                      "data.id",
+                      "data.chat.id",
+                    ];
+                    for (let ci = 0; ci < cands.length; ci++) {
+                      const segs = cands[ci].split(".");
+                      let cur: unknown = j;
+                      let okk = true;
+                      for (let s = 0; s < segs.length; s++) {
+                        if (
+                          cur &&
+                          typeof cur === "object" &&
+                          segs[s] in (cur as Record<string, unknown>)
+                        ) {
+                          cur = (cur as Record<string, unknown>)[segs[s]];
+                        } else {
+                          okk = false;
+                          break;
+                        }
+                      }
+                      if (okk && typeof cur === "string" && cur.length > 0) {
+                        found.push(cands[ci]);
+                      }
+                    }
+                    let codePresent = false;
+                    let codeLen = 0;
+                    try {
+                      const codeV = j.data?.code ?? j.code;
+                      if (typeof codeV === "string") {
+                        codePresent = true;
+                        codeLen = codeV.length;
+                      }
+                    } catch {
+                      codePresent = false;
+                    }
+                    shape = {
+                      topKeys,
+                      dataType,
+                      dataKeys,
+                      nestedKeys,
+                      arrayLengths,
+                      successPresent: "success" in j,
+                      successValue: j.success === true ? true : j.success === false ? false : null,
+                      codePresent,
+                      codeLen,
+                      chatIdCandidates: found,
+                    };
+                  }
+                }
+              } catch {
+                appFail = false;
+              }
+            } catch {
+              status = 0;
+              appFail = false;
+            }
+            if (ti === 0) {
+              result.baseline = { status, appAuthFailure: appFail, created };
+              result.baselineShape = shape;
+              result.preCreate = { status, appAuthFailure: appFail };
+              // created/chat_id is INFORMATIONAL ONLY: HTTP 2xx without app
+              // failure continues the matrix regardless of response shape.
+              if (status !== 200 || appFail) {
+                result.stoppedEarly = true;
+                return result;
+              }
+              result.stoppedEarly = false;
+            } else {
+              result.headerTests.push({ name: t.name, status, appAuthFailure: appFail });
+              if (status === 401 || appFail) {
+                result.causalHeader = t.name;
+                result.stoppedEarly = true;
+                return result;
+              }
+            }
+          }
+          for (let gi = 0; gi < args.groups.length; gi++) {
+            const g = args.groups[gi];
+            const ghh: Record<string, string> = {};
+            for (let hi = 0; hi < g.headers.length; hi++) {
+              ghh[g.headers[hi].name] = g.headers[hi].value;
+            }
+            let status = 0;
+            let appFail = false;
+            try {
+              const resp = await fetch(args.createUrl, {
+                method: "POST",
+                credentials: "include",
+                headers: ghh,
+                body: newBody,
+                signal: AbortSignal.timeout(25000),
+              });
+              status = resp.status;
+              const text = await resp.text().catch(() => "");
+              try {
+                const j: any = JSON.parse(text);
+                appFail =
+                  !!j &&
+                  j.success === false &&
+                  (j.data?.code === "Unauthorized" || j.code === "Unauthorized");
+              } catch {
+                appFail = false;
+              }
+            } catch {
+              status = 0;
+              appFail = false;
+            }
+            result.groupTests.push({ group: g.group, status, appAuthFailure: appFail });
+            if (status === 401 || appFail) {
+              result.causalGroup = g.group;
+              result.stoppedEarly = true;
+              return result;
+            }
+          }
+          // settings/update phase with real echoed instruction shape.
+          let current: any = null;
+          try {
+            const getRes = await fetch(args.settingsUrl, {
+              method: "GET",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                source: "web",
+              },
+              signal: AbortSignal.timeout(20000),
+            });
+            if (getRes.status === 200) {
+              try {
+                current = await getRes.json().catch(() => null);
+              } catch {
+                current = null;
+              }
+            }
+          } catch {
+            current = null;
+          }
+          const curP =
+            current && current.data && typeof current.data.personalization === "object"
+              ? current.data.personalization
+              : {};
+          let updStatus = 0;
+          let updFail = false;
+          try {
+            const updBody = JSON.stringify({
+              personalization: {
+                name: "",
+                description: curP.description === undefined ? null : curP.description,
+                style: null,
+                instruction: "",
+                enable_for_new_chat: false,
+              },
+            });
+            const updRes = await fetch(args.updateUrl, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+              },
+              body: updBody,
+              signal: AbortSignal.timeout(25000),
+            });
+            updStatus = updRes.status;
+            const updText = await updRes.text().catch(() => "");
+            try {
+              const uj: any = JSON.parse(updText);
+              updFail =
+                !!uj &&
+                uj.success === false &&
+                (uj.data?.code === "Unauthorized" || uj.code === "Unauthorized");
+            } catch {
+              updFail = false;
+            }
+          } catch {
+            updStatus = 0;
+            updFail = false;
+          }
+          result.settingsUpdate = { status: updStatus, appAuthFailure: updFail };
+          let postStatus = 0;
+          let postFail = false;
+          let postCreated = false;
+          try {
+            const postRes = await fetch(args.createUrl, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+              },
+              body: newBody,
+              signal: AbortSignal.timeout(25000),
+            });
+            postStatus = postRes.status;
+            const postText = await postRes.text().catch(() => "");
+            try {
+              const pj: any = JSON.parse(postText);
+              if (pj && typeof pj === "object") {
+                postCreated = Boolean(
+                  pj.chat_id || pj.id || pj.data?.chat_id || pj.data?.id || pj.data?.chat?.id,
+                );
+                postFail =
+                  pj.success === false &&
+                  (pj.data?.code === "Unauthorized" || pj.code === "Unauthorized");
+              }
+            } catch {
+              postFail = false;
+            }
+          } catch {
+            postStatus = 0;
+            postFail = false;
+          }
+          result.postCreate = { status: postStatus, appAuthFailure: postFail };
+          void postCreated;
+          return result;
+        },
+        {
+          tests,
+          groups,
+          referer,
+          createUrl: qwenUrl("/api/v2/chats/new"),
+          settingsUrl: qwenUrl("/api/v2/users/user/settings"),
+          updateUrl: qwenUrl("/api/v2/users/user/settings/update"),
+        },
+      );
+    },
+    600_000,
+    60_000,
+    false,
+  );
+  const id8 = accountId.slice(0, 8);
+  try {
+    const b = shaping.baseline;
+    console.log(
+      `[Shaping] account=${id8} baseline status=${b.status} appFail=${b.appAuthFailure} created=${b.created} stoppedEarly=${shaping.stoppedEarly}`,
+    );
+    try {
+      const sh = shaping.baselineShape;
+      if (sh) {
+        console.log(
+          `[Shaping] account=${id8} shape top=[${sh.topKeys.join(",")}] dataType=${sh.dataType} ` +
+            `dataKeys=[${sh.dataKeys.join(",")}] nested=[${sh.nestedKeys.join(",")}] ` +
+            `arrays=[${sh.arrayLengths.join(",")}] success=${sh.successPresent}/${sh.successValue} ` +
+            `code=${sh.codePresent}/${sh.codeLen} chatIdPaths=[${sh.chatIdCandidates.join(",")}]`,
+        );
+      }
+    } catch {
+      // Diagnostics must never break the probe.
+    }
+    for (const h of shaping.headerTests) {
+      console.log(
+        `[Shaping] account=${id8} header name=${h.name} status=${h.status} appFail=${h.appAuthFailure}`,
+      );
+    }
+    if (shaping.causalHeader) {
+      console.log(`[Shaping] account=${id8} causalHeader=${shaping.causalHeader}`);
+    }
+    for (const g of shaping.groupTests) {
+      console.log(
+        `[Shaping] account=${id8} group=${g.group} status=${g.status} appFail=${g.appAuthFailure}`,
+      );
+    }
+    if (shaping.causalGroup) {
+      console.log(`[Shaping] account=${id8} causalGroup=${shaping.causalGroup}`);
+    }
+    console.log(
+      `[Shaping] account=${id8} settingsUpdate status=${shaping.settingsUpdate.status} appFail=${shaping.settingsUpdate.appAuthFailure} ` +
+        `postCreate status=${shaping.postCreate.status} appFail=${shaping.postCreate.appAuthFailure}`,
+    );
+  } catch {
+    // Diagnostics must never break the probe.
+  }
+  return shaping;
+}
+export interface BrowserAuthDiag {
+  /** Live localStorage token readable in-page. */
+  liveTokenPresent: boolean;
+  /** Outgoing bearer vs live token: true/false, or null when incomparable. */
+  authMatchesLive: boolean | null;
+  /** Which credential won: live token, cookies only, post-heal, or none. */
+  authSource: "live" | "cookie-only" | "healed" | "none";
+  /** True when this request matched a cookie-only chat route. */
+  cookieOnlyRoute: boolean;
+  /** Explicit Authorization actually sent on the effective request. */
+  explicitAuthPresent: boolean;
+  /** First response carried application-level Unauthorized (HTTP 200 body). */
+  firstAppAuthFailure: boolean;
+  refreshAttempted: boolean;
+  refreshStatus: number;
+  refreshUsable: boolean;
+  refreshUpdatedLs: boolean;
+  refreshUpdatedCookie: boolean;
+  refreshUpdatedAuth: boolean;
+  refreshErrorClass: string | null;
+  retried: boolean;
+  retryStatus: number;
+}
+
+/** Bearer token carried by request headers, if any. Value stays in memory. */
+export function extractBearerToken(
+  headers: Record<string, string>,
+): string | null {
+  const raw =
+    headers["authorization"] || headers["Authorization"] || "";
+  const m = raw.match(/^\s*Bearer\s+(\S+)\s*$/i);
+  return m ? m[1] : null;
+}
+
+/** Compare outgoing bearer with the live in-page token (equality only). */
+export function bearerMatchesLiveToken(
+  headerBearer: string | null,
+  liveToken: string | null,
+): boolean | null {
+  if (!headerBearer || !liveToken) return null;
+  if (headerBearer.length !== liveToken.length) return false;
+  let diff = 0;
+  for (let i = 0; i < headerBearer.length; i++) {
+    diff |= headerBearer.charCodeAt(i) ^ liveToken.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/**
+ * Chat routes that must use cookie/session-centric browser auth: NO explicit
+ * Authorization header (mirrors the reference client). Pure and unit-tested;
+ * the in-page transport mirrors this predicate inline (bundler __name
+ * constraints forbid importing it there) with a consistency test below.
+ */
+export function isCookieOnlyRoute(url: string): boolean {
+  return (
+    url.includes("/api/v2/chats/new") ||
+    url.includes("/api/v2/users/user/settings")
+  );
+}
+
+/** Return headers without any Authorization variant (new object). */
+export function stripExplicitAuth(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...headers };
+  delete out["authorization"];
+  delete out["Authorization"];
+  return out;
+}
+
+/** Structural usability of an auth-refresh payload (no values inspected). */
+export function isUsableRefreshPayload(json: unknown): boolean {
+  if (!json || typeof json !== "object") return false;
+  const j = json as { success?: unknown; data?: unknown };
+  if (j.success !== true) return false;
+  const d = j.data as
+    | { token?: unknown; access_token?: unknown }
+    | null
+    | undefined;
+  if (!d) return false;
+  return (
+    (typeof d.access_token === "string" && d.access_token.length > 0) ||
+    (typeof d.token === "string" && d.token.length > 0)
+  );
+}
+
+/**
+ * Application-level Unauthorized classification for a completed response.
+ * Mirrors the inline in-page predicate in requestQwenTextInBrowser (which
+ * cannot import helpers — bundler __name constraints). Pure and unit-tested;
+ * a source-consistency test pins the two copies together.
+ */
+export function isAppUnauthorized(status: number, bodyText: string): boolean {
+  if (status === 401) return true;
+  if (typeof bodyText !== "string" || bodyText.length === 0) return false;
+  try {
+    const parsed: {
+      success?: unknown;
+      code?: unknown;
+      message?: unknown;
+      data?: { code?: unknown; details?: unknown } | null;
+      details?: unknown;
+    } = JSON.parse(bodyText);
+    if (!parsed || parsed.success !== false) return false;
+    const code = String(parsed.data?.code ?? parsed.code ?? "");
+    const details = String(
+      parsed.data?.details ?? parsed.details ?? parsed.message ?? "",
+    );
+    return (
+      code === "Unauthorized" ||
+      /unauthorized/i.test(code) ||
+      /unauthorized/i.test(details) ||
+      /\b401\b/.test(details)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Sanitized exception class for refresh failures (no messages/values). */
+export function sanitizeRefreshErrorClass(err: unknown): string {
+  if (err instanceof TypeError) return "TypeError";
+  if (err instanceof DOMException) {
+    return `DOMException:${err.name || "unknown"}`;
+  }
+  if (err instanceof Error) return err.name || "Error";
+  return typeof err;
 }
 
 export async function requestQwenTextInBrowser(
@@ -977,22 +2096,220 @@ export async function requestQwenTextInBrowser(
         body?: string;
         referrer?: string;
         timeoutMs: number;
-      }): Promise<BrowserTextResponse> => {
+      }): Promise<BrowserTextResponse & { diag: BrowserAuthDiag }> => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        // Read-only observation of the live in-page token (never modifies
+        // the request, never leaves the page; only booleans are reported).
+        // NOTE: no helper consts/arrow functions in here — the bundler wraps
+        // those with __name(), which does not exist in the page context.
+        const diag: BrowserAuthDiag = {
+          liveTokenPresent: false,
+          authMatchesLive: null,
+          authSource: "none",
+          firstAppAuthFailure: false,
+          refreshAttempted: false,
+          refreshStatus: 0,
+          refreshUsable: false,
+          refreshUpdatedLs: false,
+          refreshUpdatedCookie: false,
+          refreshUpdatedAuth: false,
+          refreshErrorClass: null,
+          retried: false,
+          retryStatus: 0,
+          cookieOnlyRoute: false,
+          explicitAuthPresent: false,
+        };
         try {
-          const response = await fetch(url, {
+          let liveToken: string | null = null;
+          try {
+            const t = localStorage.getItem("token");
+            liveToken = typeof t === "string" && t.length > 0 ? t : null;
+          } catch {
+            liveToken = null;
+          }
+          diag.liveTokenPresent = liveToken !== null;
+          // Cookie-only routes (chat + chat personalization): reproduce the
+          // cookie/session-centric behavior of the reference client — NO
+          // explicit Authorization; credentials:include + live browser
+          // cookies govern. All other routes keep current behavior.
+          const cookieOnlyRoute =
+            url.includes("/api/v2/chats/new") ||
+            url.includes("/api/v2/users/user/settings");
+          diag.cookieOnlyRoute = cookieOnlyRoute;
+          const effHeaders: Record<string, string> = { ...headers };
+          const hadCachedAuth = Boolean(
+            effHeaders["authorization"] || effHeaders["Authorization"],
+          );
+          if (cookieOnlyRoute) {
+            delete effHeaders["authorization"];
+            delete effHeaders["Authorization"];
+            diag.authSource = hadCachedAuth ? "cookie-only" : "none";
+          } else if (liveToken) {
+            effHeaders["authorization"] = `Bearer ${liveToken}`;
+            effHeaders["Authorization"] = `Bearer ${liveToken}`;
+            diag.authSource = "live";
+          } else {
+            delete effHeaders["authorization"];
+            delete effHeaders["Authorization"];
+            diag.authSource = hadCachedAuth ? "cookie-only" : "none";
+          }
+          diag.explicitAuthPresent =
+            Boolean(effHeaders["authorization"]) ||
+            Boolean(effHeaders["Authorization"]);
+          const sentRaw =
+            effHeaders["authorization"] || effHeaders["Authorization"] || "";
+          const sentMatch = sentRaw.match(/^\s*Bearer\s+(\S+)\s*$/i);
+          const sentEff = sentMatch ? sentMatch[1] : null;
+          diag.authMatchesLive =
+            sentEff && liveToken ? sentEff === liveToken : null;
+          let response = await fetch(url, {
             method,
             credentials: "include",
-            headers,
+            headers: effHeaders,
             body,
             signal: controller.signal,
             ...(referrer ? { referrer } : {}),
           });
+          let bodyText = "";
+          try {
+            bodyText = await response.text();
+          } catch {
+            bodyText = "";
+          }
+
+          // Auth failure = HTTP 401 OR application-level Unauthorized
+          // (Qwen answers HTTP 200 + {success:false} on create-chat).
+          let appUnauthorized = false;
+          try {
+            const parsed: any = JSON.parse(bodyText);
+            if (parsed && parsed.success === false) {
+              const code = String(parsed.data?.code || parsed.code || "");
+              const details = String(
+                parsed.data?.details || parsed.details || parsed.message || "",
+              );
+              appUnauthorized =
+                code === "Unauthorized" ||
+                /unauthorized/i.test(code) ||
+                /unauthorized/i.test(details) ||
+                /\b401\b/.test(details);
+            }
+          } catch {
+            appUnauthorized = false;
+          }
+          diag.firstAppAuthFailure = appUnauthorized;
+
+          // Silent in-page token refresh + single retry on auth failure.
+          // Mirrors the official SPA: same endpoint/method/credentials PLUS
+          // the interceptor headers the web client always sends (Version,
+          // source, X-Request-Id, Timezone), and the SPA response contract
+          // (success + data.access_token, with data.expires_at).
+          if (response.status === 401 || appUnauthorized) {
+            diag.refreshAttempted = true;
+            try {
+              const refreshVersion =
+                headers["version"] && headers["version"].length > 0
+                  ? headers["version"]
+                  : "0.3.11";
+              let rid = "";
+              try {
+                rid =
+                  Math.random().toString(36).slice(2) +
+                  Math.random().toString(36).slice(2);
+              } catch {
+                rid = "manual-refresh";
+              }
+              const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+                method: "GET",
+                credentials: "include",
+                headers: {
+                  accept: "application/json, text/plain, */*",
+                  Version: refreshVersion,
+                  source: "web",
+                  "X-Request-Id": rid,
+                  Timezone: new Date().toString().split(" (")[0],
+                },
+                signal: AbortSignal.timeout(10000),
+              });
+              diag.refreshStatus = refreshRes.status;
+              if (refreshRes.status === 200) {
+                const refreshJson: any = await refreshRes.json().catch(() => null);
+                let freshTok: string | null = null;
+                try {
+                  const d = refreshJson && refreshJson.data;
+                  const cand =
+                    d && typeof d.access_token === "string" && d.access_token.length > 0
+                      ? d.access_token
+                      : d && typeof d.token === "string" && d.token.length > 0
+                        ? d.token
+                        : null;
+                  if (refreshJson && refreshJson.success === true && cand) {
+                    freshTok = cand;
+                  }
+                } catch {
+                  freshTok = null;
+                }
+                const usable = freshTok !== null;
+                diag.refreshUsable = usable;
+                if (usable) {
+                  const tok: string = freshTok as string;
+                  localStorage.setItem("token", tok);
+                  diag.refreshUpdatedLs = true;
+                  document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                  diag.refreshUpdatedCookie = true;
+                  if (!cookieOnlyRoute) {
+                    effHeaders["authorization"] = `Bearer ${freshTok}`;
+                    effHeaders["Authorization"] = `Bearer ${freshTok}`;
+                    diag.refreshUpdatedAuth = true;
+                    diag.authSource = "healed";
+                  }
+                  response = await fetch(url, {
+                    method,
+                    credentials: "include",
+                    headers: effHeaders,
+                    body,
+                    signal: controller.signal,
+                    ...(referrer ? { referrer } : {}),
+                  });
+                  diag.retried = true;
+                  diag.retryStatus = response.status;
+                  try {
+                    bodyText = await response.text();
+                  } catch {
+                    // Keep first body on retry read failure.
+                  }
+                  try {
+                    const t3 = localStorage.getItem("token");
+                    const live3 =
+                      typeof t3 === "string" && t3.length > 0 ? t3 : null;
+                    const sRaw3 =
+                      effHeaders["authorization"] ||
+                      effHeaders["Authorization"] ||
+                      "";
+                    const sMatch3 = sRaw3.match(/^\s*Bearer\s+(\S+)\s*$/i);
+                    const sent3 = sMatch3 ? sMatch3[1] : null;
+                    diag.authMatchesLive =
+                      sent3 && live3 ? sent3 === live3 : null;
+                  } catch {
+                    diag.authMatchesLive = null;
+                  }
+                }
+              }
+            } catch (err) {
+              diag.refreshErrorClass =
+                err instanceof TypeError
+                  ? "TypeError"
+                  : err instanceof Error
+                    ? err.name || "Error"
+                    : typeof err;
+            }
+          }
+
           return {
             status: response.status,
             contentType: response.headers.get("content-type") || "",
-            raw: await response.text(),
+            raw: bodyText,
+            diag,
           };
         } finally {
           clearTimeout(timeoutId);
@@ -1011,13 +2328,69 @@ export async function requestQwenTextInBrowser(
   // Settings and personalization requests run as same-origin in-browser fetch
   // with appropriate Referer, keeping the page on the stable chat UI without
   // expensive page.goto navigations that can time out under load.
-  const response = await withQwenBrowserPage<BrowserTextResponse>(
+  const response = await withQwenBrowserPage<
+    BrowserTextResponse & { diag?: BrowserAuthDiag }
+  >(
     accountId,
     evaluateRequest,
     undefined,
     options.timeoutMs,
     recoverOnTimeout,
   );
+
+  // Sanitized per-attempt auth diagnostics (booleans/codes only).
+  try {
+    const id8 = (accountId || "global").slice(0, 8);
+    const hasAuth =
+      Boolean(browserHeaders["authorization"]) ||
+      Boolean(browserHeaders["Authorization"]);
+    const d = response.diag;
+    console.log(
+      `[QwenAuth] account=${id8} path=${path} attempt=1 ` +
+        `authSource=${d ? d.authSource : "unknown"} hasAuth=${hasAuth} ` +
+        `explicitAuth=${d ? String(d.explicitAuthPresent) : "unknown"} ` +
+        `cookieOnly=${d ? String(d.cookieOnlyRoute) : "unknown"} ` +
+        `matchesLive=${d ? String(d.authMatchesLive) : "unknown"} ` +
+        `liveToken=${d ? String(d.liveTokenPresent) : "unknown"} ` +
+        `status=${response.status}` +
+        (d?.firstAppAuthFailure ? " appUnauthorized=true" : ""),
+    );
+    if (d?.refreshAttempted) {
+      console.log(
+        `[QwenAuth] account=${id8} path=${path} refresh attempted ` +
+          `status=${d.refreshStatus} usable=${d.refreshUsable} ` +
+          `updatedLs=${d.refreshUpdatedLs} updatedCookie=${d.refreshUpdatedCookie} ` +
+          `updatedAuth=${d.refreshUpdatedAuth} ` +
+          `retryStatus=${d.retried ? d.retryStatus : "none"}` +
+          (d.refreshErrorClass ? ` errClass=${d.refreshErrorClass}` : ""),
+      );
+      try {
+        const { traceSessionEvent, traceLsCheckpoint } = await import(
+          "./session-tracer.ts"
+        );
+        traceSessionEvent(accountId, "REFRESH_START", `path=${path}`);
+        void traceLsCheckpoint(accountId, "refresh-start").catch(() => {});
+        traceSessionEvent(
+          accountId,
+          "REFRESH_END",
+          `status=${d.refreshStatus} usable=${d.refreshUsable} retry=${d.retried ? d.retryStatus : "none"}`,
+        );
+        // The in-page refresh wrote localStorage.token + the cookie; sample the
+        // result from Node so the change is attributable to REFRESH.
+        if (d.refreshUpdatedLs || d.refreshUpdatedCookie) {
+          void traceLsCheckpoint(accountId, "refresh-end-ls-written").catch(
+            () => {},
+          );
+        } else {
+          void traceLsCheckpoint(accountId, "refresh-end").catch(() => {});
+        }
+      } catch {
+        // Tracing must never break requests.
+      }
+    }
+  } catch {
+    // Diagnostics must never break requests.
+  }
 
   return new Response(response.raw, {
     status: response.status,
@@ -1073,12 +2446,12 @@ export async function requestQwenSettingsDirectFetch(
     // passes the WAF.
     let json: any = null;
     let okShape = false;
-    if (contentType.includes("html")) {
+    if (contentType.includes("html") || !response.ok) {
       okShape = false;
     } else {
       try {
         json = JSON.parse(raw);
-        okShape = json && typeof json === "object" && "success" in json;
+        okShape = json && typeof json === "object" && json.success === true;
       } catch {
         okShape = false;
       }
@@ -1132,20 +2505,7 @@ async function requestQwenPersonalizationInBrowser(
   headers: Record<string, string>,
   payload?: Record<string, unknown>,
 ): Promise<{ status: number; raw: string; json: any }> {
-  // If browser-only fetch is disabled, try direct Node fetch as fast-path
-  if (!config.qwen.browserOnlyFetch && !isAuthMockEnabled()) {
-    const direct = await requestQwenSettingsDirectFetch(
-      accountId,
-      method,
-      path,
-      headers,
-      payload,
-    );
-    if (direct) {
-      return direct;
-    }
-  }
-
+  // Always route personalization through stealth browser page (user constraint: tudo via browser stealth)
   const response = await requestQwenTextInBrowser(
     accountId,
     method,
@@ -1159,6 +2519,176 @@ async function requestQwenPersonalizationInBrowser(
   );
   const { raw, json } = await readJsonTextResponse(response);
   return { status: response.status, raw, json };
+}
+
+/**
+ * DIAGNOSTIC ONLY — A/B of POST /api/v2/users/user/settings/update.
+ *
+ * variant "proxy": byte-for-byte the request syncQwenRequestPersonalization
+ *   builds today (captured anti-bot headers via buildCapturedQwenHeaders,
+ *   `version` stripped, cookie-only routing, same payload builder).
+ * variant "spa":  what the live SPA issues — the page's own patched `fetch`
+ *   adds the anti-bot header set itself, so the app code only sets
+ *   Content-Type/Accept and lets the page supply the rest.
+ *
+ * Same page, same context, same session, no re-login, no refresh, no context
+ * recreation. Sanitized output only: header NAMES/presence, body keys and a
+ * body hash. Never header or body values.
+ */
+export type SettingsUpdateVariant =
+  | "proxy"
+  | "spa"
+  | "proxy-minus-bx"
+  | "proxy-minus-secch"
+  | "proxy-minus-source"
+  | "proxy-plus-origins"
+  | "spa-plus-version"
+  | "proxy-no-body-keys";
+
+export async function probeSettingsUpdateAB(
+  accountId: string,
+  variant: SettingsUpdateVariant = "proxy",
+  instruction = "",
+): Promise<{
+  variant: string;
+  status: number;
+  appSuccess: boolean | null;
+  appUnauthorized: boolean;
+  topKeys: string[];
+  errorCode: string | null;
+  request: {
+    url: string;
+    method: string;
+    bodyKeys: string[];
+    bodyHash: string;
+    contentType: string | null;
+    source: string | null;
+    timezonePresent: boolean;
+    xRequestIdPresent: boolean;
+    xRequestOrigin: string | null;
+    versionPresent: boolean;
+    authorizationPresent: boolean;
+    secChUaPresent: boolean;
+    secChUaMobilePresent: boolean;
+    secChUaPlatformPresent: boolean;
+    bxVPresent: boolean;
+    bxUaPresent: boolean;
+    bxUmidtokenPresent: boolean;
+    acceptPresent: boolean;
+    cookieMode: string;
+    referrer: string | null;
+  };
+}> {
+  const { headers } = await getQwenHeaders(false, accountId);
+  // Live settings, fetched with the proxy's own GET (also the login-valid probe).
+  const getRes = await requestQwenPersonalizationInBrowser(
+    accountId,
+    "GET",
+    "/api/v2/users/user/settings",
+    buildCapturedQwenHeaders(headers, { referer: qwenUrl("/settings/personalization") }),
+  );
+  const currentSettings = getRes.json?.data ?? null;
+  const payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
+  const payloadJson = JSON.stringify(payload);
+  const referer = qwenUrl("/settings/personalization");
+
+  // The proxy's request headers, then the per-variant mutation.
+  let requestHeaders: Record<string, string> =
+    buildPersonalizationRequestHeaders(headers, referer);
+  let dropBodyKeys = false;
+  switch (variant) {
+    case "proxy":
+      break;
+    case "spa":
+      // The SPA app code only declares the content type; the page's patched
+      // fetch injects accept/source/bx-*/sec-ch-*/version itself.
+      requestHeaders = { "Content-Type": "application/json" };
+      break;
+    case "spa-plus-version":
+      requestHeaders = { "Content-Type": "application/json", version: headers["version"] || "" };
+      break;
+    case "proxy-minus-bx":
+      delete requestHeaders["bx-ua"];
+      delete requestHeaders["bx-umidtoken"];
+      delete requestHeaders["bx-v"];
+      break;
+    case "proxy-minus-secch":
+      delete requestHeaders["sec-ch-ua"];
+      delete requestHeaders["sec-ch-ua-mobile"];
+      delete requestHeaders["sec-ch-ua-platform"];
+      break;
+    case "proxy-minus-source":
+      delete requestHeaders["source"];
+      break;
+    case "proxy-plus-origins":
+      requestHeaders["x-request-origin"] = "web";
+      requestHeaders["x-request-id"] = crypto.randomUUID();
+      requestHeaders["timezone"] = "UTC";
+      break;
+    case "proxy-no-body-keys":
+      dropBodyKeys = true;
+      break;
+  }
+
+  const bodyJson = dropBodyKeys ? JSON.stringify({}) : payloadJson;
+  const res = await requestQwenTextInBrowser(
+    accountId,
+    "POST",
+    "/api/v2/users/user/settings/update",
+    requestHeaders,
+    bodyJson,
+    { settingsPage: true, referrer: referer },
+  );
+  const raw = await res.text();
+  let json: any = null;
+  try {
+    json = raw ? JSON.parse(raw) : null;
+  } catch {
+    json = null;
+  }
+  const eff = getBrowserFetchHeaders(requestHeaders);
+  const appSuccess =
+    json && typeof json === "object" ? json.success === true : null;
+  const code = json?.data?.code ?? json?.code ?? null;
+  return {
+    variant,
+    status: res.status,
+    appSuccess,
+    appUnauthorized: isAppUnauthorized(res.status, raw),
+    topKeys: json && typeof json === "object" ? Object.keys(json).slice(0, 10) : [],
+    errorCode: code === null ? null : String(code),
+    request: {
+      url: qwenUrl("/api/v2/users/user/settings/update"),
+      method: "POST",
+      bodyKeys: Object.keys(dropBodyKeys ? {} : payload),
+      bodyHash: traceBodyHash(bodyJson),
+      contentType: eff["content-type"] ?? eff["Content-Type"] ?? null,
+      source: eff["source"] ?? null,
+      timezonePresent: Boolean(eff["timezone"]),
+      xRequestIdPresent: Boolean(eff["x-request-id"]),
+      xRequestOrigin: eff["x-request-origin"] ?? null,
+      versionPresent: Boolean(eff["version"] ?? eff["Version"]),
+      authorizationPresent: Boolean(eff["authorization"] ?? eff["Authorization"]),
+      secChUaPresent: Boolean(eff["sec-ch-ua"]),
+      secChUaMobilePresent: Boolean(eff["sec-ch-ua-mobile"]),
+      secChUaPlatformPresent: Boolean(eff["sec-ch-ua-platform"]),
+      bxVPresent: Boolean(eff["bx-v"]),
+      bxUaPresent: Boolean(eff["bx-ua"]),
+      bxUmidtokenPresent: Boolean(eff["bx-umidtoken"]),
+      acceptPresent: Boolean(eff["accept"]),
+      cookieMode: "include",
+      referrer: referer,
+    },
+  };
+}
+
+/** Stable short hash of a JSON body (values never logged). */
+function traceBodyHash(v: string): string {
+  try {
+    return crypto.createHash("sha256").update(v, "utf8").digest("hex").slice(0, 12);
+  } catch {
+    return "hash-error";
+  }
 }
 
 async function cancelQwenBrowserStream(
@@ -1558,6 +3088,40 @@ async function createQwenBrowserResponse(
   }
 }
 
+/**
+ * Personalization / settings request headers.
+ *
+ * Bisect-proven on an identical session: the cached `version` header turns
+ * settings/personalization into appUnauthorized, so it is stripped here and
+ * ONLY here. Chat requests keep their own path (qwen-chat-pool.ts) untouched.
+ */
+export function buildPersonalizationRequestHeaders(
+  headers: Record<string, string>,
+  referer: string,
+): Record<string, string> {
+  const requestHeaders = buildCapturedQwenHeaders(headers, { referer });
+  delete requestHeaders["version"];
+  delete requestHeaders["Version"];
+  return requestHeaders;
+}
+
+/**
+ * In-flight personalization syncs, keyed by account + instruction identity.
+ * Concurrent requests for the same account+instructions share ONE underlying
+ * sync (one browser navigation) instead of each navigating on its own.
+ * Port of upstream 71770f7 (dedup block only).
+ */
+const inFlightPersonalizationSyncs = new Map<string, Promise<boolean>>();
+
+export function getInFlightPersonalizationCount(): number {
+  return inFlightPersonalizationSyncs.size;
+}
+
+/** @internal test seam: drop all in-flight entries (test isolation). */
+export function _resetInFlightPersonalizationSyncsForTests(): void {
+  inFlightPersonalizationSyncs.clear();
+}
+
 export async function syncQwenRequestPersonalization(
   instruction: string,
   accountId?: string,
@@ -1570,15 +3134,67 @@ export async function syncQwenRequestPersonalization(
     forceSync?: boolean;
   } = {},
 ): Promise<boolean> {
-  if (isAuthMockEnabled()) {
-    // Test hook: force the sync to report "not applied" so the fail-fast
-    // contract (personalization-required suite) is exercisable in mock mode.
-    if (process.env.TEST_PERSONALIZATION_SYNC_FAIL === "true") return false;
-    return true;
-  }
-  // instruction pode ser vazia para limpar personalization
-
   const cacheKey = accountId || "global";
+  const sent = textSize(instruction);
+  const syncHash = sent.hash ? `${sent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
+  const inFlightKey = `${cacheKey}:${syncHash || "empty"}`;
+
+  const existingInFlight = inFlightPersonalizationSyncs.get(inFlightKey);
+  if (existingInFlight) {
+    logger.debug("[Qwen] Personalization sync already in flight, sharing promise", {
+      accountId: cacheKey,
+    });
+    return existingInFlight;
+  }
+
+  let syncPromise!: Promise<boolean>;
+  syncPromise = (async () => {
+    await Promise.resolve();
+    try {
+      if (isAuthMockEnabled()) {
+        const delay = parseInt(process.env.TEST_PERSONALIZATION_DELAY_MS || "0", 10);
+        if (delay > 0) {
+          await sleep(delay);
+        }
+        // Test hook: force the sync to report "not applied" so the fail-fast
+        // contract (personalization-required suite) is exercisable in mock mode.
+        if (process.env.TEST_PERSONALIZATION_SYNC_FAIL === "true") return false;
+        return true;
+      }
+      return await syncQwenRequestPersonalizationInternal(
+        instruction,
+        accountId,
+        metadata,
+        cacheKey,
+        sent,
+        syncHash,
+      );
+    } finally {
+      if (inFlightPersonalizationSyncs.get(inFlightKey) === syncPromise) {
+        inFlightPersonalizationSyncs.delete(inFlightKey);
+      }
+    }
+  })();
+
+  inFlightPersonalizationSyncs.set(inFlightKey, syncPromise);
+  return syncPromise;
+}
+
+async function syncQwenRequestPersonalizationInternal(
+  instruction: string,
+  accountId: string | undefined,
+  metadata: {
+    model?: string;
+    toolsCount?: number;
+    sessionId?: string | null;
+    promptChars?: number;
+    forceSync?: boolean;
+  },
+  cacheKey: string,
+  sent: ReturnType<typeof textSize>,
+  syncHash: string | null,
+): Promise<boolean> {
+  // instruction pode ser vazia para limpar personalization
 
   // Proactive token renewal: refresh BEFORE attempting personalization
   // to avoid 401 errors that waste time on retry
@@ -1596,14 +3212,13 @@ export async function syncQwenRequestPersonalization(
   }
 
   const { headers } = await getQwenHeaders(forceRefresh, accountId);
-  let requestHeaders = buildCapturedQwenHeaders(headers, {
-    referer: qwenUrl("/settings/personalization"),
-  });
+  let requestHeaders = buildPersonalizationRequestHeaders(
+    headers,
+    qwenUrl("/settings/personalization"),
+  );
   let currentSettings: any = null;
   let payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
 
-  const sent = textSize(instruction);
-  const syncHash = sent.hash ? `${sent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
   const bypassCache = metadata.forceSync === true;
 
   // 1. Check memory cache (skipped on forceSync)
@@ -1663,6 +3278,7 @@ export async function syncQwenRequestPersonalization(
         existingJson?.data?.ui?.largeTextAsFile === false &&
         existingJson?.data?.ui?.splitLargeChunks === false &&
         existingJson?.data?.ui?.autoTags === false &&
+        existingJson?.data?.ui?.title?.auto === false &&
         existingJson?.data?.mcp_remind === false &&
         existingJson?.data?.memory?.enable_memory === false &&
         existingJson?.data?.memory?.enable_history_memory === false &&
@@ -1756,13 +3372,29 @@ export async function syncQwenRequestPersonalization(
 
   if (isUnauthorized) {
     console.warn(
-      `[Qwen] Personalization 401 — refreshing session and retrying | account=${cacheKey}`,
+      `[Qwen] Personalization 401 — refreshing session with re-auth and retrying | account=${cacheKey}`,
     );
+    // First-failure capture BEFORE any recovery: snapshot the live state so
+    // the transition (valid -> Unauthorized) is classifiable afterwards.
     try {
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
-      requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
-        referer: qwenUrl("/settings/personalization"),
-      });
+      const {
+        snapshotForAccount,
+        markFirstFailure,
+        traceSessionEvent,
+      } = await import("./session-tracer.ts");
+      const snap = await snapshotForAccount(accountId || "").catch(() => null);
+      traceSessionEvent(accountId, "SETTINGS_UPDATE_STATUS", "http=401-or-appFail", snap);
+      markFirstFailure(accountId, "SETTINGS_UPDATE_STATUS", snap);
+    } catch {
+      // Tracing must never break flows.
+    }
+    try {
+      currentSettings = null;
+      const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
+      requestHeaders = buildPersonalizationRequestHeaders(
+        freshHeaders,
+        qwenUrl("/settings/personalization"),
+      );
       ({ raw, json } = await attemptPost(requestHeaders));
     } catch (retryErr) {
       // Layer 3: Retry failed → non-fatal, continue without personalization
@@ -1778,6 +3410,12 @@ export async function syncQwenRequestPersonalization(
     console.warn(
       `[Qwen] Personalization sync failed (non-fatal) | account=${cacheKey} | response=${raw.slice(0, 200)}`,
     );
+    try {
+      const { noteUpstreamAuthResult } = await import("./session-tracer.ts");
+      noteUpstreamAuthResult(accountId, "settings-update", 200, true);
+    } catch {
+      // Tracing must never break flows.
+    }
     return false;
   }
 
@@ -1843,6 +3481,13 @@ export async function syncQwenRequestPersonalization(
     matchReturned,
     matchStored,
   });
+  try {
+    const { noteUpstreamAuthResult, snapshotForAccount } = await import("./session-tracer.ts");
+    const snap = await snapshotForAccount(accountId || "").catch(() => null);
+    noteUpstreamAuthResult(accountId, "settings-update", 200, false, snap);
+  } catch {
+    // Tracing must never break flows.
+  }
   return true;
 }
 
@@ -2067,53 +3712,104 @@ function formatPublicQwenModel(model: Record<string, unknown>): PublicQwenModel 
 }
 
 export async function deleteAllQwenChats(accountId?: string): Promise<boolean> {
-  let requestHeaders: Record<string, string>;
   if (isAuthMockEnabled()) {
     const { headers } = await getQwenHeaders(false, accountId);
-    requestHeaders = buildCapturedQwenHeaders(headers, {
+    const requestHeaders = buildCapturedQwenHeaders(headers, {
       referer: qwenUrl("/settings/chats"),
     });
-  } else {
-    // In live mode, requestQwenTextInBrowser executes inside the authenticated
-    // browser page where session cookies are attached automatically.
-    // Bypassing getQwenHeaders avoids triggering captureQwenHeaders (which sends
-    // a dummy chat completion to intercept anti-fraud tokens not needed for deletions).
-    requestHeaders = {
-      source: "web",
-      version: "0.2.89",
-      timezone: new Date().toString().split(" (")[0],
-      "x-request-id": crypto.randomUUID(),
-      Referer: qwenUrl("/settings/chats"),
-    };
-  }
 
-  const response = await requestQwenTextInBrowser(
-    accountId,
-    "DELETE",
-    "/api/v2/chats/",
-    requestHeaders,
-    undefined,
-    { referrer: qwenUrl("/settings/chats") },
-  );
-
-  const { raw, json: parsed } = await readJsonTextResponse(response, {
-    strict: true,
-  });
-  if (!response.ok) {
-    throw new Error(
-      `Failed to delete chats from Qwen: ${response.status} ${raw.substring(0, 200)}`,
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "DELETE",
+      "/api/v2/chats/",
+      requestHeaders,
+      undefined,
+      { referrer: qwenUrl("/settings/chats") },
     );
+
+    const { raw, json: parsed } = await readJsonTextResponse(response, {
+      strict: true,
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to delete chats from Qwen: ${response.status} ${raw.substring(0, 200)}`,
+      );
+    }
+
+    const success = parsed?.success === true && parsed?.data?.status === true;
+    if (!success) {
+      throw new Error(
+        `Qwen delete chats returned unexpected payload: ${raw.substring(0, 200)}`,
+      );
+    }
+
+    clearAllSessionsForAccount(accountId || "global");
+    return true;
   }
 
-  const success = parsed?.success === true && parsed?.data?.status === true;
-  if (!success) {
-    throw new Error(
-      `Qwen delete chats returned unexpected payload: ${raw.substring(0, 200)}`,
+  // Live mode: fetch remote chats and delete them by ID in parallel batches
+  // (Alibaba WAF rejects bare DELETE /api/v2/chats/ with 401; deleting by ID succeeds 100%).
+  try {
+    const { withAccountPage } = await import("./playwright.ts");
+    const result = await withAccountPage(
+      accountId || "global",
+      async (page) => {
+        return page.evaluate(async () => {
+          let totalDeleted = 0;
+          let pageNum = 1;
+          while (true) {
+            const listRes = await fetch(`/api/v2/chats/?page=${pageNum}&exclude_project=true`, {
+              credentials: "include",
+              headers: { accept: "application/json, text/plain, */*" },
+            });
+            const listJson = await listRes.json().catch(() => null);
+            const items = listJson?.data || [];
+            if (!Array.isArray(items) || items.length === 0) break;
+
+            for (let i = 0; i < items.length; i += 5) {
+              const batch = items.slice(i, i + 5);
+              await Promise.all(
+                batch.map(async (chat: any) => {
+                  try {
+                    await fetch(`/api/v2/chats/${chat.id}`, {
+                      method: "DELETE",
+                      credentials: "include",
+                      headers: { accept: "application/json, text/plain, */*" },
+                    });
+                    totalDeleted++;
+                  } catch {}
+                }),
+              );
+            }
+
+            if (items.length < 20) break;
+          }
+          return { success: true, count: totalDeleted };
+        });
+      },
+      60_000,
+      30_000,
+      true,
     );
-  }
 
-  clearAllSessionsForAccount(accountId || "global");
-  return true;
+    clearAllSessionsForAccount(accountId || "global");
+    return result?.success === true;
+  } catch (err: any) {
+    try {
+      const chats = await fetchRemoteQwenChats(accountId);
+      if (chats.length === 0) {
+        clearAllSessionsForAccount(accountId || "global");
+        return true;
+      }
+      for (const chat of chats) {
+        await deleteSingleQwenChat(accountId, chat.id).catch(() => false);
+      }
+      clearAllSessionsForAccount(accountId || "global");
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 export interface RemoteQwenChat {
@@ -2589,6 +4285,7 @@ async function readResponsePreview(
 export function buildCompletionHeaders(
   headers: Record<string, string>,
   chatSessionId: string | null | undefined,
+  accountId?: string,
 ): Record<string, string> {
   const base = buildCapturedQwenHeaders(headers, {
     chatSessionId: chatSessionId || null,
@@ -2598,7 +4295,49 @@ export function buildCompletionHeaders(
   });
   if (headers["bx-ua"]) base["bx-ua"] = headers["bx-ua"];
   if (headers["bx-umidtoken"]) base["bx-umidtoken"] = headers["bx-umidtoken"];
+  alignLegacyCompletionAuth(base, accountId);
   return base;
+}
+
+/**
+ * Align a legacy completion with the proven modern session (Fix C).
+ *
+ * A reused thread forces the legacy transport, which would otherwise replay
+ * the continuation with cached browser material: a `version` restored from
+ * `qwen_auth_sessions` (rows carry 0.3.11/0.3.12, and completions sent with
+ * those answer 401 while the configured 0.2.91 answers 200) and an
+ * `Authorization` synthesized from a possibly stale `token` cookie. The
+ * DirectTransport proves the working pair every round: persisted Bearer +
+ * configured bundle version. Apply exactly that pair here:
+ *
+ * - `version` is always the configured chat-completions version;
+ * - when a usable persisted Bearer exists, both `Authorization` and the
+ *   jar's `token` pair carry it (pair coherence: a mismatched Bearer/cookie
+ *   pair is rejected even when each is individually valid);
+ * - otherwise the previously built headers stand unchanged (legacy fallback).
+ *
+ * Completions only. Non-chat endpoints (chats/new, settings) use their own
+ * builders and are untouched. No DB writes, no refresh, no restore.
+ */
+function alignLegacyCompletionAuth(
+  base: Record<string, string>,
+  accountId?: string,
+): void {
+  base["version"] = config.qwen.webVersion;
+  if (!accountId) return;
+  let bearer = "";
+  try {
+    bearer = getPersistedBearerToken(accountId)?.token ?? "";
+  } catch {
+    return;
+  }
+  if (!bearer) return;
+  base["Authorization"] = `Bearer ${bearer}`;
+  const cookie = base["Cookie"] ?? base["cookie"] ?? "";
+  if (cookie) {
+    base["Cookie"] = setCookiePairInJar(cookie, "token", bearer);
+    delete base["cookie"];
+  }
 }
 
 export interface PostCaptchaResetDeps {
@@ -3090,7 +4829,7 @@ async function createQwenStreamInternal(
         // The 0.2.86 HAR shows the real client POSTs completions with
         // bx-ua/bx-umidtoken + x-accel-buffering, so the relay matches it
         // instead of relying on sendBxUa.
-        buildCompletionHeaders(requestHeaders, chatSessionId),
+        buildCompletionHeaders(requestHeaders, chatSessionId, accountId),
         payloadJson,
         controller.signal,
         qwenUrl(

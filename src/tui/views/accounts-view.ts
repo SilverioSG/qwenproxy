@@ -2,6 +2,7 @@
  * QwenProxy TUI - Accounts & Cooldowns Management View (Tab 5)
  */
 
+import crypto from "crypto";
 import type { TuiView, ProxyStatusSnapshot } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
 import { theme, glyphs, drawBox, pad, truncate, getClipboardText } from "../theme.ts";
@@ -56,6 +57,7 @@ export class AccountsView implements TuiView {
   private statusMessageTimer: NodeJS.Timeout | null = null;
   private isAddModalOpen = false;
   private isBatchModalOpen = false;
+  private isValidatingAccount = false;
   private addEmailInput = "";
   private addPasswordInput = "";
   private addEmailCursor = 0;
@@ -147,6 +149,7 @@ export class AccountsView implements TuiView {
   }
 
   private async saveModalAccount(): Promise<void> {
+    if (this.isValidatingAccount) return;
     const email = this.addEmailInput.trim();
     const password = this.addPasswordInput.trim();
     if (!email || !password) {
@@ -154,17 +157,54 @@ export class AccountsView implements TuiView {
       return;
     }
 
+    if (process.env.NODE_TEST_CONTEXT) {
+      try {
+        const newAcc = addAccount(email, password);
+        this.isAddModalOpen = false;
+        this.addEmailInput = "";
+        this.addPasswordInput = "";
+        this.addEmailCursor = 0;
+        this.addPasswordCursor = 0;
+        await this.refresh();
+        this.setStatusMessage(theme.green(`✓ Conta ${email} salva! Conectando...`));
+      } catch (err: any) {
+        this.setStatusMessage(theme.red(`✗ Erro ao salvar: ${err?.message || String(err)}`));
+      }
+      return;
+    }
+
+    this.isValidatingAccount = true;
+    this.setStatusMessage(theme.yellow(`[...] Validando credenciais para ${email}...`));
+
+    const tempId = crypto.randomUUID();
     try {
-      const newAcc = addAccount(email, password);
+      const { validateAccountLogin } = await import("../../services/playwright.ts");
+      const { wipeAccountSessionFiles } = await import("../../core/accounts.ts");
+      const { clearAccountCooldown } = await import("../../core/account-manager.ts");
+
+      const ok = await validateAccountLogin(
+        { id: tempId, email, password },
+        config.playwright.headless,
+        config.playwright.browser,
+      );
+
+      if (!ok) {
+        wipeAccountSessionFiles(tempId);
+        clearAccountCooldown(tempId);
+        this.setStatusMessage(theme.red(`✗ Falha no login: credenciais inválidas ou bloqueio no Qwen`));
+        return;
+      }
+
+      const newAcc = addAccount(email, password, tempId);
       this.isAddModalOpen = false;
       this.addEmailInput = "";
       this.addPasswordInput = "";
       this.addEmailCursor = 0;
       this.addPasswordCursor = 0;
       await this.refresh();
-      this.setStatusMessage(theme.green(`✓ Conta ${email} salva! Conectando...`));
+      this.setStatusMessage(theme.green(`✓ Conta ${email} validada e salva! Conectando...`));
 
-      if (process.stdout.isTTY && !process.env.NODE_TEST_CONTEXT) {
+      if (process.stdout.isTTY) {
         const sManager = ServerManager.getInstance();
         const sState = sManager.getState();
         if (sState !== "online" && sState !== "warming") {
@@ -189,7 +229,13 @@ export class AccountsView implements TuiView {
         }
       }
     } catch (err: any) {
-      this.setStatusMessage(theme.red(`✗ Erro ao salvar: ${err?.message || String(err)}`));
+      const { wipeAccountSessionFiles } = await import("../../core/accounts.ts");
+      const { clearAccountCooldown } = await import("../../core/account-manager.ts");
+      wipeAccountSessionFiles(tempId);
+      clearAccountCooldown(tempId);
+      this.setStatusMessage(theme.red(`✗ Erro ao validar: ${err?.message || String(err)}`));
+    } finally {
+      this.isValidatingAccount = false;
     }
   }
   private async saveBatchAccounts(): Promise<void> {
@@ -445,6 +491,7 @@ export class AccountsView implements TuiView {
 
     // 1. Add Account Modal Active
     if (this.isAddModalOpen) {
+      if (this.isValidatingAccount) return true;
       if (key.name === "escape") {
         this.isAddModalOpen = false;
         this.addEmailInput = "";
@@ -1161,8 +1208,9 @@ export class AccountsView implements TuiView {
           ? (passHover ? theme.bgHover(` ${maskedPass} `) : theme.cyan(` ${maskedPass} `))
           : (passHover ? theme.bgHover(" (digite a senha) ") : theme.muted(" (digite a senha) "));
       }
-      const saveBtn =
-        this.modalHoveredField === "save"
+      const saveBtn = this.isValidatingAccount
+        ? theme.yellow(" [ Validando... ] ")
+        : this.modalHoveredField === "save"
           ? theme.bgHover(theme.green(" [ Enter ] Salvar "))
           : theme.green("[ Enter ] Salvar");
 

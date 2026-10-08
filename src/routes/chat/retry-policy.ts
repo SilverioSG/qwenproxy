@@ -7,6 +7,7 @@
 
 import { config } from "../../core/config.ts";
 import { computeQuotaCooldownMs } from "../../core/account-manager.ts";
+import { isSharedWafCircuitError } from "../../core/waf-circuit.ts";
 import { logger } from "../../core/logger.ts";
 import {
   PersonalizationSyncError,
@@ -18,6 +19,7 @@ import {
 import {
   AuthError,
   ClientAbortedError,
+  isKnownClientAbortMessage,
   NotFoundError,
   ValidationError,
 } from "../../core/errors.ts";
@@ -148,7 +150,10 @@ export function isClientAbortError(
   // retrying the old one resends full context on another account for nothing
   // (and can queue indefinitely behind the new stream's lease).
   if (err instanceof ClientAbortedError) return true;
-  if (err instanceof Error && err.message.includes("client aborted")) return true;
+  // Exact abort markers (pre-lease "Aborted before acquiring account lease",
+  // queued-wait abort, mid-stream disconnect) plus the legacy "client aborted"
+  // substring. Real lease/busy failures never match (see errors.ts).
+  if (err instanceof Error && isKnownClientAbortMessage(err.message)) return true;
   // Bare AbortError mid-stream is usually idle/upstream timeout (retryable).
   return false;
 }
@@ -242,6 +247,8 @@ export function isQuotaLikeError(err: unknown): boolean {
   return (
     code === "quota_limit" ||
     code === "ratelimited" ||
+    code === "membership_limit" ||
+    code === "membershiplimit" ||
     message.includes("quota_limit") ||
     message.includes("quota exceeded") ||
     message.includes("allocated quota") ||
@@ -253,11 +260,16 @@ export function isQuotaLikeError(err: unknown): boolean {
     message.includes("rate increased too quickly") ||
     message.includes("upper limit for today's usage") ||
     message.includes("you've reached the upper limit") ||
+    message.includes("membership_limit") ||
+    message.includes("membership limit") ||
+    message.includes("update_member") ||
+    message.includes("update member") ||
     // Accept local rate_limit code only when message also looks like quota/rate
     (code === "rate_limit_exceeded" &&
       (message.includes("quota") ||
         message.includes("rate") ||
         message.includes("limit") ||
+        message.includes("membership") ||
         message.includes("demanda") ||
         message.includes("demand")))
   );
@@ -283,6 +295,44 @@ export function isAntiBotError(err: unknown): boolean {
     message.includes("verify you are human") ||
     message.includes("human verification") ||
     message.includes("denyfromx5")
+  );
+}
+
+/**
+ * A direct-transport request that ran its SINGLE WAF recovery leg and still
+ * could not obtain a usable clearance (`x5sec`).
+ *
+ * This is deliberately NOT the same as `isAntiBotError`: that one matches every
+ * WAF signal, including a challenge the transport never tried to clear, and its
+ * branch intentionally does not retry. Here the transport already spent its one
+ * recovery attempt, so the only remaining lever is the existing policy's own
+ * retry / account rotation.
+ *
+ * Only the transport's own typed error qualifies. An upstream auth failure, a
+ * malformed response or a config error must never be routed here, which is why
+ * this checks the concrete error class plus the exact reason string instead of
+ * pattern-matching prose.
+ */
+export function isDirectClearanceExhausted(err: unknown): boolean {
+  const e = err as {
+    name?: unknown;
+    message?: unknown;
+    blockReason?: unknown;
+  };
+  if (e?.name !== "DirectTransportWafBlocked") return false;
+  if (e.blockReason !== "clearance-timeout") return false;
+  return String(e.message ?? "") === "direct-transport-waf-clearance-timeout";
+}
+
+/**
+ * The transport never got the chance to run its recovery leg (no account
+ * context, or recovery disabled by the caller). Rotating accounts would only
+ * mask the misconfiguration, so this is deliberately terminal.
+ */
+export function isDirectWafRecoveryUnavailable(err: unknown): boolean {
+  const e = err as { name?: unknown; blockReason?: unknown };
+  return (
+    e?.name === "DirectTransportWafBlocked" && e.blockReason === "no-recovery"
   );
 }
 
@@ -472,11 +522,15 @@ export function classifyRetryAction(
   // Agent instructions ride ONLY the account-level personalization. An
   // unconfirmed sync means this account cannot serve the request as-is —
   // rotate to another account (each attempt re-syncs on its own account).
+  // Park the failing account with PersonalizationFailed cooldown so it does
+  // not enter an infinite ping-pong loop when multiple accounts fail.
   if (err instanceof PersonalizationSyncError) {
     return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryAfterMs: baseDelayMs,
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "PersonalizationFailed",
     });
   }
 
@@ -553,6 +607,57 @@ export function classifyRetryAction(
     // same doomed request and cooldown-marking accounts for ~5 hours.
     if (isModelNotFoundError(err)) {
       return makeRetryAction("model_not_found", { retryable: false });
+    }
+
+    // The direct transport already spent its single recovery leg and still had
+    // no clearance. That is a transient, account-scoped condition: retry once
+    // on the same account, and let the existing account cooldown/backoff apply.
+    // Deliberately BEFORE isAntiBotError so this precise case is not absorbed
+    // by the generic (non-retrying) WAF branch below.
+    if (isDirectClearanceExhausted(err)) {
+      return makeRetryAction("direct_waf_clearance_timeout", {
+        retryable: true,
+        // Same account first: a fresh clearance attempt on the same session is
+        // the cheapest recovery. Account rotation remains available to the
+        // caller if the retry also fails.
+        switchAccount: false,
+        forceNewChat: true,
+        retryAfterMs: baseDelayMs,
+      });
+    }
+
+    // The transport had no way to attempt recovery at all (no account, or
+    // recovery disabled). That is a configuration/ownership condition, not a
+    // transient one: rotating accounts would hide it. Fail fast.
+    if (isDirectWafRecoveryUnavailable(err)) {
+      return makeRetryAction("direct_waf_recovery_unavailable", {
+        retryable: false,
+      });
+    }
+
+    // Headless automatic recovery already spent its one same-account retry
+    // and the punish persisted. Rotate exactly once (second-account probe);
+    // the shared circuit opens on the second independent confirmation and
+    // stops further rotation. No cooldown: a punish is not auth evidence.
+    if (
+      (err as { name?: unknown; blockReason?: unknown })?.name ===
+        "DirectTransportWafBlocked" &&
+      (err as { blockReason?: unknown })?.blockReason === "probe-rotate"
+    ) {
+      return makeRetryAction("waf_probe_rotate", {
+        retryable: true,
+        switchAccount: true,
+        forceNewChat: true,
+        retryAfterMs: baseDelayMs,
+      });
+    }
+
+    // Shared-WAF circuit open: fail fast without consuming accounts,
+    // cooldowns or rotation budget. Terminal by policy.
+    if (isSharedWafCircuitError(err)) {
+      return makeRetryAction("shared_waf_circuit_open", {
+        retryable: false,
+      });
     }
 
     if (isAntiBotError(err)) {

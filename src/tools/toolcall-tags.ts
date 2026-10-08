@@ -32,12 +32,12 @@ function tagName(tag: string): string {
 
 /** All accepted open tag names (custom + legacy). */
 export function getOpenNames(): string[] {
-  return Array.from(new Set([tagName(TOOL_CALL_OPEN), "tool_call", "tool_calls"]));
+  return Array.from(new Set([tagName(TOOL_CALL_OPEN), "tool_call", "tool_calls", "function"]));
 }
 
 /** All accepted close tag names (custom + legacy). */
 export function getCloseNames(): string[] {
-  return Array.from(new Set([tagName(TOOL_CALL_CLOSE), "tool_call", "tool_calls", "tool"]));
+  return Array.from(new Set([tagName(TOOL_CALL_CLOSE), "tool_call", "tool_calls", "tool", "function"]));
 }
 
 /** Wrap a JSON payload in the canonical open/close tags. */

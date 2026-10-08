@@ -117,6 +117,9 @@ function renderAccountsTable(accts) {
       '<button class="account-btn small" data-id="' +
       escHtml(a.id) +
       '" data-action="reset">Reset cooldown</button>' +
+      '<button class="account-btn small" data-id="' +
+      escHtml(a.id) +
+      '" data-action="verify">Verify manually</button>' +
       '<button class="account-btn small danger" data-id="' +
       escHtml(a.id) +
       '" data-email="' +
@@ -196,6 +199,74 @@ async function handleResetCooldown(id, email) {
 }
 
 /* ── Remove Account (native removeAccount) ── */
+async function handleVerifyManually(id, btn) {
+  setError(null);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Opening…';
+  }
+  try {
+    var res = await fetch('/v1/accounts/' + encodeURIComponent(id) + '/manual-verification/start', {
+      method: 'POST',
+      headers: authHeaders(),
+    });
+    var result;
+    try {
+      result = await res.json();
+    } catch {
+      result = null;
+    }
+    if (!res.ok) {
+      throw new Error(result && result.error ? result.error : 'Failed to start verification (' + res.status + ')');
+    }
+    showToast('Visible browser opened. Complete login manually, then wait for validation.', 'info');
+    pollVerifyStatus(id, btn);
+  } catch (e) {
+    setError(e.message);
+    showToast(e.message, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Verify manually';
+    }
+  }
+}
+
+async function pollVerifyStatus(id, btn) {
+  for (var i = 0; i < 200; i++) {
+    await new Promise(function (r) { setTimeout(r, 3000); });
+    var res;
+    try {
+      res = await fetch('/v1/accounts/' + encodeURIComponent(id) + '/manual-verification/status', {
+        headers: authHeaders(),
+      });
+      var st = await res.json();
+    } catch {
+      continue;
+    }
+    var state = st && st.state;
+    if (btn) {
+      if (state === 'waiting') btn.textContent = 'Waiting — send a test message in Qwen…';
+      else if (state === 'authenticated') btn.textContent = 'Authenticated — send a test message…';
+      else if (state === 'verifying') btn.textContent = 'Chat detected — verifying…';
+      else if (state === 'opening') btn.textContent = 'Opening…';
+      else if (state === 'autofilling') btn.textContent = 'Autofilling credentials…';
+    }
+    if (state === 'verified') {
+      showToast('Account verified and ready.', 'success');
+      break;
+    }
+    if (state === 'failed' || state === 'cancelled') {
+      showToast('Verification ' + state + (st.detail ? ': ' + st.detail : ''), state === 'cancelled' ? 'info' : 'error');
+      break;
+    }
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Verify manually';
+  }
+  loadAccounts();
+}
+
 function handleRemove(id, email) {
   document.getElementById('confirmEmail').textContent = email;
   document.getElementById('confirmOverlay').classList.add('open');
@@ -246,6 +317,7 @@ function init() {
     var email = btn.getAttribute('data-email') || '';
     if (action === 'reset') handleResetCooldown(id, email || id);
     else if (action === 'remove') handleRemove(id, email || id);
+    else if (action === 'verify') handleVerifyManually(id, btn);
   });
   loadAccounts();
   createPoller(loadAccounts, 3000);

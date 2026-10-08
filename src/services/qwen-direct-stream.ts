@@ -1,0 +1,386 @@
+/**
+ * Stream factory for the DIRECT WEB TRANSPORT.
+ *
+ * Implements the SAME contract as `createQwenStream` so the chat hot path can
+ * swap transports without touching anything downstream: the returned
+ * `ReadableStream` is a passthrough of the raw upstream SSE, which is exactly
+ * what the legacy factory returns. Every downstream parser keeps working.
+ *
+ * What this path does NOT do, by design:
+ *   - it never calls `captureQwenHeaders` (no UI typing, no send button, no
+ *     request interception);
+ *   - it never drives the captcha slider (a human solves it on demand);
+ *   - it does not need the dedicated Baxia minter (the proven account request
+ *     needs the cookie jar + Bearer JWT only).
+ *
+ * Anything the direct transport does not support is refused up front, so the
+ * caller can fall back to the legacy transport instead of silently degrading.
+ */
+
+import {
+  QWEN_DIRECT_WEB_TRANSPORT_ENABLED,
+  directCompletionStream,
+  directCreateChat,
+  getDirectBundleVersion,
+} from "./qwen-direct-transport.ts";
+import {
+  captureAccountSession,
+  captureX5secBaseline,
+  invalidateX5sec,
+  peekAccountSession,
+} from "./qwen-account-session.ts";
+import type { TokenEstimationContext } from "./token-estimation-metrics.ts";
+import { config, isLocalChatMode, type ChatMode } from "../core/config.ts";
+import {
+  isWafCircuitOpen,
+  getWafCircuitSignature,
+  recordWafPunish,
+  SharedWafCircuitError,
+  wafCircuitTtlRemainingMs,
+  wafSignatureFromDirectResult,
+} from "../core/waf-circuit.ts";
+
+/**
+ * Which WAF recovery policy applies. Headless production has no human to
+ * solve a challenge, so punish takes the bounded automatic path; headed /
+ * interactive mode keeps the human waiter. Pure and unit-testable; the
+ * caller passes the canonical service flag (`config.playwright.headless`).
+ */
+export function selectWafRecoveryMode(
+  headless: boolean,
+): "human" | "headless-auto" {
+  return headless ? "headless-auto" : "human";
+}
+
+export interface DirectStreamOptions {
+  prompt: string;
+  model: string;
+  accountId: string;
+  chatMode?: ChatMode;
+  /** Budget for a human captcha solve when the upstream challenges us. */
+  humanSolveTimeoutMs?: number;
+  allowRecovery?: boolean;
+  signal?: AbortSignal;
+  /**
+   * Fired once when HUMAN_CAPTCHA_REQUIRED is detected, before the human
+   * waiter starts, with the waiter's effective budget. Lets the request
+   * lifecycle extend its attempt deadline for the solve instead of racing
+   * a shorter timer against it. Never fired when no challenge appears.
+   */
+  onCaptchaStart?: (info: { budgetMs: number }) => void;
+  /**
+   * Set by the dispatcher for MODERN_PERSISTED_ACCOUNT_DIRECT_PATH: the
+   * account holds usable modern persisted auth, so the flag gate is bypassed
+   * without flipping the global flag. Never set by other callers.
+   */
+  modernPersisted?: boolean;
+}
+
+export interface DirectStreamResult {
+  stream: ReadableStream;
+  headers: Record<string, string>;
+  uiSessionId: string;
+  accountId: string;
+  createdNewChat: boolean;
+  tokenEstimationContext: TokenEstimationContext;
+}
+
+/** Strip the public Fast suffix to the upstream model id. Pure. */
+export function resolveUpstreamModel(model: string): string {
+  return model.endsWith("-fast") ? model.slice(0, -5) : model;
+}
+
+/** Thrown when the caller must fall back to the legacy transport. */
+export class DirectTransportUnsupported extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`direct-transport-unsupported:${reason}`);
+    this.name = "DirectTransportUnsupported";
+    this.reason = reason;
+  }
+}
+
+/** Why a WAF-blocked request could not be completed. */
+export type DirectWafBlockReason =
+  /** Recovery was disabled by the caller, or there is no account to solve on. */
+  | "no-recovery"
+  /** The official challenge was opened but no clearance arrived within budget. */
+  | "clearance-timeout"
+  /** A clearance arrived, yet the single retry was refused again. */
+  | "retry-refused"
+  /**
+   * Headless automatic recovery (same-account retry, Fix E) was refused with
+   * the same punish signature. Exactly one rotation probe may follow; the
+   * shared circuit opens on the second independent account.
+   */
+  | "probe-rotate";
+
+/**
+ * Thrown when the upstream refused this request with a WAF challenge.
+ *
+ * The transport NEVER retries internally beyond its single recovery leg
+ * (MAX_RECOVERY_RETRIES = 1). When the recovery cannot produce a usable
+ * clearance the failure is handed upward so the EXISTING retry/account policy
+ * can treat it as the transient condition it is -- see
+ * `isDirectClearanceExhausted` in routes/chat/retry-policy.ts.
+ */
+export class DirectTransportWafBlocked extends Error {
+  readonly recoveryAttempted: boolean;
+  readonly recoverySucceeded: boolean;
+  /** Distinguishes clearance-timeout from auth/config failures. */
+  readonly blockReason: DirectWafBlockReason;
+  constructor(
+    recoveryAttempted: boolean,
+    recoverySucceeded: boolean,
+    blockReason: DirectWafBlockReason = recoverySucceeded
+      ? "retry-refused"
+      : recoveryAttempted
+        ? "clearance-timeout"
+        : "no-recovery",
+  ) {
+    super(
+      blockReason === "retry-refused"
+        ? "direct-transport-waf-retry-refused"
+        : blockReason === "clearance-timeout"
+          ? "direct-transport-waf-clearance-timeout"
+          : blockReason === "probe-rotate"
+            ? "direct-transport-waf-probe-rotate"
+            : "direct-transport-waf-recovery-unavailable",
+    );
+    this.name = "DirectTransportWafBlocked";
+    this.recoveryAttempted = recoveryAttempted;
+    this.recoverySucceeded = recoverySucceeded;
+    this.blockReason = blockReason;
+  }
+}
+
+export function isDirectTransportEnabled(): boolean {
+  return QWEN_DIRECT_WEB_TRANSPORT_ENABLED;
+}
+
+/**
+ * Create a chat stream over the direct HTTP transport.
+ *
+ * The account's live cookie jar and JWT are read from its own browser page: the
+ * account browser is the single source of session truth. That page is never
+ * used to type, click, or intercept anything.
+ */
+export async function createDirectAccountStream(
+  opts: DirectStreamOptions,
+): Promise<DirectStreamResult> {
+  if (!isDirectTransportEnabled() && !opts.modernPersisted) {
+    throw new DirectTransportUnsupported("feature-flag-disabled");
+  }
+  if (opts.signal?.aborted) {
+    throw new Error("client aborted before direct stream creation");
+  }
+  if (!opts.prompt) throw new DirectTransportUnsupported("empty-prompt");
+
+  const session = await captureAccountSession(opts.accountId, { force: true });
+  if (!session) {
+    // No live account page: fall back to the existing login/recovery machinery
+    // rather than inventing a second login path here.
+    throw new DirectTransportUnsupported("no-account-session");
+  }
+  if (!session.bearerToken) {
+    throw new DirectTransportUnsupported("no-bearer-token");
+  }
+  if (!session.cookieHeader) {
+    throw new DirectTransportUnsupported("no-cookie-jar");
+  }
+  if (opts.signal?.aborted) {
+    throw new Error("client aborted before direct request");
+  }
+
+  // Shared-WAF circuit: while open, fail fast without consuming upstream
+  // state — no legs, no cooldown, no rotation. Checked again after leg 1
+  // in case another request confirmed the punish concurrently.
+  if (isWafCircuitOpen()) {
+    const signature = getWafCircuitSignature() ?? "waf-challenge";
+    throw new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs());
+  }
+
+  const version = await getDirectBundleVersion().catch(() => null);
+  // "local" is the upstream ephemeral chat mode; every other ChatMode value
+  // maps to a normal (threaded) upstream chat.
+  // Same mapping the legacy transport uses (qwen.ts:4562).
+  const chatMode = isLocalChatMode(opts.chatMode) ? "local" : "normal";
+  const accountId8 = opts.accountId.slice(0, 8);
+  // Defense in depth: the normal request path already normalizes synthetic
+  // variants (qwen3.8-max-fast -> qwen3.8-max), but a literal alias sent to
+  // the upstream answers Not_Found/Model not found (proven live). The public
+  // alias stays accepted; only the upstream model id is canonical here.
+  const upstreamModel = resolveUpstreamModel(opts.model);
+
+  // The working credential pair, refreshed by recovery legs below. The
+  // legs always send a coherent pair (Fix C): reassign both together.
+  let activeBearer = session.bearerToken;
+
+  const createLeg = async (cookie: string): Promise<string | null> => {
+    const created = await directCreateChat({
+      cookie,
+      model: upstreamModel,
+      chatMode,
+      chatType: "t2t",
+      userAgent: session.userAgent,
+      version,
+      bearerToken: activeBearer,
+      baxia: null,
+    });
+    if (!created.ok || !created.chatId) {
+      console.warn(
+        `⚠️ [DirectTransport] create_failed | account=${accountId8} | http=${created.httpStatus} | waf=${created.waf} | code=${created.errorCode ?? "-"}`,
+      );
+      return null;
+    }
+    return created.chatId;
+  };
+
+  const completeLeg = (cookie: string, chatId: string) =>
+    directCompletionStream({
+      cookie,
+      bearerToken: activeBearer,
+      chatId,
+      model: upstreamModel,
+      content: opts.prompt,
+      chatMode,
+      chatType: "t2t",
+      userAgent: session.userAgent,
+      version,
+      baxia: null,
+      signal: opts.signal,
+    });
+
+  // ── Leg 1 ────────────────────────────────────────────────────────────────
+  let cookie = session.cookieHeader;
+  let chatId = await createLeg(cookie);
+  if (!chatId) throw new DirectTransportUnsupported("create-chat-failed");
+  let result = await completeLeg(cookie, chatId);
+
+  // ── At most ONE captcha recovery, always on a BRAND NEW chat ───────
+  // Human mode waits for a person (headed/interactive). Headless production
+  // takes the bounded automatic path instead (Fix E): no 300s wait, at most
+  // one same-account retry and one rotation probe per punish signature.
+  if (!result.ok && result.waf) {
+    if (opts.allowRecovery === false || !opts.accountId) {
+      invalidateX5sec(opts.accountId ?? "");
+      throw new DirectTransportWafBlocked(false, false, "no-recovery");
+    }
+    console.warn(
+      `🚪 [DirectTransport] HUMAN_CAPTCHA_REQUIRED=YES | account=${accountId8} | CHALLENGE_OPENED=pending | challenge=${result.punishUrl ? "punish_url" : "none"}`,
+    );
+    const signature = wafSignatureFromDirectResult(result.punishUrl ?? null, result.challengeBody);
+    let headlessRecovery = false;
+    if (selectWafRecoveryMode(config.playwright.headless) === "headless-auto") {
+      // A known-shared WAF fails fast without consuming state: no session
+      // work, no legs, no cooldown, no rotation.
+      if (isWafCircuitOpen(signature)) {
+        throw new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs());
+      }
+      // Same-account bounded recovery: drop the refused clearance, re-capture
+      // the session, and run the single second leg below with fresh material.
+      // No waiting, no cooldown, no rotation yet.
+      invalidateX5sec(opts.accountId);
+      const retrySession = await captureAccountSession(opts.accountId, { force: true }).catch(() => null);
+      if (opts.signal?.aborted) {
+        throw new Error("client aborted before direct retry");
+      }
+      if (retrySession?.cookieHeader && retrySession?.bearerToken) {
+        cookie = retrySession.cookieHeader;
+        activeBearer = retrySession.bearerToken;
+      }
+      headlessRecovery = true;
+    } else {
+    // Single coherent deadline policy: while the human recovery below is
+    // active, the attempt budget is the human budget, not the normal
+    // acquire deadline. The lifecycle owner re-arms its timer from this
+    // hook; without it a solve past the normal deadline could never land.
+    const { HUMAN_CAPTCHA_BUDGET_MS } = await import("./qwen-human-captcha.ts");
+    const humanBudgetMs = Math.max(5_000, opts.humanSolveTimeoutMs ?? HUMAN_CAPTCHA_BUDGET_MS);
+    opts.onCaptchaStart?.({ budgetMs: humanBudgetMs });
+    // Snapshot the clearance we were JUST refused on, BEFORE dropping it from
+    // the operational cache. Recovery must be able to tell a new clearance from
+    // this one; invalidating first used to erase that evidence and made the wait
+    // report success in ~2.8s against the unchanged rejected cookie.
+    const baseline = captureX5secBaseline(peekAccountSession(opts.accountId));
+    // Now it can be dropped from the cache: it is not trusted.
+    invalidateX5sec(opts.accountId);
+    const { recoverWithHumanCaptcha } = await import("./qwen-human-captcha.ts");
+    const outcome = await recoverWithHumanCaptcha(opts.accountId, {
+      // FULL body: the punish URL's x5secdata is truncated in any preview.
+      challengeBody: result.challengeBody ?? "",
+      timeoutMs: opts.humanSolveTimeoutMs,
+      baseline,
+      signal: opts.signal,
+    });
+    if (!outcome.solved || !outcome.cookieHeader) {
+      console.warn(
+        `❌ [DirectTransport] human_solve_failed | account=${accountId8}`,
+      );
+      throw new DirectTransportWafBlocked(true, false, "clearance-timeout");
+    }
+    cookie = outcome.cookieHeader;
+    console.log(
+      `✅ [HumanCaptcha] HUMAN_CAPTCHA_SOLVED=YES | account=${accountId8} | X5SEC_TTL_MS=${Math.round(outcome.x5secTtlMs)}`,
+    );
+    }
+    // NEW chat: the pre-recovery chatId belongs to the pre-recovery session.
+    chatId = await createLeg(cookie);
+    if (!chatId) throw new DirectTransportWafBlocked(true, true, "retry-refused");
+    result = await completeLeg(cookie, chatId);
+    if (!result.ok) {
+      if (headlessRecovery) {
+        // Persisted punish: record this account's observation. A second
+        // independent account with the same signature opens the shared
+        // circuit; anything else rotates exactly once via policy (no
+        // cooldown either way). A non-WAF failure keeps existing handling.
+        const retrySignature = result.waf
+          ? wafSignatureFromDirectResult(result.punishUrl ?? null, result.challengeBody)
+          : null;
+        if (retrySignature) {
+          const observed = recordWafPunish(opts.accountId, retrySignature);
+          if (observed.shared || isWafCircuitOpen(retrySignature)) {
+            throw new SharedWafCircuitError(retrySignature, wafCircuitTtlRemainingMs());
+          }
+          throw new DirectTransportWafBlocked(true, false, "probe-rotate");
+        }
+      } else {
+        // A second challenge fails cleanly. No loop.
+        throw new DirectTransportWafBlocked(true, true, "retry-refused");
+      }
+    }
+  }
+
+  if (!result.ok || !result.stream) {
+    // Sanitized preview only: app error JSONs carry codes, never secrets.
+    const preview = String(
+      (result as { challengeBody?: unknown }).challengeBody ?? "",
+    )
+      .replace(/\s+/g, " ")
+      .slice(0, 200);
+    console.warn(
+      `⚠️ [DirectTransport] completion_rejected | account=${accountId8} | http=${result.httpStatus} | ct=${result.contentType} | waf=${result.waf} | version=${version ?? "-"} | body=${preview}`,
+    );
+    throw new Error(
+      `direct-completion-failed http=${result.httpStatus} ct=${result.contentType} waf=${result.waf}`,
+    );
+  }
+
+  console.log(
+    `⚡ [DirectTransport] stream_ready | account=${accountId8} | chat=${chatId.slice(0, 8)} | ct=${result.contentType}`,
+  );
+
+  return {
+    stream: result.stream,
+    headers: {},
+    uiSessionId: chatId,
+    accountId: opts.accountId,
+    createdNewChat: true,
+    tokenEstimationContext: {
+      qwenPayloadBytes: Buffer.byteLength(opts.prompt, "utf-8"),
+      qwenPayloadPromptChars: opts.prompt.length,
+      qwenPayloadMessageCount: 1,
+      activePersonalization: null,
+    },
+  };
+}
