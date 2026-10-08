@@ -62,7 +62,11 @@ function renderAccountRows(data) {
       }
       return (
         '<tr>' +
-        '<td>' +
+        '<td title="' +
+        (a.accountId === 'unknown'
+          ? 'Unassigned: request finished before account attribution (pre-lease failure, global protection, client abort) or media-bypass. Not necessarily an error.'
+          : escHtml(a.email || a.accountId)) +
+        '">' +
         escHtml(a.email || a.accountId) +
         '</td>' +
         '<td class="num">' +

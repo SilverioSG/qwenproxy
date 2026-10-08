@@ -67,10 +67,14 @@ async function refreshHealth() {
   var mon = await apiFetch('/metrics/monitor');
   if (mon && mon.totals && typeof mon.totals.totalRequests === 'number') {
     setText('kpiTotalRequests', mon.totals.totalRequests);
-    setText(
-      'kpiTotalRequestsSub',
-      (mon.totals.totalErrors || 0) + ' errors',
-    );
+    // Primary failure metric: failed backend/protection requests (aborts out).
+    var failed = mon.totals.failedRequests != null ? mon.totals.failedRequests : mon.totals.totalErrors || 0;
+    var aborts = mon.totals.clientAborts || 0;
+    var prot = mon.totals.protectionEvents || 0;
+    var sub = failed + ' failed';
+    if (aborts > 0) sub += ' · ' + aborts + ' aborted';
+    if (prot > 0) sub += ' · ' + prot + ' protection';
+    setText('kpiTotalRequestsSub', sub);
   }
 }
 /* ── Pool Stats ── */

@@ -311,7 +311,7 @@ ${THEME_BOOTSTRAP}
     <div class="monitor-kpi-grid" id="kpiGrid">
       <div class="kpi-card"><span class="kpi-label">Total Requests</span><span class="kpi-value" id="kpiTotalReqs">—</span><span class="kpi-sub" id="kpiTotalReqsSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">Success</span><span class="kpi-value" id="kpiSuccess">—</span><span class="kpi-sub" id="kpiSuccessSub"></span></div>
-      <div class="kpi-card"><span class="kpi-label">Errors</span><span class="kpi-value" id="kpiErrors">—</span><span class="kpi-sub" id="kpiErrorsSub"></span></div>
+      <div class="kpi-card"><span class="kpi-label">Failed</span><span class="kpi-value" id="kpiErrors">—</span><span class="kpi-sub" id="kpiErrorsSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">Avg Latency</span><span class="kpi-value" id="kpiAvgLat">—</span><span class="kpi-sub" id="kpiAvgLatSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">P95 Latency</span><span class="kpi-value" id="kpiP95Lat">—</span><span class="kpi-sub" id="kpiP95LatSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">Median</span><span class="kpi-value" id="kpiMedianLat">—</span><span class="kpi-sub" id="kpiMedianLatSub"></span></div>
