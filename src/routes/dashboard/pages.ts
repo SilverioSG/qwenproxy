@@ -286,7 +286,7 @@ export const monitorHtml = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QwenProxy — Monitor</title>
+<title>QwenProxy — Monitor — Last 1,000 Requests</title>
 ${THEME_BOOTSTRAP}
   <link rel="stylesheet" href="/dashboard/static/shared.css">
   <link rel="stylesheet" href="/dashboard/static/overview.css">
@@ -300,7 +300,7 @@ ${THEME_BOOTSTRAP}
     <div class="page-header">
       <h1>
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        Monitor
+        Monitor — Last 1,000 Requests
       </h1>
       <div class="page-header-right">
         <span class="badge badge-accent" id="entryCountBadge">— entries</span>
@@ -309,7 +309,7 @@ ${THEME_BOOTSTRAP}
 
     <!-- KPI Grid (V1: global live counters only) -->
     <div class="monitor-kpi-grid" id="kpiGrid">
-      <div class="kpi-card"><span class="kpi-label">Total Requests</span><span class="kpi-value" id="kpiTotalReqs">—</span><span class="kpi-sub" id="kpiTotalReqsSub"></span></div>
+      <div class="kpi-card"><span class="kpi-label">Requests (Last 1,000)</span><span class="kpi-value" id="kpiTotalReqs">—</span><span class="kpi-sub" id="kpiTotalReqsSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">Success</span><span class="kpi-value" id="kpiSuccess">—</span><span class="kpi-sub" id="kpiSuccessSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">Failed</span><span class="kpi-value" id="kpiErrors">—</span><span class="kpi-sub" id="kpiErrorsSub"></span></div>
       <div class="kpi-card"><span class="kpi-label">Avg Latency</span><span class="kpi-value" id="kpiAvgLat">—</span><span class="kpi-sub" id="kpiAvgLatSub"></span></div>
@@ -363,7 +363,7 @@ ${THEME_BOOTSTRAP}
           <div class="empty-state" id="emptyMonitor">Per-account history is not collected in V1. See Accounts for live per-account state.</div>
           <div class="tbl-wrap">
             <table id="monitorTable" style="display:none">
-              <thead><tr><th>Account</th><th>Total</th><th>Success</th><th>Errors</th><th>Rate</th><th>Avg Lat</th><th>P95</th><th>Median</th><th>Modes</th><th>Recent Errors</th></tr></thead>
+              <thead><tr><th>Account</th><th>Total</th><th>Success</th><th>Errors</th><th>Rate</th><th>Avg Lat</th><th>P95</th><th>Median</th><th>Modes</th><th>Errors (Last 1,000 Requests)</th></tr></thead>
               <tbody id="monitorBody"></tbody>
             </table>
           </div>
