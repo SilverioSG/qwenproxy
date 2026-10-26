@@ -31,6 +31,10 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../core/config.ts";
 import { parseJwtExpiry } from "../utils/jwt.ts";
+import {
+  classifyPostLoginValidation,
+  type AuthValidationState,
+} from "./auth-contract.ts";
 
 /** Validated refresh endpoint. */
 export const QWEN_REFRESH_URL = "https://auth.qwen.ai/api/v2/auths/refresh";
@@ -438,7 +442,48 @@ export async function tryRefreshToken(
 
 // Single-flight per account: concurrent requests share one renewal instead
 // of stampeding the refresh endpoint. Cleared in `finally`.
-const refreshInFlight = new Map<string, Promise<boolean>>();
+const refreshInFlight = new Map<string, Promise<AccountFreshState>>();
+
+export interface AccountFreshState {
+  materialPresent: boolean;
+  tokenValid: boolean;
+  tokenExpiresAtSec: number | null;
+  refreshPerformed: boolean;
+  refreshOk: boolean;
+  refreshCode?: string;
+}
+
+export interface AccountSessionState extends AccountFreshState {
+  sessionVerified: AuthValidationState;
+  verificationReason?: string;
+  /** Verification could not run because no live page exists. */
+  pageRequired?: boolean;
+}
+
+export type SessionVerifier = (accountId: string) => Promise<{
+  state: AuthValidationState;
+  reason?: string;
+}>;
+
+function emptyFreshState(): AccountFreshState {
+  return {
+    materialPresent: false,
+    tokenValid: false,
+    tokenExpiresAtSec: null,
+    refreshPerformed: false,
+    refreshOk: false,
+  };
+}
+
+function refreshCodeLooksRejected(code: string | undefined): boolean {
+  const c = (code ?? "").toLowerCase();
+  return (
+    c.includes("401") ||
+    c.includes("403") ||
+    c.includes("unauthorized") ||
+    c.includes("revoked")
+  );
+}
 
 /** @internal test seam */
 export function _resetRefreshSingleFlightForTests(): void {
@@ -448,6 +493,80 @@ export function _resetRefreshSingleFlightForTests(): void {
 /** @internal test seam */
 export function _refreshSingleFlightSizeForTests(): number {
   return refreshInFlight.size;
+}
+
+async function ensureAccountFreshState(
+  accountId: string,
+  opts: { fetchFn?: RefreshFetch } = {},
+): Promise<AccountFreshState> {
+  if (!accountId) return emptyFreshState();
+  if (isAuthMockEnabled()) {
+    return {
+      ...emptyFreshState(),
+      materialPresent: true,
+      tokenValid: true,
+    };
+  }
+  const shared = refreshInFlight.get(accountId);
+  if (shared) return shared;
+  const run: Promise<AccountFreshState> = (async () => {
+    try {
+      let material: RefreshMaterial | null = null;
+      try {
+        const { getRefreshMaterial } = await import("../core/database.ts");
+        material = getRefreshMaterial(accountId);
+      } catch {
+        return emptyFreshState();
+      }
+      if (!material) return emptyFreshState();
+      const base: AccountFreshState = {
+        materialPresent: true,
+        tokenValid: false,
+        tokenExpiresAtSec: material.tokenExpiresAtSec,
+        refreshPerformed: false,
+        refreshOk: false,
+      };
+      if (!needsRefresh(material.tokenExpiresAtSec)) {
+        return { ...base, tokenValid: true };
+      }
+      if (hasRefreshMaterial(material.jar)) {
+        const result = await tryRefreshToken(accountId, {
+          fetchFn: opts.fetchFn,
+        });
+        if (result.ok) {
+          return {
+            ...base,
+            tokenValid: true,
+            refreshPerformed: true,
+            refreshOk: true,
+          };
+        }
+        console.warn(
+          `[AuthRefresh] silent refresh failed | account=${accountId.slice(0, 8)} | code=${result.code ?? "?"} | details=${result.details ?? "no details"}`,
+        );
+        const tokenValid =
+          material.tokenExpiresAtSec == null ||
+          material.tokenExpiresAtSec * 1000 > Date.now();
+        return {
+          ...base,
+          tokenValid,
+          refreshPerformed: true,
+          refreshOk: false,
+          refreshCode: result.code,
+        };
+      }
+      // A token that is still alive right now (inside the margin but not yet
+      // expired, or opaque with no exp) remains usable for this request.
+      const tokenValid =
+        material.tokenExpiresAtSec == null ||
+        material.tokenExpiresAtSec * 1000 > Date.now();
+      return { ...base, tokenValid };
+    } finally {
+      refreshInFlight.delete(accountId);
+    }
+  })();
+  refreshInFlight.set(accountId, run);
+  return run;
 }
 
 /**
@@ -463,43 +582,114 @@ export function _refreshSingleFlightSizeForTests(): number {
  * - Deliberately no browser fallback here: opening a profile cannot mint a
  *   token without a person, and must never destroy the persisted jar.
  * Never throws.
+ *
+ * API preserved in Phase 2A: callers that only need token freshness keep this
+ * boolean. Authentication confirmation is a separate contract below.
  */
 export async function ensureAccountFresh(
   accountId: string,
   opts: { fetchFn?: RefreshFetch } = {},
 ): Promise<boolean> {
-  if (!accountId) return false;
-  if (isAuthMockEnabled()) return true;
-  const shared = refreshInFlight.get(accountId);
-  if (shared) return shared;
-  const run: Promise<boolean> = (async () => {
-    try {
-      let material: RefreshMaterial | null = null;
-      try {
-        const { getRefreshMaterial } = await import("../core/database.ts");
-        material = getRefreshMaterial(accountId);
-      } catch {
-        return false;
-      }
-      if (!material) return false;
-      if (!needsRefresh(material.tokenExpiresAtSec)) return true;
-      if (hasRefreshMaterial(material.jar)) {
-        const result = await tryRefreshToken(accountId, {
-          fetchFn: opts.fetchFn,
-        });
-        if (result.ok) return true;
-        console.warn(
-          `[AuthRefresh] silent refresh failed | account=${accountId.slice(0, 8)} | code=${result.code ?? "?"} | details=${result.details ?? "no details"}`,
-        );
-      }
-      // A token that is still alive right now (inside the margin but not yet
-      // expired, or opaque with no exp) remains usable for this request.
-      if (material.tokenExpiresAtSec == null) return true;
-      return material.tokenExpiresAtSec * 1000 > Date.now();
-    } finally {
-      refreshInFlight.delete(accountId);
+  const state = await ensureAccountFreshState(accountId, opts);
+  return state.tokenValid;
+}
+
+async function defaultSessionVerifier(accountId: string): Promise<{
+  state: AuthValidationState;
+  reason?: string;
+}> {
+  try {
+    const { getAccountPageSnapshotHandles, probePageLoggedIn } = await import(
+      "./playwright.ts"
+    );
+    const handles = getAccountPageSnapshotHandles(accountId);
+    if (!handles?.page) {
+      return { state: "inconclusive", reason: "no-live-page" };
     }
-  })();
-  refreshInFlight.set(accountId, run);
-  return run;
+    const probe = await probePageLoggedIn(handles.page as never, 3000, {
+      nonMutating: true,
+    });
+    const settingsStatus =
+      probe.reason === "settings-401"
+        ? 401
+        : probe.reason === "settings-403"
+          ? 403
+          : probe.reason === "ok" || probe.reason.startsWith("settings-")
+            ? 200
+            : 0;
+    return {
+      state: classifyPostLoginValidation({
+        reason: probe.reason,
+        settingsStatus,
+        settingsAppFail: !probe.ok,
+      }),
+      reason: probe.reason,
+    };
+  } catch {
+    return { state: "inconclusive", reason: "probe-error" };
+  }
+}
+
+/**
+ * Independent authentication contract for modern sessions. Token freshness
+ * (`tokenValid`/`refreshPerformed`) is NOT authentication: a valid JWT or a
+ * successful refresh only becomes `sessionVerified: "valid"` after the
+ * existing non-mutating settings probe confirms the upstream session.
+ *
+ * - no material → inconclusive, reason=no-auth-material
+ * - refresh attempted but rejected (401/403/unauthorized/revoked) → rejected
+ * - token unusable without a conclusive upstream signal → inconclusive
+ * - verifier omitted and no live page → inconclusive, reason=no-live-page
+ * - verifier rejected → rejected; verifier timeout/error → inconclusive
+ *
+ * This is only used by login/reauth paths, never by the per-request hot path.
+ * `ensureAccountFresh` remains the hot-path freshness API.
+ */
+export async function ensureAccountSession(
+  accountId: string,
+  opts: {
+    fetchFn?: RefreshFetch;
+    verify?: SessionVerifier;
+  } = {},
+): Promise<AccountSessionState> {
+  const fresh = await ensureAccountFreshState(accountId, opts);
+  if (isAuthMockEnabled()) {
+    return {
+      ...fresh,
+      sessionVerified: "valid",
+      verificationReason: "mock-auth",
+    };
+  }
+  if (!fresh.materialPresent) {
+    return {
+      ...fresh,
+      sessionVerified: "inconclusive",
+      verificationReason: "no-auth-material",
+    };
+  }
+  if (!fresh.tokenValid) {
+    const rejected =
+      fresh.refreshPerformed && refreshCodeLooksRejected(fresh.refreshCode);
+    return {
+      ...fresh,
+      sessionVerified: rejected ? "rejected" : "inconclusive",
+      verificationReason: rejected
+        ? `refresh-${fresh.refreshCode ?? "rejected"}`
+        : "token-not-usable",
+    };
+  }
+  let verification: { state: AuthValidationState; reason?: string };
+  try {
+    verification = opts.verify
+      ? await opts.verify(accountId)
+      : await defaultSessionVerifier(accountId);
+  } catch {
+    verification = { state: "inconclusive", reason: "verify-error" };
+  }
+  return {
+    ...fresh,
+    sessionVerified: verification.state,
+    verificationReason: verification.reason,
+    pageRequired: verification.reason === "no-live-page" ? true : undefined,
+  };
 }

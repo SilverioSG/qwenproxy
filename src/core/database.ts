@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { encrypt, isEncrypted } from "./crypto-utils.ts";
+import type { AuthValidationState } from "../services/auth-contract.ts";
 
 /**
  * Several suites exercise account rotation by deleting every row and restoring
@@ -428,6 +429,43 @@ export function saveAuthSession(
   } catch {
     // Tracing must never break persistence.
   }
+}
+
+export interface SaveValidatedAuthSessionResult {
+  saved: boolean;
+  reason?: string;
+}
+
+/**
+ * Persist only a session that was conclusively validated. This is the
+ * confirmed-session writer for login/manual flows; `saveAuthSession` remains
+ * the low-level row writer (captures/refresh) and keeps its preservation
+ * semantics.
+ *
+ * Rules:
+ * - rejected/inconclusive never overwrite a confirmed session;
+ * - a confirmed session needs a non-empty UA, either supplied now or already
+ *   stored (an update with an empty snapshot preserves the previous UA);
+ * - `getValidAuthSession` is intentionally unchanged and stays strict.
+ */
+export function saveValidatedAuthSession(
+  accountId: string,
+  session: Parameters<typeof saveAuthSession>[1],
+  validation: AuthValidationState,
+): SaveValidatedAuthSessionResult {
+  if (validation !== "valid") {
+    return { saved: false, reason: `validation-${validation}` };
+  }
+  if (!session.userAgent) {
+    const prev = getDatabase()
+      .prepare(`SELECT user_agent FROM qwen_auth_sessions WHERE account_id = ?`)
+      .get(accountId) as { user_agent?: string | null } | undefined;
+    if (!prev?.user_agent) {
+      return { saved: false, reason: "missing-user-agent" };
+    }
+  }
+  saveAuthSession(accountId, session);
+  return { saved: true };
 }
 
 export function getValidAuthSession(

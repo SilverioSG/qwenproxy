@@ -81,6 +81,13 @@ function statusOf(err: unknown): number | undefined {
 export function isTerminalLocalError(err: unknown): boolean {
   if (!err) return false;
 
+  // Typed, narrow exception: an upstream Qwen session rejection is eligible
+  // for account failover. Local proxy AuthError instances do NOT carry this
+  // marker and stay terminal below.
+  if ((err as { accountFailover?: boolean }).accountFailover === true) {
+    return false;
+  }
+
   if (
     err instanceof ValidationError ||
     err instanceof AuthError ||

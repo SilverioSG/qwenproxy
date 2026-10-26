@@ -98,9 +98,15 @@ import {
 } from "./capture-probe.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
+import {
+  classifyPostLoginValidation,
+  shouldUnmarkReadyAfterRecovery,
+  type AuthValidationState,
+} from "./auth-contract.ts";
 // Static import is cycle-free: qwen-token-refresh only touches playwright via
 // dynamic import (best-effort cache push after a no-browser refresh).
 import { getJarPair, ensureAccountFresh } from "./qwen-token-refresh.ts";
+import { recoverAccountSession } from "./auth-recovery.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
 const contextInitHooks: ContextInitHook[] = [];
@@ -2680,6 +2686,8 @@ export interface LoginAttemptResult {
   success: boolean;
   permanentFailure?: boolean;
   reason?: string;
+  /** Post-login classification when a token was installed. */
+  validation?: AuthValidationState;
 }
 
 export function classifyQwenAuthError(
@@ -2750,20 +2758,39 @@ export async function loginToQwen(
   // MODERN_AUTH_PRESENT: an account holding modern refresh material must never
   // run the password machinery — password flows cannot restore a modern
   // session, and their exhaustion parks the account 24h AuthFailed (proven
-  // live by the SessionKeeper proactive renewal). Silent refresh only; the
-  // boolean result flows to the caller with no cooldown side effects.
+  // live by the SessionKeeper proactive renewal). Token freshness is NOT
+  // authentication: require the independent non-mutating session verification.
   try {
     const { getRefreshMaterial } = await import("../core/database.ts");
     if (getRefreshMaterial(accountId)?.jar) {
       try {
-        const { ensureAccountFresh } = await import(
-          "./qwen-token-refresh.ts"
-        );
-        const fresh = await ensureAccountFresh(accountId).catch(() => false);
+        const recovery = await recoverAccountSession(
+          accountId,
+          "login-modern",
+        ).catch(() => null);
+        const verified = recovery?.outcome === "verified";
+        if (
+          recovery &&
+          shouldUnmarkReadyAfterRecovery(recovery.outcome)
+        ) {
+          unmarkAccountHeadersReady(accountId);
+        }
         try {
-          traceSessionEvent(accountId, "LOGIN_END", fresh ? "ok-modern" : "stale-modern");
+          traceSessionEvent(
+            accountId,
+            "LOGIN_END",
+            verified
+              ? "ok-modern"
+              : recovery?.outcome === "rejected"
+                ? "rejected-modern"
+                : recovery?.outcome === "page-required"
+                  ? "page-required-modern"
+                  : recovery?.outcome === "inconclusive"
+                    ? "unverified-modern"
+                    : "deferred-modern",
+          );
         } catch {}
-        return fresh;
+        return verified;
       } catch {
         return false;
       }
@@ -2826,7 +2853,14 @@ async function loginToQwenInner(
 
     // Try API login first
     const apiResult = await loginViaApi(page, email, password);
+    if (apiResult.validation && apiResult.validation !== "valid") {
+      // Conclusive rejection or an inconclusive probe must not fall through to
+      // the UI login path or persist a confirmed session.
+      unmarkAccountHeadersReady(accountId);
+      return false;
+    }
     if (apiResult.success) {
+      let persisted = false;
       cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
       // The refresh_token cookie can land a tick after the access token;
@@ -2841,26 +2875,45 @@ async function loginToQwenInner(
           const cache = getHeaderCache(accountId);
           cache.headers.cookie = cookieStr;
           cache.lastRefresh = Date.now();
-          markAccountHeadersReady(accountId);
-          const { saveAuthSession } = await import("../core/database.ts");
+          let userAgent = cache.headers["user-agent"] || "";
+          if (!userAgent) {
+            userAgent = await page
+              .evaluate(() => navigator.userAgent)
+              .catch(() => "");
+          }
+          const { saveValidatedAuthSession } = await import("../core/database.ts");
           const exp = parseJwtExpiry(tokenCookie.value);
-          saveAuthSession(accountId, {
-            cookie: cookieStr,
-            userAgent: cache.headers["user-agent"] || "",
-            bxV: cache.headers["bx-v"] || "2.5.37",
-            bxUa: cache.headers["bx-ua"] || "",
-            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-            secChUa: cache.headers["sec-ch-ua"] || undefined,
-            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-            version: cache.headers["version"] || undefined,
-            tokenExpiresAt: exp || undefined,
-            capturedAt: Date.now(),
-            refreshToken: getJarPair(cookieStr, "refresh_token"),
-          });
+          const saved = saveValidatedAuthSession(
+            accountId,
+            {
+              cookie: cookieStr,
+              userAgent,
+              bxV: cache.headers["bx-v"] || "2.5.37",
+              bxUa: cache.headers["bx-ua"] || "",
+              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+              secChUa: cache.headers["sec-ch-ua"] || undefined,
+              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+              version: cache.headers["version"] || undefined,
+              tokenExpiresAt: exp || undefined,
+              capturedAt: Date.now(),
+              refreshToken: getJarPair(cookieStr, "refresh_token"),
+            },
+            "valid",
+          );
+          persisted = saved.saved;
+          if (saved.saved) {
+            markAccountHeadersReady(accountId);
+          } else {
+            unmarkAccountHeadersReady(accountId);
+            console.warn(
+              `⚠️  [Playwright] Session not persisted for ${maskEmail(email)}: ${saved.reason ?? "unknown"}`,
+            );
+          }
         }
       } catch {}
-      return true;
+      if (!persisted) unmarkAccountHeadersReady(accountId);
+      return persisted;
     }
 
     if (apiResult.permanentFailure) {
@@ -2878,6 +2931,7 @@ async function loginToQwenInner(
     // Fallback to UI login
     const uiResult = await loginViaUi(page, email, password);
     if (uiResult.success) {
+      let persisted = false;
       cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
       // Same bounded refresh_token wait as the API-login path above.
@@ -2890,26 +2944,45 @@ async function loginToQwenInner(
           const cache = getHeaderCache(accountId);
           cache.headers.cookie = cookieStr;
           cache.lastRefresh = Date.now();
-          markAccountHeadersReady(accountId);
-          const { saveAuthSession } = await import("../core/database.ts");
+          let userAgent = cache.headers["user-agent"] || "";
+          if (!userAgent) {
+            userAgent = await page
+              .evaluate(() => navigator.userAgent)
+              .catch(() => "");
+          }
+          const { saveValidatedAuthSession } = await import("../core/database.ts");
           const exp = parseJwtExpiry(tokenCookie.value);
-          saveAuthSession(accountId, {
-            cookie: cookieStr,
-            userAgent: cache.headers["user-agent"] || "",
-            bxV: cache.headers["bx-v"] || "2.5.37",
-            bxUa: cache.headers["bx-ua"] || "",
-            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-            secChUa: cache.headers["sec-ch-ua"] || undefined,
-            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-            version: cache.headers["version"] || undefined,
-            tokenExpiresAt: exp || undefined,
-            capturedAt: Date.now(),
-            refreshToken: getJarPair(cookieStr, "refresh_token"),
-          });
+          const saved = saveValidatedAuthSession(
+            accountId,
+            {
+              cookie: cookieStr,
+              userAgent,
+              bxV: cache.headers["bx-v"] || "2.5.37",
+              bxUa: cache.headers["bx-ua"] || "",
+              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+              secChUa: cache.headers["sec-ch-ua"] || undefined,
+              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+              version: cache.headers["version"] || undefined,
+              tokenExpiresAt: exp || undefined,
+              capturedAt: Date.now(),
+              refreshToken: getJarPair(cookieStr, "refresh_token"),
+            },
+            "valid",
+          );
+          persisted = saved.saved;
+          if (saved.saved) {
+            markAccountHeadersReady(accountId);
+          } else {
+            unmarkAccountHeadersReady(accountId);
+            console.warn(
+              `⚠️  [Playwright] Session not persisted for ${maskEmail(email)}: ${saved.reason ?? "unknown"}`,
+            );
+          }
         }
       } catch {}
-      return true;
+      if (!persisted) unmarkAccountHeadersReady(accountId);
+      return persisted;
     }
 
     if (uiResult.permanentFailure) {
@@ -2980,6 +3053,8 @@ export interface LoginAttemptTrace {
   lsTokenPresentAfter: boolean;
   lsTokenChanged: boolean;
   validated: boolean | null;
+  /** Explicit post-login classification of the non-mutating probe. */
+  validation?: AuthValidationState;
   cookieInstallOk: boolean | null;
   lsWriteOk: boolean | null;
   reloadOk: boolean | null;
@@ -3799,6 +3874,11 @@ async function loginViaApi(
         } catch {
           // Best effort: the invariant is a tripwire, never a gate.
         }
+        trace.validation = classifyPostLoginValidation({
+          reason: trace.postValidationReason,
+          settingsStatus: trace.postValidation.settingsStatus,
+          settingsAppFail: trace.postValidation.settingsAppFail,
+        });
         try {
           const { snapshotSessionState, traceSessionEvent } = await import(
             "./session-tracer.ts"
@@ -3814,7 +3894,21 @@ async function loginViaApi(
           // Tracing must never break login.
         }
         storeTrace();
-        return { success: true };
+        if (trace.validation === "rejected") {
+          return {
+            success: false,
+            validation: "rejected",
+            reason: `post-login validation rejected: ${trace.postValidationReason || "unknown"}`,
+          };
+        }
+        if (trace.validation === "inconclusive") {
+          return {
+            success: false,
+            validation: "inconclusive",
+            reason: `post-login validation inconclusive: ${trace.postValidationReason || "unknown"}`,
+          };
+        }
+        return { success: true, validation: "valid" };
       }
     }
 
@@ -3826,6 +3920,7 @@ async function loginViaApi(
     storeTrace();
     return {
       success: false,
+      validation: "rejected",
       reason: "API signin não confirmou sessão autenticada",
     };
   } catch (err: any) {
@@ -3833,17 +3928,54 @@ async function loginViaApi(
     if (page && !page.isClosed()) {
       try {
         await sleep(1500);
-        if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
-          trace.validated = true;
+        if (!page.url().includes("/auth")) {
+          // Do not treat "the URL is not /auth" as authentication. Reuse the
+          // same non-mutating settings probe used by the normal post-login
+          // path; never the full probe (it rotates the session it verifies).
+          const pvRes = await probePageLoggedIn(page, 3000, {
+            nonMutating: true,
+          });
+          trace.validated = pvRes.ok;
+          trace.postValidationReason = pvRes.reason;
+          trace.postValidation.settingsStatus = pvRes.reason.startsWith("settings-")
+            ? pvRes.reason === "settings-401"
+              ? 401
+              : pvRes.reason === "settings-403"
+                ? 403
+                : 200
+            : pvRes.reason === "ok"
+              ? 200
+              : 0;
+          trace.postValidation.settingsAppFail = !pvRes.ok;
+          trace.validation = classifyPostLoginValidation({
+            reason: trace.postValidationReason,
+            settingsStatus: trace.postValidation.settingsStatus,
+            settingsAppFail: trace.postValidation.settingsAppFail,
+          });
           storeTrace();
-          return { success: true };
+          if (trace.validation === "rejected") {
+            return {
+              success: false,
+              validation: "rejected",
+              reason: `post-login fallback validation rejected: ${trace.postValidationReason || "unknown"}`,
+            };
+          }
+          if (trace.validation === "inconclusive") {
+            return {
+              success: false,
+              validation: "inconclusive",
+              reason: `post-login fallback validation inconclusive: ${trace.postValidationReason || "unknown"}`,
+            };
+          }
+          return { success: true, validation: "valid" };
         }
       } catch {}
     }
     console.warn(`⚠️  [Playwright] API login error: ${errMsg}`);
     trace.validated = false;
+    trace.validation = "inconclusive";
     storeTrace();
-    return { success: false, reason: errMsg };
+    return { success: false, validation: "inconclusive", reason: errMsg };
   }
 }
 
@@ -4424,7 +4556,6 @@ export async function captureQwenHeaders(
       if (capturedHeaders["version"]) {
         updateQwenWebVersion(capturedHeaders["version"]);
       }
-      markAccountHeadersReady(accountId);
       cache.lastRefresh = Date.now();
       // Header interception can set challenge/session cookies, so do not reuse
       // a cookie snapshot taken before this browser request.
@@ -4436,28 +4567,43 @@ export async function captureQwenHeaders(
       // durable row; capture only refreshes runtime cache here).
       if (persistSession) {
       try {
-        const { saveAuthSession } = await import("../core/database.ts");
+        const { saveValidatedAuthSession } = await import("../core/database.ts");
         const { parseJwtExpiry } = await import("../utils/jwt.ts");
         const tokenExpiry = parseJwtExpiry(capturedHeaders.cookie);
-        saveAuthSession(accountId, {
-          cookie: capturedHeaders.cookie,
-          userAgent: capturedHeaders["user-agent"],
-          bxV: capturedHeaders["bx-v"],
-          bxUa: capturedHeaders["bx-ua"],
-          bxUmidtoken: capturedHeaders["bx-umidtoken"],
-          secChUa: capturedHeaders["sec-ch-ua"],
-          secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
-          secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
-          version: capturedHeaders["version"],
-          tokenExpiresAt: tokenExpiry || undefined,
-          capturedAt: Date.now(),
-          // Opportunistic: keep the refresh bookkeeping fresh when the
-          // captured jar carries it. Absence keeps the stored value
-          // (saveAuthSession preserves on undefined).
-          refreshToken:
-            getJarPair(capturedHeaders.cookie, "refresh_token") ?? undefined,
-        });
-      } catch {}
+        const saved = saveValidatedAuthSession(
+          accountId,
+          {
+            cookie: capturedHeaders.cookie,
+            userAgent: capturedHeaders["user-agent"],
+            bxV: capturedHeaders["bx-v"],
+            bxUa: capturedHeaders["bx-ua"],
+            bxUmidtoken: capturedHeaders["bx-umidtoken"],
+            secChUa: capturedHeaders["sec-ch-ua"],
+            secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
+            secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
+            version: capturedHeaders["version"],
+            tokenExpiresAt: tokenExpiry || undefined,
+            capturedAt: Date.now(),
+            // Opportunistic: keep the refresh bookkeeping fresh when the
+            // captured jar carries it. Absence keeps the stored value
+            // (saveAuthSession preserves on undefined).
+            refreshToken:
+              getJarPair(capturedHeaders.cookie, "refresh_token") ?? undefined,
+          },
+          "valid",
+        );
+        if (saved.saved) {
+          markAccountHeadersReady(accountId);
+        } else {
+          unmarkAccountHeadersReady(accountId);
+        }
+      } catch {
+        unmarkAccountHeadersReady(accountId);
+      }
+      } else {
+        // Manual verification owns the durable row; capture only refreshes the
+        // runtime cache and is allowed to mark READY without a DB write.
+        markAccountHeadersReady(accountId);
       }
 
       await route.abort("aborted").catch(() => {});
@@ -5080,26 +5226,36 @@ async function refreshHeadersInternal(
           const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
           cache.headers.cookie = cookieStr;
           cache.lastRefresh = Date.now();
-          markAccountHeadersReady(accountId);
           try {
-            const { saveAuthSession } = await import("../core/database.ts");
+            const { saveValidatedAuthSession } = await import("../core/database.ts");
             const tokenCookie = liveCookies.find((c) => c.name === "token");
             const exp = tokenCookie ? parseJwtExpiry(tokenCookie.value) : undefined;
-            saveAuthSession(accountId, {
-              cookie: cookieStr,
-              userAgent: cache.headers["user-agent"] || "",
-              bxV: cache.headers["bx-v"] || "2.5.37",
-              bxUa: cache.headers["bx-ua"] || "",
-              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-              secChUa: cache.headers["sec-ch-ua"] || undefined,
-              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-              version: cache.headers["version"] || undefined,
-              tokenExpiresAt: exp || undefined,
-              capturedAt: Date.now(),
-              refreshToken: getJarPair(cookieStr, "refresh_token") ?? undefined,
-            });
-          } catch {}
+            const saved = saveValidatedAuthSession(
+              accountId,
+              {
+                cookie: cookieStr,
+                userAgent: cache.headers["user-agent"] || "",
+                bxV: cache.headers["bx-v"] || "2.5.37",
+                bxUa: cache.headers["bx-ua"] || "",
+                bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+                secChUa: cache.headers["sec-ch-ua"] || undefined,
+                secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+                secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+                version: cache.headers["version"] || undefined,
+                tokenExpiresAt: exp || undefined,
+                capturedAt: Date.now(),
+                refreshToken: getJarPair(cookieStr, "refresh_token") ?? undefined,
+              },
+              "valid",
+            );
+            if (saved.saved) {
+              markAccountHeadersReady(accountId);
+            } else {
+              unmarkAccountHeadersReady(accountId);
+            }
+          } catch {
+            unmarkAccountHeadersReady(accountId);
+          }
           return;
         }
       }

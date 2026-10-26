@@ -542,6 +542,42 @@ export function hasActiveAccountLease(accountId: string): boolean {
 }
 
 /**
+ * True when the account has an active lease whose label is not `ownerLabel`.
+ * A null/undefined ownerLabel preserves the legacy "any active lease" check.
+ * Read-only: used by auth recovery to avoid blocking on the request's own
+ * lease while still protecting streams owned by other requests.
+ */
+export function hasOtherActiveAccountLease(
+  accountId: string,
+  ownerLabel?: string | null,
+): boolean {
+  const slot = slots.get(accountId);
+  if (!slot || slot.activeLeases.length === 0) return false;
+  if (!ownerLabel) return true;
+  return slot.activeLeases.some((lease) => lease.label !== ownerLabel);
+}
+
+/**
+ * True when the account has an active lease whose unique leaseId is not
+ * `ownerLeaseId`. This is the authentication-recovery ownership check:
+ * session/email labels are shared by design and cannot identify a request.
+ *
+ * Stale leases are swept first; released/aborted leases are already removed
+ * from activeLeases. A null/undefined ownerLeaseId keeps the background
+ * contract: any active lease blocks recovery.
+ */
+export function hasOtherActiveAccountLeaseByLeaseId(
+  accountId: string,
+  ownerLeaseId?: string | null,
+): boolean {
+  sweepStaleLeases(accountId);
+  const slot = slots.get(accountId);
+  if (!slot || slot.activeLeases.length === 0) return false;
+  if (!ownerLeaseId) return true;
+  return slot.activeLeases.some((lease) => lease.leaseId !== ownerLeaseId);
+}
+
+/**
  * Mark an account as temporarily busy (e.g. after chat_in_progress).
  * This is a lightweight hint that prevents immediate re-selection without
  * consuming a lease slot.

@@ -163,12 +163,18 @@ test("B: modern cold account passes the ready gate; legacy-only does not", () =>
 
 // ── C. no password reauth for modern accounts ───────────────────────────────
 
-test("C: modern session revalidation succeeds without legacy login", async () => {
+test("C: modern cold account without page is page-required, no legacy login", async () => {
   const id = seedModern({});
   const ok = await _attemptReloginForTests(id, "modern@example.com");
-  assert.equal(ok, true);
-  // No browser context was created to achieve this.
+  // Phase 2C: freshness alone is not reauth success; no live page means
+  // page-required and the caller must fail over, not retry the same account.
+  assert.equal(ok, false);
   assert.equal(getAccountPageSnapshotHandles(id), null);
+  // Compatibility: callers that only need token freshness keep the boolean.
+  const { revalidateModernAccountSession } = await import(
+    "../services/qwen-account-session.ts"
+  );
+  assert.equal(await revalidateModernAccountSession(id), true);
 });
 
 // ── D. refresh PASS feeds the direct decision ───────────────────────────────

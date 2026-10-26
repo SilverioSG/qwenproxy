@@ -756,7 +756,8 @@ test("manual verification: captureQwenHeaders persistSession=false skips saveAut
   const idx = src.indexOf("if (persistSession) {");
   assert.ok(idx >= 0);
   const block = src.slice(idx, idx + 400);
-  assert.ok(block.includes("saveAuthSession"));
+  // Phase 1 routes confirmed capture persistence through the validated writer.
+  assert.ok(block.includes("saveValidatedAuthSession"));
 });
 
 test("manual verification: chat on background tab still verifies", async () => {

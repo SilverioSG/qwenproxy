@@ -5,6 +5,7 @@ import {
 	getNextAvailableAccount,
 	markAccountRateLimited,
 	syncCooldownsFromDb,
+	unmarkAccountHeadersReady,
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
@@ -432,28 +433,47 @@ function getNextFreeAccountForParallel(
 }
 
 
+interface AttemptReloginResult {
+	ok: boolean;
+	/** True only when the modern session decision was `verified`. */
+	modernVerified: boolean;
+}
+
 async function attemptRelogin(
 	accountId: string,
 	accountEmail: string,
-): Promise<boolean> {
+	ownerLeaseId?: string,
+): Promise<AttemptReloginResult> {
 	// MODERN_AUTH_PRESENT first: an account with usable modern persisted auth
 	// must never run the password-login machinery just because no browser
-	// context exists. Fresh → retry serves it via the cold bridge/direct path;
-	// stale modern material → return false so the request rotates with
-	// classification instead of paying password retries. LEGACY_ONLY accounts
-	// fall through to the existing password path unchanged.
+	// context exists. A fresh JWT is NOT enough: the coordinator classifies the
+	// upstream session and may return verified/rejected/inconclusive/deferred/
+	// page-required. The current request's own lease is excluded by its unique
+	// leaseId; other streams still block, even with the same session/email
+	// label. Only a verified session may continue on the same account;
+	// everything else fails over instead of retrying freshness.
 	try {
-		const { revalidateModernAccountSession } = await import(
+		const { revalidateModernAccountSessionDecision } = await import(
 			"../../services/qwen-account-session.ts"
 		);
-		const modern = await revalidateModernAccountSession(accountId).catch(
-			() => null,
-		);
-		if (modern !== null) {
+		const decision = await revalidateModernAccountSessionDecision(
+			accountId,
+			{ ownerLeaseId },
+		).catch(() => ({ kind: "inconclusive" as const, reason: "revalidation-error" }));
+		if (decision.kind !== "legacy") {
+			if (decision.kind === "rejected") {
+				// Conclusive upstream rejection: remove READY. Inconclusive,
+				// deferred and page-required preserve the previously verified
+				// READY state and the recovery material.
+				unmarkAccountHeadersReady(accountId);
+			}
 			console.warn(
-				`🔄 [Chat] Modern session revalidation for ${maskEmail(accountEmail)} (${accountId.slice(0, 8)}): fresh=${modern}, no legacy login attempted`,
+				`🔄 [Chat] Modern session decision for ${maskEmail(accountEmail)} (${accountId.slice(0, 8)}): ${decision.kind}, no legacy login attempted`,
 			);
-			return modern;
+			return {
+				ok: decision.kind === "verified",
+				modernVerified: decision.kind === "verified",
+			};
 		}
 	} catch {
 		// Fall through to the legacy path.
@@ -463,7 +483,7 @@ async function attemptRelogin(
 		console.log(
 			`✅ [Chat] Playwright headers refreshed for ${maskEmail(accountEmail)}. Retrying...`,
 		);
-		return true;
+		return { ok: true, modernVerified: false };
 	} catch (refreshErr: unknown) {
 		logger.error("[Chat] Playwright header refresh failed", {
 			accountEmail: maskEmail(accountEmail),
@@ -475,14 +495,30 @@ async function attemptRelogin(
 					: typeof refreshErr,
 		});
 	}
-	return false;
+	return { ok: false, modernVerified: false };
 }
 
-/** @internal test seam: modern-first relogin without the request loop. */
-export const _attemptReloginForTests = attemptRelogin;
+/** @internal test seam: boolean view of the modern-first relogin. */
+export const _attemptReloginForTests = async (
+	accountId: string,
+	accountEmail: string,
+	ownerLeaseId?: string,
+): Promise<boolean> =>
+	(await attemptRelogin(accountId, accountEmail, ownerLeaseId)).ok;
+export const _tryCreateStreamWithRetryForTests = tryCreateStreamWithRetry;
+
+/**
+ * Test-only seam for the 401 simulation. Production callers never pass it, so
+ * the real transport and the real retry/relogin path stay unchanged.
+ */
+export interface UpstreamStreamTestDeps {
+	createStreamForAccount?: typeof createStreamForAccount;
+	fetchQwenModels?: typeof fetchQwenModels;
+}
 
 export async function acquireUpstreamStream(
 	params: AcquireParams,
+	testDeps: UpstreamStreamTestDeps = {},
 ): Promise<StreamCreationResult | StreamCreationFailure> {
 	const {
 		finalPrompt,
@@ -765,6 +801,7 @@ export async function acquireUpstreamStream(
 				},
 				accountId,
 				accountEmail,
+				testDeps,
 			);
 
 			if (result.success) {
@@ -1026,6 +1063,34 @@ export function shouldWaitQueueForever(
 	return (isThreadOwnerWaiting && !heldByOtherSession) || !hasFreeAlternate;
 }
 
+/**
+ * Opaque, in-memory fingerprint of the persisted auth material. Never logged.
+ * Used only to distinguish a real refresh (DB row changed) from a settings
+ * probe that merely returned 200 without renewing the transport material.
+ */
+async function authMaterialFingerprint(
+	accountId: string,
+): Promise<string | null> {
+	try {
+		const { getRefreshMaterial } = await import("../../core/database.ts");
+		const material = getRefreshMaterial(accountId);
+		if (!material) return null;
+		return [
+			material.jar,
+			material.userAgent,
+			material.refreshToken ?? "",
+			material.tokenExpiresAtSec == null
+				? ""
+				: String(material.tokenExpiresAtSec),
+		].join("\u0000");
+	} catch {
+		return null;
+	}
+}
+
+/** @internal test seam: material-change detection, no secrets returned/logged. */
+export const _authMaterialFingerprintForTests = authMaterialFingerprint;
+
 async function tryCreateStreamWithRetry(
 	params: {
 		finalPrompt: string;
@@ -1064,7 +1129,10 @@ async function tryCreateStreamWithRetry(
 	},
 	accountId: string,
 	accountEmail: string,
+	testDeps: UpstreamStreamTestDeps = {},
 ): Promise<CreateStreamSuccess | CreateStreamFailure> {
+	const createStream = testDeps.createStreamForAccount ?? createStreamForAccount;
+	const fetchModels = testDeps.fetchQwenModels ?? fetchQwenModels;
 	const maxAttempts = Math.max(1, config.retry.maxAttempts);
 	const maxAccountSwitches = Math.max(0, config.retry.maxAccountSwitches);
 	let attemptsLeft = maxAttempts;
@@ -1074,6 +1142,11 @@ async function tryCreateStreamWithRetry(
 	let accountSwitches = 0;
 	let chatInProgressCount = 0;
 	let chatInProgressEscalated = false;
+	// Per-request/per-account guard for the verified-but-still-401 cycle.
+	// The first valid verification allows one transport retry; a second 401
+	// ends this account attempt without another settings probe/reauth.
+	const validVerified401RetryUsed = new Set<string>();
+	const materialAfterValid401 = new Map<string, string | null>();
 	// Account that accumulated the chat_in_progress failures (the one whose
 	// upstream chat is actually stuck "in progress"). The post-budget
 	// escalation switches to a FRESH chat, and the loop-exit session clear
@@ -1117,7 +1190,7 @@ async function tryCreateStreamWithRetry(
 			// checks use the real context window published by Qwen, not the
 			// conservative registry fallback. The call is cached per account.
 			try {
-				await fetchQwenModels(currentAccountId);
+				await fetchModels(currentAccountId);
 			} catch (metadataError) {
 				logger.warn("[chat] model metadata sync unavailable; using registry fallback", {
 					model: params.contextModelId ?? params.model,
@@ -1417,7 +1490,7 @@ async function tryCreateStreamWithRetry(
 					attemptDeadlineBox.current.extend(acquireDeadlineMs);
 				});
 				result = await Promise.race([
-					runWithLatencyRequest(params.reqId, () => createStreamForAccount({
+					runWithLatencyRequest(params.reqId, () => createStream({
 						prompt: promptForUpstream,
 						isThinkingModel: params.isThinkingModel,
 						model: params.model,
@@ -1656,15 +1729,47 @@ async function tryCreateStreamWithRetry(
 			err instanceof QwenSessionExpiredError ||
 			err.name === "QwenSessionExpiredError"
 		) {
+			const accountKey = currentAccountId;
+			const materialBefore = await authMaterialFingerprint(accountKey);
+
+			if (validVerified401RetryUsed.has(accountKey)) {
+				const verifiedMaterial = materialAfterValid401.get(accountKey) ?? null;
+				const sameMaterial =
+					verifiedMaterial !== null && materialBefore !== null
+						? verifiedMaterial === materialBefore
+						: null;
+				console.warn(
+					`🛑 [Chat] Second upstream 401 after a valid verification | ${currentAccountEmail} (${accountKey.slice(0, 8)}) | same_material=${sameMaterial === null ? "unknown" : sameMaterial} | ending this account attempt for failover`,
+				);
+				return { success: false, error: err };
+			}
+
 			console.warn(
 				`🔄 [Chat] Session expired for ${currentAccountEmail} (${currentAccountId}). Attempting re-login...`,
 			);
-			const reLoginOk = await attemptRelogin(
+			const reLogin = await attemptRelogin(
 				currentAccountId,
 				currentAccountEmail,
+				accountLease?.leaseId,
 			);
-			if (reLoginOk) continue;
-			return { success: false, error: err };
+			if (!reLogin.ok) return { success: false, error: err };
+			if (!reLogin.modernVerified) {
+				// Legacy header refresh keeps its original retry behavior; the
+				// one-retry guard applies only to a modern `verified` decision.
+				continue;
+			}
+
+			const materialAfter = await authMaterialFingerprint(accountKey);
+			const materialChanged =
+				materialBefore !== null && materialAfter !== null
+					? materialBefore !== materialAfter
+					: null;
+			validVerified401RetryUsed.add(accountKey);
+			materialAfterValid401.set(accountKey, materialAfter);
+			console.warn(
+				`🔄 [Chat] Valid session verification allows one retry | ${currentAccountEmail} (${accountKey.slice(0, 8)}) | material_changed=${materialChanged === null ? "unknown" : materialChanged}`,
+			);
+			continue;
 		}
 
 

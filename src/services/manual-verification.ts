@@ -365,8 +365,17 @@ const deps: {
     };
   },
   saveSession: async (accountId, session) => {
-    const { saveAuthSession } = await import("../core/database.ts");
-    saveAuthSession(accountId, { ...session, capturedAt: Date.now() });
+    const { saveValidatedAuthSession } = await import("../core/database.ts");
+    const result = saveValidatedAuthSession(
+      accountId,
+      { ...session, capturedAt: Date.now() },
+      "valid",
+    );
+    if (!result.saved) {
+      throw new Error(
+        `Manual session not persisted: ${result.reason ?? "unknown"}`,
+      );
+    }
   },
   validateLive: async (accountId: string) => {
     // Authoritative check against the OPERATIONAL (headless) context: the

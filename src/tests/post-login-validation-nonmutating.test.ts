@@ -187,8 +187,9 @@ test("G. loginViaApi validates with the non-mutating probe", () => {
   assert.ok(lsWrite > cookie, "LS install must follow cookie install");
   assert.ok(reload > lsWrite, "reload must follow installs");
   assert.ok(validate > reload, "validation must follow reload");
-  // The only non-mutating validation call in the whole file is this one.
-  assert.equal((src.match(/probePageLoggedIn\(page, 3000, \{/g) ?? []).length, 1);
+  // The normal post-login validation and the catch fallback both use the
+  // non-mutating probe; the full probe must never be used for either.
+  assert.equal((src.match(/probePageLoggedIn\(page, 3000, \{/g) ?? []).length, 2);
 });
 
 /** H/I. The probe performs exactly one read and mutates nothing in the page. */
@@ -212,7 +213,9 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
   const prod = src.split("/**")[0] + src; // whole file
   const calls = [...prod.matchAll(/isPageLoggedIn\(\s*[A-Za-z_$][\w$]*\s*(?:,\s*[\d_]+\s*)?\)/g)];
-  assert.ok(calls.length >= 7, `expected the legacy call sites, got ${calls.length}`);
+  // The loginViaApi catch now uses probePageLoggedIn(nonMutating) instead of a
+  // legacy isPageLoggedIn call, so the legacy call-site count drops by one.
+  assert.ok(calls.length >= 6, `expected the legacy call sites, got ${calls.length}`);
   // Only the two post-login confirmations may pass an options object, and both
   // must be non-mutating: loginViaApi's post-install validation and the
   // executeReauth confirmation in refreshHeadersInternal.
