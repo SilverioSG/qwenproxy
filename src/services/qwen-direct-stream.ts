@@ -90,6 +90,55 @@ export function resolveUpstreamModel(model: string): string {
   return model.endsWith("-fast") ? model.slice(0, -5) : model;
 }
 
+/**
+ * Qwen answers `200 application/json` with this payload when the `version`
+ * header no longer matches the deployed web bundle:
+ *   {"success":false,"data":{"code":"Bad_Request","details":"Internal error..."}}
+ * Narrow on purpose: other 200+JSON failures must keep their existing handling.
+ */
+export function isStaleVersionBadRequest(body: string | null | undefined): boolean {
+  if (!body) return false;
+  return /Bad_Request/i.test(body) && /internal error/i.test(body);
+}
+
+export interface VersionHealDeps {
+  /** Current version value used by the attempt. */
+  getVersion: () => Promise<string | null>;
+  /** Force one shared discovery probe and return the (possibly updated) value. */
+  refreshVersion: () => Promise<string | null>;
+  log?: (message: string) => void;
+}
+
+/**
+ * Single stale-`version` self-heal, mirroring the proven Qwen-Free-Api flow.
+ *
+ * Runs the attempt; on the exact Bad_Request signature it forces ONE shared
+ * version probe and retries the SAME attempt once — only if the version
+ * actually changed. It never rotates accounts, never replays context and
+ * never refreshes twice for the same failure: the caller keeps ownership of
+ * failover, so this is purely a header refresh.
+ */
+export async function attemptWithVersionHeal<
+  T extends { ok: boolean; waf: boolean; challengeBody?: string | null },
+>(attempt: () => Promise<T>, deps: VersionHealDeps): Promise<T> {
+  const first = await attempt();
+  if (first.ok || first.waf || !isStaleVersionBadRequest(first.challengeBody)) {
+    return first;
+  }
+  const before = await deps.getVersion();
+  const after = await deps.refreshVersion();
+  if (!after || after === before) {
+    deps.log?.(
+      `[Version] Bad_Request with Version=${before ?? "-"} — no newer version available; failing as before`,
+    );
+    return first;
+  }
+  deps.log?.(
+    `[Version] Bad_Request with Version=${before ?? "-"} — refreshed to ${after}; retrying once`,
+  );
+  return attempt();
+}
+
 /** Thrown when the caller must fall back to the legacy transport. */
 export class DirectTransportUnsupported extends Error {
   readonly reason: string;
@@ -200,7 +249,9 @@ export async function createDirectAccountStream(
     throw new SharedWafCircuitError(signature, wafCircuitTtlRemainingMs());
   }
 
-  const version = await getDirectBundleVersion().catch(() => null);
+  const version0 = await getDirectBundleVersion().catch(() => null);
+  // Mutable: the stale-version self-heal updates it before the single retry.
+  let version = version0;
   // "local" is the upstream ephemeral chat mode; every other ChatMode value
   // maps to a normal (threaded) upstream chat.
   // Same mapping the legacy transport uses (qwen.ts:4562).
@@ -255,7 +306,22 @@ export async function createDirectAccountStream(
   let cookie = session.cookieHeader;
   let chatId = await createLeg(cookie);
   if (!chatId) throw new DirectTransportUnsupported("create-chat-failed");
-  let result = await completeLeg(cookie, chatId);
+  const firstChatId = chatId;
+  // One header-only self-heal: same chat, same account, at most one retry.
+  let result = await attemptWithVersionHeal(
+    () => completeLeg(cookie, firstChatId),
+    {
+      getVersion: async () => version,
+      refreshVersion: async () => {
+        const next = await getDirectBundleVersion({ force: true }).catch(
+          () => null,
+        );
+        if (next) version = next;
+        return version;
+      },
+      log: (message) => console.warn(message),
+    },
+  );
 
   // ── At most ONE captcha recovery, always on a BRAND NEW chat ───────
   // Human mode waits for a person (headed/interactive). Headless production

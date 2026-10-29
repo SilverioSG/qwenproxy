@@ -88,10 +88,18 @@ test("policy: a second transport-level recovery stays forbidden", () => {
     2,
     "exactly two create legs: original + one post-solve retry",
   );
+  // Two syntactic completion sites: the first leg (wrapped by the bounded
+  // version self-heal, which adds at most one retry at runtime) and the single
+  // post-solve retry. The `const completeLeg = (...)` definition does not match
+  // `completeLeg(`, so this counts call sites only. No attempt loop exists.
   assert.equal(
-    (src.match(/= await completeLeg\(/g) ?? []).length,
+    (src.match(/completeLeg\(/g) ?? []).length,
     2,
-    "exactly two completion attempts, never more",
+    "two bounded completion call sites, never a loop",
+  );
+  assert.ok(
+    (src.match(/attemptWithVersionHeal\(/g) ?? []).length === 1,
+    "the version self-heal is used exactly once",
   );
   assert.ok(!/for\s*\(.*attempt/.test(src), "no attempt loop in the transport");
   assert.ok(!/while\s*\(true\)/.test(src), "no unbounded loop in the transport");

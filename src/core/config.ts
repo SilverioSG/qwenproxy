@@ -14,6 +14,23 @@ if (!isRunningUnderNodeTest()) {
   }
 }
 
+/**
+ * Last known good chat.qwen.ai web bundle version.
+ *
+ * Used as the fallback when AUTO discovery fails, so a transient scrape error
+ * never degrades the header below the last value we know the upstream accepted.
+ */
+const DEFAULT_WEB_VERSION = "0.2.91";
+
+/**
+ * `QWEN_WEB_VERSION` accepts a literal version (manual pin) or `auto`
+ * (discover from the public bundle, cached). Empty/unset means AUTO.
+ */
+export function isAutoWebVersion(value?: string | null): boolean {
+  const v = (value ?? "").trim().toLowerCase();
+  return v.length === 0 || v === "auto";
+}
+
 const envSchema = z
   .object({
     PORT: z
@@ -32,10 +49,10 @@ const envSchema = z
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       ),
     QWEN_BX_V: z.string().default("2.5.37"),
-    // Version header on Qwen API requests = the deployed web bundle version
-    // (fallback when dynamic DOM detection is not yet completed).
-    // Override via env when Qwen ships a new bundle.
-    QWEN_WEB_VERSION: z.string().default("0.2.91"),
+    // Version header on Qwen API requests = the deployed web bundle version.
+    // `auto` (default) discovers it from the public bundle with a 30 min cache;
+    // a literal value pins it and skips discovery entirely.
+    QWEN_WEB_VERSION: z.string().default("auto"),
     // Controls bx-ua/bx-umidtoken injection on the GENERAL API paths
     // (chats/new, settings): those work without them (live-probed). The
     // completions path is the exception — the 0.2.86 HAR shows the real
@@ -415,7 +432,11 @@ export const config = {
     ),
     sendBxUa: env.QWEN_SEND_BX_UA === "true",
     /** Deployed web bundle version sent as the `version` API header. */
-    webVersion: env.QWEN_WEB_VERSION,
+    webVersion: isAutoWebVersion(env.QWEN_WEB_VERSION)
+      ? DEFAULT_WEB_VERSION
+      : env.QWEN_WEB_VERSION.trim(),
+    /** True when QWEN_WEB_VERSION is `auto` (discover) rather than pinned. */
+    webVersionAuto: isAutoWebVersion(env.QWEN_WEB_VERSION),
   },
   contextMeter: {
     enabled: env.CONTEXT_METER_ENABLED === "true",
