@@ -11,7 +11,7 @@ import {
   UpstreamRateLimit,
   ClientAbortedError,
 } from "../core/errors.ts";
-import { buildQwenRequestHeaders } from "./qwen-headers.ts";
+import { buildQwenRequestHeaders, getQwenWebVersion } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
 import { setCookiePairInJar } from "./qwen-token-refresh.ts";
@@ -2210,7 +2210,7 @@ export async function requestQwenTextInBrowser(
               const refreshVersion =
                 headers["version"] && headers["version"].length > 0
                   ? headers["version"]
-                  : "0.3.11";
+                  : "0.3.26";
               let rid = "";
               try {
                 rid =
@@ -3839,7 +3839,7 @@ export async function deleteSingleQwenChat(
 
   const requestHeaders: Record<string, string> = {
     source: "web",
-    version: "0.2.89",
+    version: getQwenWebVersion() || "0.3.26",
     timezone: new Date().toString().split(" (")[0],
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
@@ -3892,7 +3892,7 @@ export async function fetchRemoteQwenChats(
   }
 
   const requestHeaders: Record<string, string> = {
-    version: "0.2.89",
+    version: getQwenWebVersion() || "0.3.26",
     timezone: new Date().toString().split(" (")[0],
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl("/settings/chats"),

@@ -214,7 +214,7 @@ test("2/3/4: expired token + material → refresh ok, keeps refresh + jar", asyn
   assert.equal(seen[0].init.body, undefined);
   assert.equal(headers.get("source"), "web");
   assert.equal(headers.get("x-request-origin"), "https://chat.qwen.ai");
-  assert.equal(headers.get("Version"), "0.3.11");
+  assert.equal(headers.get("Version"), "0.3.26");
   assert.ok((headers.get("X-Request-Id") ?? "").length >= 8);
   assert.ok((headers.get("Timezone") ?? "").length > 0);
   assert.equal(headers.get("accept"), "application/json, text/plain, */*");

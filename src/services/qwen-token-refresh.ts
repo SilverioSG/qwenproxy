@@ -30,6 +30,7 @@
 
 import { randomUUID } from "node:crypto";
 import { config } from "../core/config.ts";
+import { getQwenWebVersion } from "./qwen-headers.ts";
 import { parseJwtExpiry } from "../utils/jwt.ts";
 import {
   classifyPostLoginValidation,
@@ -38,8 +39,8 @@ import {
 
 /** Validated refresh endpoint. */
 export const QWEN_REFRESH_URL = "https://auth.qwen.ai/api/v2/auths/refresh";
-/** Web bundle version the refresh contract was validated with. */
-export const QWEN_REFRESH_VERSION = "0.3.11";
+/** Web bundle version the refresh contract was validated with (fallback). */
+export const QWEN_REFRESH_VERSION = "0.3.26";
 /**
  * How close to expiry (ms) an access token may be before it counts as
  * needing a refresh. 5 min covers slow upstream round-trips AND matches the
@@ -274,7 +275,7 @@ export async function refreshWithJar(
         accept: "application/json, text/plain, */*",
         source: "web",
         "x-request-origin": "https://chat.qwen.ai",
-        Version: QWEN_REFRESH_VERSION,
+        Version: getQwenWebVersion() || QWEN_REFRESH_VERSION,
         "X-Request-Id": randomUUID(),
         Timezone: timezoneString(),
         origin: "https://chat.qwen.ai",

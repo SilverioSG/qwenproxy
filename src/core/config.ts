@@ -20,7 +20,7 @@ if (!isRunningUnderNodeTest()) {
  * Used as the fallback when AUTO discovery fails, so a transient scrape error
  * never degrades the header below the last value we know the upstream accepted.
  */
-const DEFAULT_WEB_VERSION = "0.2.91";
+const DEFAULT_WEB_VERSION = "0.3.26";
 
 /**
  * `QWEN_WEB_VERSION` accepts a literal version (manual pin) or `auto`
