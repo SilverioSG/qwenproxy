@@ -41,6 +41,7 @@
  */
 
 import { config } from "../core/config.ts";
+import { isRunningUnderNodeTest } from "../core/paths.ts";
 import {
   getDefaultQwenUserAgent,
   getQwenWebVersion,
@@ -206,6 +207,66 @@ export async function getDirectBundleVersion(
 }
 
 /**
+ * Fetch the public homepage over plain HTTP. Some networks get the Aliyun JS
+ * challenge here instead of the app shell, so the caller falls back to curl.
+ */
+async function fetchHomepageHtml(): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(qwenUrl("/"), {
+        headers: {
+          "User-Agent": getDirectUserAgent(),
+          Accept: "text/html,application/xhtml+xml",
+        },
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      return await res.text();
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Second discovery attempt using the system curl binary.
+ *
+ * Node's fetch/undici fingerprint is answered with the Aliyun JS challenge
+ * (`<body onload="check()">`) on this host, while curl receives the real app
+ * shell containing the bundle path. No new npm dependency: if curl is absent
+ * the probe simply fails and the last known good version is preserved.
+ */
+async function fetchHomepageViaCurl(): Promise<string | null> {
+  // Deterministic tests: never spawn a real network process.
+  if (isRunningUnderNodeTest()) return null;
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      "curl",
+      [
+        "-sS",
+        "-L",
+        "--max-time",
+        "10",
+        "-A",
+        getDirectUserAgent(),
+        qwenUrl("/"),
+      ],
+      { maxBuffer: 4 * 1024 * 1024, timeout: 12_000 },
+    );
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Shared frontend-version discovery (AUTO mode).
  *
  * Mirrors the proven Qwen-Free-Api flow: scrape the homepage bundle path,
@@ -228,37 +289,33 @@ export async function getFrontendVersion(
   if (!versionInflight) {
     versionInflight = (async (): Promise<string | null> => {
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
-        try {
-          const res = await fetch(qwenUrl("/"), {
-            headers: {
-              "User-Agent": getDirectUserAgent(),
-              Accept: "text/html,application/xhtml+xml",
-            },
-            signal: controller.signal,
-          });
-          const html = await res.text();
-          const found = extractFrontendVersion(html);
-          if (found) {
-            const previous = versionCache;
-            if (previous !== found) {
-              console.log(
-                previous
-                  ? `[Version] Frontend updated: ${previous} → ${found}`
-                  : `[Version] Resolved frontend version: ${found}`,
-              );
-            }
-            versionCache = found;
-            updateQwenWebVersion(found);
-            return found;
-          }
-        } finally {
-          clearTimeout(timer);
+        const direct = await fetchHomepageHtml();
+        let found = direct ? extractFrontendVersion(direct) : null;
+        let source = "http";
+        if (!found) {
+          const viaCurl = await fetchHomepageViaCurl();
+          found = viaCurl ? extractFrontendVersion(viaCurl) : null;
+          source = "curl";
         }
-      } catch {
+        if (found) {
+          const previous = versionCache;
+          if (previous !== found) {
+            console.log(
+              previous
+                ? `[Version] Frontend updated: ${previous} → ${found} (${source})`
+                : `[Version] Resolved frontend version: ${found} (${source})`,
+            );
+          }
+          versionCache = found;
+          updateQwenWebVersion(found);
+          return found;
+        }
         console.warn(
-          `[Version] Frontend version scrape failed — keeping ${versionCache || getQwenWebVersion()}`,
+          `[Version] Frontend version not found — keeping ${versionCache || getQwenWebVersion()}`,
+        );
+      } catch (err) {
+        console.warn(
+          `[Version] Frontend version scrape failed (${err instanceof Error ? err.message : String(err)}) — keeping ${versionCache || getQwenWebVersion()}`,
         );
       } finally {
         versionCheckedAt = Date.now();
