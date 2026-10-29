@@ -128,12 +128,14 @@ const inScope = (accountId: string) => ({
 
 // ── A. dispatch: cold modern account -> direct without the flag ─────────────
 
-test("A: in-scope request on a cold modern account uses the direct path", async () => {
+test("A: with the flag off, a cold modern account is NOT selected for direct", async () => {
   const id = seedModern({});
   assert.equal(hasUsableModernPersistedAuth(id), true);
+  // The transport flag is the single switch: modern persisted auth no longer
+  // bypasses it, so this request is owned by the legacy transport.
   assert.deepEqual(shouldUseDirectTransport(inScope(id)), {
-    use: true,
-    reason: "modern-persisted",
+    use: false,
+    reason: "flag-disabled",
   });
   // The cold bridge serves it with no live page.
   assert.equal(getAccountPageSnapshotHandles(id), null);
@@ -179,7 +181,7 @@ test("C: modern cold account without page is page-required, no legacy login", as
 
 // ── D. refresh PASS feeds the direct decision ───────────────────────────────
 
-test("D: rotated fresh token keeps the direct path", async () => {
+test("D: rotated fresh token still does not bypass the transport flag", async () => {
   const fresh = makeJwt(Math.floor(Date.now() / 1000) + 900);
   const id = seedModern({ expSec: Math.floor(Date.now() / 1000) - 3600 });
   let calls = 0;
@@ -193,8 +195,8 @@ test("D: rotated fresh token keeps the direct path", async () => {
   assert.ok(state);
   assert.equal(state!.bearerToken, fresh);
   assert.deepEqual(shouldUseDirectTransport(inScope(id)), {
-    use: true,
-    reason: "modern-persisted",
+    use: false,
+    reason: "flag-disabled",
   });
 });
 
