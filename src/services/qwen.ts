@@ -1919,7 +1919,7 @@ export interface BrowserAuthDiag {
   /** Outgoing bearer vs live token: true/false, or null when incomparable. */
   authMatchesLive: boolean | null;
   /** Which credential won: live token, cookies only, post-heal, or none. */
-  authSource: "live" | "cookie-only" | "healed" | "none";
+  authSource: "live" | "cookie-only" | "persisted" | "healed" | "none";
   /** True when this request matched a cookie-only chat route. */
   cookieOnlyRoute: boolean;
   /** Explicit Authorization actually sent on the effective request. */
@@ -2078,6 +2078,19 @@ export async function requestQwenTextInBrowser(
   }
 
   const browserHeaders = getBrowserFetchHeaders(headers);
+  // /api/v2/chats/new is cookie-only for the reference client, but the live
+  // jar can hold a stale/rotated token. The persisted Bearer is the credential
+  // the upstream accepts (the same one DirectTransport sends), so resolve it
+  // here — outside the page — and let the callback attach it. Every other
+  // route keeps its current behavior untouched.
+  let chatNewBearer: string | null = null;
+  if (path.includes("/api/v2/chats/new")) {
+    try {
+      chatNewBearer = getPersistedBearerToken(accountId)?.token ?? null;
+    } catch {
+      chatNewBearer = null;
+    }
+  }
   if (
     body !== undefined &&
     !Object.keys(browserHeaders).some(
@@ -2089,13 +2102,14 @@ export async function requestQwenTextInBrowser(
 
   const evaluateRequest = (page: Page) =>
     page.evaluate(
-      async ({ url, method, headers, body, referrer, timeoutMs }: {
+      async ({ url, method, headers, body, referrer, timeoutMs, authBearer }: {
         url: string;
         method: "GET" | "POST" | "DELETE";
         headers: Record<string, string>;
         body?: string;
         referrer?: string;
         timeoutMs: number;
+        authBearer: string | null;
       }): Promise<BrowserTextResponse & { diag: BrowserAuthDiag }> => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -2134,8 +2148,8 @@ export async function requestQwenTextInBrowser(
           // explicit Authorization; credentials:include + live browser
           // cookies govern. All other routes keep current behavior.
           const cookieOnlyRoute =
-            url.includes("/api/v2/chats/new") ||
-            url.includes("/api/v2/users/user/settings");
+            url.includes("/api/v2/users/user/settings") ||
+            (url.includes("/api/v2/chats/new") && !authBearer);
           diag.cookieOnlyRoute = cookieOnlyRoute;
           const effHeaders: Record<string, string> = { ...headers };
           const hadCachedAuth = Boolean(
@@ -2145,6 +2159,10 @@ export async function requestQwenTextInBrowser(
             delete effHeaders["authorization"];
             delete effHeaders["Authorization"];
             diag.authSource = hadCachedAuth ? "cookie-only" : "none";
+          } else if (authBearer) {
+            effHeaders["authorization"] = `Bearer ${authBearer}`;
+            effHeaders["Authorization"] = `Bearer ${authBearer}`;
+            diag.authSource = "persisted";
           } else if (liveToken) {
             effHeaders["authorization"] = `Bearer ${liveToken}`;
             effHeaders["Authorization"] = `Bearer ${liveToken}`;
@@ -2322,6 +2340,7 @@ export async function requestQwenTextInBrowser(
         body,
         referrer: options.referrer,
         timeoutMs: options.timeoutMs ?? Math.min(config.timeouts.page, 20_000),
+        authBearer: chatNewBearer,
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
@@ -4310,7 +4329,8 @@ export function buildCompletionHeaders(
  * DirectTransport proves the working pair every round: persisted Bearer +
  * configured bundle version. Apply exactly that pair here:
  *
- * - `version` is always the configured chat-completions version;
+ * - `version` is always the AUTO-effective chat-completions version
+ *   (`getQwenWebVersion()`: browser/curl-discovered value, static fallback);
  * - when a usable persisted Bearer exists, both `Authorization` and the
  *   jar's `token` pair carry it (pair coherence: a mismatched Bearer/cookie
  *   pair is rejected even when each is individually valid);
@@ -4323,7 +4343,7 @@ function alignLegacyCompletionAuth(
   base: Record<string, string>,
   accountId?: string,
 ): void {
-  base["version"] = config.qwen.webVersion;
+  base["version"] = getQwenWebVersion();
   if (!accountId) return;
   let bearer = "";
   try {

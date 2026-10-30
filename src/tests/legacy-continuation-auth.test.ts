@@ -5,8 +5,8 @@
  * - a legacy completion for an account with a usable persisted Bearer sends
  *   `Authorization` from that Bearer (not from a stale cached token cookie)
  *   and the jar's `token` pair aligned to it (pair coherence);
- * - `version` is always the configured chat-completions version (0.2.91),
- *   never a row value like 0.3.11/0.3.12 (proven live to 401 completions);
+ * - `version` is always the AUTO-effective chat-completions version
+ *   (`getQwenWebVersion()`), never a row value like 0.3.11/0.3.12;
  * - without usable persisted material the previous mechanism stands
  *   (Bearer synthesized from the jar);
  * - the direct transport and the thread-reuse routing are untouched.
@@ -18,12 +18,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { config } from "../core/config.ts";
 import {
   deleteAuthSession,
   saveAuthSession,
 } from "../core/database.ts";
 import { buildCompletionHeaders } from "../services/qwen.ts";
+import {
+  _resetQwenWebVersionForTests,
+  getQwenWebVersion,
+  updateQwenWebVersion,
+} from "../services/qwen-headers.ts";
 import {
   buildDirectQwenHeaders,
 } from "../services/qwen-direct-transport.ts";
@@ -77,8 +81,8 @@ test("legacy continuation uses the persisted Bearer, aligns the pair, pins versi
     const out = buildCompletionHeaders(legacyInput(), "chat-abc123", id);
     // Authorization from the persisted modern Bearer, not the stale cookie.
     assert.equal(out["Authorization"], `Bearer ${PERSISTED_BEARER}`);
-    // Version pinned to the configured chat-completions version.
-    assert.equal(out["version"], config.qwen.webVersion);
+    // Version is the AUTO-effective one, never the stale row value.
+    assert.equal(out["version"], getQwenWebVersion());
     assert.notEqual(out["version"], "0.3.11");
     // Jar pair aligned (coherence), other cookies preserved.
     assert.ok(out["Cookie"].includes(`token=${PERSISTED_BEARER}`));
@@ -96,7 +100,7 @@ test("row version 0.3.12 is equally ignored on legacy continuation", () => {
   try {
     const out = buildCompletionHeaders(legacyInput(), "chat-abc123", id);
     assert.equal(out["Authorization"], `Bearer ${PERSISTED_BEARER}`);
-    assert.equal(out["version"], config.qwen.webVersion);
+    assert.equal(out["version"], getQwenWebVersion());
     assert.notEqual(out["version"], "0.3.12");
   } finally {
     cleanup(id);
@@ -145,4 +149,19 @@ test("thread-reuse routing unchanged: continuation still goes legacy", () => {
   );
   // Fresh chats stay in scope (no routing change for the direct path).
   assert.equal(directTransportScopeReason(base), null);
+});
+
+// ── AUTO version reaches the relay ─────────────────────────────────────────
+
+test("legacy continuation uses the AUTO-discovered version", () => {
+  const id = "fixc-acc-auto";
+  seedModern(id, "0.3.11");
+  try {
+    updateQwenWebVersion("0.3.27");
+    const out = buildCompletionHeaders(legacyInput(), "chat-abc123", id);
+    assert.equal(out["version"], "0.3.27");
+  } finally {
+    _resetQwenWebVersionForTests();
+    cleanup(id);
+  }
 });

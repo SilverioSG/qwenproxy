@@ -1,7 +1,7 @@
 /**
  * Normal-request modern-auth integration (FASE 7):
  *
- * A. normal request + cold modern persisted account -> direct path, no browser
+ * A. normal request + cold modern persisted account -> legacy unless the flag is on
  * B. modern persisted account passes the runtime eligibility gate without
  *    legacy headersReady
  * C. modern persisted account never enters password reauth for lack of browser
@@ -18,6 +18,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
+import { config } from "../core/config.ts";
 import {
   deleteAuthSession,
   hasUsableModernPersistedAuth,
@@ -126,14 +127,14 @@ const inScope = (accountId: string) => ({
   existingChatSessionId: null,
 });
 
-// ── A. dispatch: cold modern account -> direct without the flag ─────────────
+// ── A. dispatch: flag off -> legacy even for a cold modern account ──────────
 
-test("A: in-scope request on a cold modern account uses the direct path", async () => {
+test("A: in-scope request on a cold modern account stays on legacy without the flag", async () => {
   const id = seedModern({});
   assert.equal(hasUsableModernPersistedAuth(id), true);
   assert.deepEqual(shouldUseDirectTransport(inScope(id)), {
-    use: true,
-    reason: "modern-persisted",
+    use: false,
+    reason: "flag-disabled",
   });
   // The cold bridge serves it with no live page.
   assert.equal(getAccountPageSnapshotHandles(id), null);
@@ -179,7 +180,7 @@ test("C: modern cold account without page is page-required, no legacy login", as
 
 // ── D. refresh PASS feeds the direct decision ───────────────────────────────
 
-test("D: rotated fresh token keeps the direct path", async () => {
+test("D: rotated fresh token still stays on legacy without the flag", async () => {
   const fresh = makeJwt(Math.floor(Date.now() / 1000) + 900);
   const id = seedModern({ expSec: Math.floor(Date.now() / 1000) - 3600 });
   let calls = 0;
@@ -193,9 +194,25 @@ test("D: rotated fresh token keeps the direct path", async () => {
   assert.ok(state);
   assert.equal(state!.bearerToken, fresh);
   assert.deepEqual(shouldUseDirectTransport(inScope(id)), {
-    use: true,
-    reason: "modern-persisted",
+    use: false,
+    reason: "flag-disabled",
   });
+});
+
+// ── M. flag on: the direct path is restored ────────────────────────────────
+
+test("M: QWEN_DIRECT_WEB_TRANSPORT=true selects the direct path", () => {
+  const id = seedModern({});
+  const previous = config.qwen.directWebTransport;
+  try {
+    config.qwen.directWebTransport = true;
+    assert.deepEqual(shouldUseDirectTransport(inScope(id)), {
+      use: true,
+      reason: "in-scope",
+    });
+  } finally {
+    config.qwen.directWebTransport = previous;
+  }
 });
 
 // ── E. revoked/expired modern auth classifies without password ──────────────

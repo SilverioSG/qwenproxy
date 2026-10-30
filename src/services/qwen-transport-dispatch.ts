@@ -4,12 +4,9 @@
  * Chooses between the two proven transports WITHOUT changing any caller:
  *
  *   QWEN_DIRECT_WEB_TRANSPORT=false (default)
- *     -> legacy `createQwenStream` (browser page, composer, header capture).
- *        Behaviour is byte-for-byte what it was before this module existed,
- *        EXCEPT for in-scope requests on accounts with usable modern persisted
- *        auth (MODERN_PERSISTED_ACCOUNT_DIRECT_PATH): those go direct from
- *        ensureAccountFresh + the cold persisted bridge, with no browser.
- *        Legacy-only accounts are untouched.
+ *     -> legacy `createQwenStream` for EVERY request, including accounts with
+ *        usable modern persisted auth. The flag is the single switch: there is
+ *        no implicit direct path for modern-persisted accounts.
  *
  *   QWEN_DIRECT_WEB_TRANSPORT=true
  *     -> direct HTTP account transport (Bearer + live cookie jar incl. the
@@ -25,7 +22,6 @@
  */
 
 import { config, type ChatMode } from "../core/config.ts";
-import { hasUsableModernPersistedAuth } from "../core/database.ts";
 import type { QwenFileEntry } from "./qwen.ts";
 
 export interface DispatchArgs {
@@ -95,13 +91,8 @@ export function shouldUseDirectTransport(args: {
   if (config.qwen.directWebTransport) {
     return { use: true, reason: "in-scope" };
   }
-  // MODERN_PERSISTED_ACCOUNT_DIRECT_PATH: without the global flag, an
-  // in-scope request on an account with usable modern persisted auth still
-  // goes direct — it is served from ensureAccountFresh + the cold persisted
-  // bridge with no browser. Legacy-only accounts keep the legacy transport.
-  if (args.accountId && hasUsableModernPersistedAuth(args.accountId)) {
-    return { use: true, reason: "modern-persisted" };
-  }
+  // The flag is the single switch. When it is false, NOTHING goes direct —
+  // including accounts with usable modern persisted auth.
   return { use: false, reason: "flag-disabled" };
 }
 
