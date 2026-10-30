@@ -30,6 +30,7 @@
 
 import { randomUUID } from "node:crypto";
 import { config } from "../core/config.ts";
+import { setAccountAuthState } from "../core/accounts.ts";
 import { getQwenWebVersion } from "./qwen-headers.ts";
 import { parseJwtExpiry } from "../utils/jwt.ts";
 import {
@@ -438,6 +439,12 @@ export async function tryRefreshToken(
   console.log(
     `[AuthRefresh] ok | account=${accountId.slice(0, 8)} | source=${source} | access=${out.access.length} chars${out.rotated ? " | refresh rotated" : " | refresh kept"}`,
   );
+  // A validated renewal re-admits an account that a previous 401 had rejected.
+  try {
+    setAccountAuthState(accountId, "valid");
+  } catch {
+    // State bookkeeping must never break a successful refresh.
+  }
   return { ok: true, rotated: out.rotated };
 }
 

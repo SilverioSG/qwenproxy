@@ -6,6 +6,7 @@ import {
   computeQuotaCooldownMs,
   markAccountRateLimited,
 } from "../core/account-manager.ts";
+import { setAccountAuthState } from "../core/accounts.ts";
 import { mapClientModelToQwen } from "../core/model-alias.ts";
 import { qwenUrl } from "./qwen-url.ts";
 import { QwenUpstreamError } from "./qwen-errors.ts";
@@ -110,6 +111,15 @@ async function createQwenChatSession(
     noteUpstreamAuthResult(accountId, "create-chat", 200, false, snap);
   } catch {
     // Tracing must never break flows.
+  }
+  // A create-chat that reaches here is an authenticated account: re-admit it
+  // even if an earlier attempt had marked it rejected.
+  if (accountId) {
+    try {
+      setAccountAuthState(accountId, "valid");
+    } catch {
+      // State bookkeeping must never break a successful create.
+    }
   }
   return chatId;
 }

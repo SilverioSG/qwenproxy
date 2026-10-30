@@ -187,6 +187,14 @@ function runMigrations(db: Database.Database): void {
   } catch (err) {
     if (!isDuplicateColumnError(err)) throw err;
   }
+  // Persistent authentication state (AuthValidationState). Unlike a cooldown,
+  // it does not expire on its own: a rejected account stays out of the picker
+  // until a later login/refresh/create validates it again.
+  try {
+    db.exec(`ALTER TABLE accounts ADD COLUMN auth_state TEXT;`);
+  } catch (err) {
+    if (!isDuplicateColumnError(err)) throw err;
+  }
 
   // qwen_auth_sessions columns migration
   const authSessionCols = [

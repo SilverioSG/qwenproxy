@@ -13,6 +13,12 @@ export interface QwenAccount {
   password: string;
   cooldown_until?: number;
   cooldown_reason?: string | null;
+  /**
+   * Persistent authentication state (AuthValidationState). `rejected` keeps the
+   * account out of the picker until a later login/refresh/create validates it;
+   * it is NOT a cooldown and does not expire by itself.
+   */
+  auth_state?: "valid" | "rejected" | "inconclusive" | null;
 }
 
 export function isPlaceholderAccountEmail(email: string, password?: string): boolean {
@@ -156,7 +162,7 @@ function getCachedAccounts(): QwenAccount[] {
   const db = getDatabase();
   const rows = db
     .prepare(
-      "SELECT id, email, password, cooldown_until, cooldown_reason FROM accounts ORDER BY created_at ASC",
+      "SELECT id, email, password, cooldown_until, cooldown_reason, auth_state FROM accounts ORDER BY created_at ASC",
     )
     .all() as QwenAccount[];
 
@@ -458,4 +464,33 @@ export function updateAccountCooldown(
     "UPDATE accounts SET cooldown_until = ?, cooldown_reason = ? WHERE id = ?",
   ).run(cooldownUntil, reason, id);
   invalidateAccountsCache();
+}
+
+/**
+ * Persist an account's authentication state.
+ *
+ * `rejected` removes the account from selection without a cooldown; `valid`
+ * re-admits it after a successful login, refresh or create-chat.
+ */
+export function setAccountAuthState(
+  id: string,
+  state: "valid" | "rejected" | "inconclusive",
+): void {
+  const db = getDatabase();
+  db.prepare(
+    "UPDATE accounts SET auth_state = ?, updated_at = datetime('now') WHERE id = ?",
+  ).run(state, id);
+  invalidateAccountsCache();
+}
+
+export function getAccountAuthState(
+  id: string,
+): "valid" | "rejected" | "inconclusive" | null {
+  const account = getCachedAccounts().find((a) => a.id === id);
+  return (account?.auth_state as
+    | "valid"
+    | "rejected"
+    | "inconclusive"
+    | null
+    | undefined) ?? null;
 }
