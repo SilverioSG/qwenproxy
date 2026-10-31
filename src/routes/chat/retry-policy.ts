@@ -532,12 +532,22 @@ export function classifyRetryAction(
   // Park the failing account with PersonalizationFailed cooldown so it does
   // not enter an infinite ping-pong loop when multiple accounts fail.
   if (err instanceof PersonalizationSyncError) {
+    // Personalization failures are heterogeneous: an expired session/401 is a
+    // confirmed auth failure (mark rejected), while a page crash or a
+    // navigation failure is infrastructure and must NOT reject the account.
+    const message = String((err as Error).message || "").toLowerCase();
+    const authFailure =
+      /session expired|re-authentication failed|unauthorized|\b401\b/.test(
+        message,
+      );
     return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryAfterMs: baseDelayMs,
       accountCooldownMs: config.concurrency.initFailureCooldownMs,
-      accountCooldownReason: "PersonalizationFailed",
+      accountCooldownReason: authFailure
+        ? "AuthInitFailed"
+        : "PersonalizationFailed",
     });
   }
 

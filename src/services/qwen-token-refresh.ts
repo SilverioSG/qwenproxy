@@ -31,7 +31,7 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../core/config.ts";
 import { setAccountAuthState } from "../core/accounts.ts";
-import { getQwenWebVersion } from "./qwen-headers.ts";
+import { getDefaultQwenUserAgent, getQwenWebVersion } from "./qwen-headers.ts";
 import { parseJwtExpiry } from "../utils/jwt.ts";
 import {
   classifyPostLoginValidation,
@@ -336,6 +336,132 @@ export async function refreshWithJar(
 }
 
 /**
+ * Args for the in-page refresh call. The endpoint only accepts the real web
+ * client: GET, credentials:include and the SPA interceptor headers. A
+ * Node/undici request is WAF-blocked with HTTP 405 HTML.
+ */
+export function buildRefreshPageArgs(
+  version: string,
+  requestId: string,
+): { url: string; headers: Record<string, string> } {
+  return {
+    url: QWEN_REFRESH_URL,
+    headers: {
+      accept: "application/json, text/plain, */*",
+      source: "web",
+      version,
+      "x-request-origin": "https://chat.qwen.ai",
+      "x-request-id": requestId,
+      timezone: new Date().toString().split(" (")[0],
+    },
+  };
+}
+
+/**
+ * In-page renewal on the account's EXISTING Chromium page. No profile is
+ * opened here: without a warm page the caller falls back to the persisted
+ * path (which is what the single-flight/persist contract expects).
+ */
+async function refreshViaLivePage(
+  accountId: string,
+  previousRefresh: string | null,
+  userAgent: string,
+): Promise<RefreshResult | null> {
+  try {
+    const { getAccountPageSnapshotHandles } = await import("./playwright.ts");
+    const handles = getAccountPageSnapshotHandles(accountId);
+    const page = handles?.page as
+      | {
+          isClosed: () => boolean;
+          evaluate: (
+            fn: (arg: {
+              url: string;
+              headers: Record<string, string>;
+            }) => Promise<{ status: number; token: string }>,
+            arg: { url: string; headers: Record<string, string> },
+          ) => Promise<{ status: number; token: string }>;
+          context: () => {
+            cookies: () => Promise<
+              Array<{
+                name: string;
+                value: string;
+                domain: string;
+                expires: number;
+              }>
+            >;
+          };
+        }
+      | undefined;
+    if (!page || page.isClosed()) return null;
+    const version = getQwenWebVersion();
+    const args = buildRefreshPageArgs(
+      version,
+      Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2),
+    );
+    const result = await page.evaluate(
+      async ({ url, headers }: { url: string; headers: Record<string, string> }) => {
+        try {
+          const res = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            headers,
+            signal: AbortSignal.timeout(10_000),
+          });
+          const text = await res.text();
+          let json: any = null;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = null;
+          }
+          const token =
+            json?.data?.access_token ||
+            json?.data?.token ||
+            json?.access_token ||
+            json?.token ||
+            "";
+          return { status: res.status, token: typeof token === "string" ? token : "" };
+        } catch {
+          return { status: 0, token: "" };
+        }
+      },
+      args,
+    );
+    if (result.status !== 200 || !result.token) return null;
+    const cookies = await page.context().cookies();
+    const qwenCookies = cookies.filter(
+      (c) =>
+        c.domain === "chat.qwen.ai" ||
+        c.domain === ".qwen.ai" ||
+        c.domain.endsWith(".qwen.ai"),
+    );
+    const parts = qwenCookies
+      .map((c) => `${c.name}=${c.value}`)
+      .filter((p) => !p.startsWith("token="));
+    parts.push(`token=${result.token}`);
+    const rt = qwenCookies.find((c) => c.name === "refresh_token");
+    const { saveAuthSession } = await import("../core/database.ts");
+    saveAuthSession(accountId, {
+      cookie: parts.join("; "),
+      userAgent: userAgent || getDefaultQwenUserAgent(),
+      bxV: "2.5.37",
+      version,
+      capturedAt: Date.now(),
+      tokenExpiresAt: parseJwtExpiry(result.token) || 0,
+      refreshToken: rt?.value ?? previousRefresh,
+      refreshExpiresAt:
+        rt?.expires && rt.expires > 0 ? Math.floor(rt.expires) : undefined,
+    });
+    console.log(
+      `[AuthRefresh] ok | account=${accountId.slice(0, 8)} | source=page | access=${result.token.length} chars | refresh kept`,
+    );
+    return { ok: true, rotated: false };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Renew one account's persisted session without opening any browser profile.
  * Material source: the LIVE jar when the account has a warm context (it is
  * the freshest — in-page heals rotate cookies without persisting to SQLite
@@ -389,6 +515,15 @@ export async function tryRefreshToken(
   }
   const previousRefresh =
     material.refreshToken ?? getJarPair(material.jar, "refresh_token");
+
+  // In-page first: the real web client refreshes from the browser context
+  // with its interceptor headers. Node/undici gets 405 HTML from the WAF.
+  const viaPage = await refreshViaLivePage(
+    accountId,
+    previousRefresh,
+    material.userAgent,
+  );
+  if (viaPage) return viaPage;
 
   const out = await refreshWithJar(
     material.jar,

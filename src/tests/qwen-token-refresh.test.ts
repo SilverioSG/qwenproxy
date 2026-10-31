@@ -290,9 +290,10 @@ test("6: concurrent ensureAccountFresh shares one refresh", async () => {
 
 test("7: refresh path never touches the browser", async () => {
   // Static guarantee: the refresh module must not statically import any
-  // browser layer, open profiles, or close browsers. The single dynamic
-  // import("./playwright.ts") is the best-effort in-memory cache push (no
-  // profile open, no navigation) — allowed, everything else is forbidden.
+  // browser layer, open profiles, or close browsers. The dynamic
+  // import("./playwright.ts") bridges are limited to the live-jar observe,
+  // the in-memory cache push and the in-page refresh (no profile open, no
+  // navigation) — everything else is forbidden.
   const src = fs.readFileSync(
     path.resolve("src/services/qwen-token-refresh.ts"),
     "utf-8",
@@ -305,8 +306,8 @@ test("7: refresh path never touches the browser", async () => {
   const dynamicUses = (src.match(/import\("\.\/playwright\.ts"\)/g) ?? []).length;
   assert.equal(
     dynamicUses,
-    2,
-    "only the live-jar observe + cache-push bridges may touch playwright",
+    3,
+    "only the live-jar observe, cache-push and in-page refresh bridges may touch playwright",
   );
 
   // Behavioral: an expired session renews with zero browser state involved.
