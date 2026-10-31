@@ -12,6 +12,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { chromium, type BrowserContext, type Page } from "patchright";
 
@@ -652,16 +653,38 @@ function logEvent(
   }
 }
 
-function singletonLockPresent(profileDir: string): boolean {
-  for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
-    try {
-      fs.lstatSync(path.join(profileDir, name));
-      return true;
-    } catch {
-      continue;
-    }
+/**
+ * Chromium ProcessSingleton (Linux) semantics: the ownership marker is the
+ * `SingletonLock` symlink whose target is "<hostname>-<pid>". `SingletonSocket`
+ * and `SingletonCookie` are auxiliary IPC files; their mere existence does NOT
+ * mean the profile is in use (they routinely outlive a crashed/closed browser).
+ *
+ * A lock is treated as held only when it was created by THIS host and the
+ * target PID is alive (EPERM still means the process exists). A lock from
+ * another host or with a dead PID is stale and must not block the visible
+ * launch; Chromium itself takes such locks over.
+ */
+export function singletonLockPresent(profileDir: string): boolean {
+  const lockPath = path.join(profileDir, "SingletonLock");
+  let target: string;
+  try {
+    target = fs.readlinkSync(lockPath);
+  } catch {
+    return false;
   }
-  return false;
+  const sep = target.lastIndexOf("-");
+  if (sep <= 0) return false;
+  const host = target.slice(0, sep);
+  const pid = Number(target.slice(sep + 1));
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (host !== os.hostname()) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but belongs to another user -> still held.
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
 }
 
 async function closeVisible(
