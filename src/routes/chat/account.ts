@@ -287,7 +287,13 @@ export function resolveInitialAccount(
 			const preferred = configuredAccounts.find(
 				(candidate) => candidate.id === preferredAccountId,
 			);
-			if (preferred && !getAccountCooldownInfo(preferred.id)) {
+			// Sticky affinity must not resurrect an account whose authentication
+			// was confirmed rejected. Fall through to the normal picker instead.
+			if (
+				preferred &&
+				preferred.auth_state !== "rejected" &&
+				!getAccountCooldownInfo(preferred.id)
+			) {
 				return { account: preferred, configuredAccounts };
 			}
 			// Preferred is missing/on cooldown: fall through to next available.

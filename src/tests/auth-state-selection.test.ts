@@ -19,6 +19,7 @@ import {
   getNextAvailableAccount,
   markAccountRateLimited,
 } from "../core/account-manager.ts";
+import { resolveInitialAccount } from "../routes/chat/account.ts";
 
 const created: string[] = [];
 
@@ -85,4 +86,24 @@ test("an auth failure marks rejected and a valid peer stays selectable", () => {
   markAccountRateLimited(bad.id, 300_000, "AuthInitFailed");
   assert.equal(getAccountAuthState(bad.id), "rejected");
   assert.equal(getNextAvailableAccount(only(good.id))?.id, good.id);
+});
+
+test("sticky preferred account cannot be a rejected account", () => {
+  const preferred = mk("sticky-rejected");
+  const fallback = mk("sticky-fallback");
+  setAccountAuthState(preferred.id, "rejected");
+  setAccountAuthState(fallback.id, "valid");
+  clearAccountCooldown(preferred.id);
+  const resolved = resolveInitialAccount(preferred.id);
+  assert.notEqual(resolved.account.id, preferred.id);
+  assert.notEqual(getAccountAuthState(resolved.account.id), "rejected");
+});
+
+test("sticky affinity is preserved for a valid preferred account", () => {
+  const preferred = mk("sticky-valid");
+  const other = mk("sticky-other");
+  setAccountAuthState(preferred.id, "valid");
+  setAccountAuthState(other.id, "valid");
+  const resolved = resolveInitialAccount(preferred.id);
+  assert.equal(resolved.account.id, preferred.id);
 });
