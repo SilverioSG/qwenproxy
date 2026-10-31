@@ -66,7 +66,7 @@ export function markAccountRateLimited(
   if (
     accountId !== "global" &&
     (cooldownReason === "AuthInitFailed" ||
-      cooldownReason === "AuthPermanentFailure")
+      cooldownReason.startsWith("AuthPermanentFailure"))
   ) {
     try {
       setAccountAuthState(accountId, "rejected");

@@ -80,6 +80,7 @@ import {
 	isAntiBotError as isAntiBotPolicyError,
 	isAccountInitializationError,
 	isChatInProgressError,
+	isConfirmedAuthError,
 	isQuotaLikeError,
 	isTerminalLocalError,
 	shouldRetryInvalidInputOnSameAccount,
@@ -2025,6 +2026,16 @@ async function tryCreateStreamWithRetry(
 			console.warn(
 				`⚠️  [Chat] No other account available after ${policy.reason} | Retrying on same account`,
 			);
+			// A confirmed auth failure must never be retried on the same
+			// account: there is no alternative and the credentials are dead.
+			// Fail fast instead of repeating the login cycle.
+			if (
+				policy.reason === "account_initialization_failed" &&
+				isConfirmedAuthError(err)
+			) {
+				policy.retryable = false;
+				attemptsLeft = 0;
+			}
 		}
 
 		// Force new chat / full context when policy requests it (invalid_input, chat gone, etc.)

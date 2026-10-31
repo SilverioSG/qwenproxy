@@ -226,6 +226,22 @@ export function shouldRetryChatInProgressOnSameAccount(
   return reason === "chat_in_progress" && alreadyRetriedCount < 3;
 }
 
+/**
+ * Confirmed credential/session failure (NOT infrastructure). Only these mark
+ * the account auth_state=rejected; page crashes/navigation/init timeouts do not.
+ */
+export function isConfirmedAuthError(err: unknown): boolean {
+  const message = errMessage(err).toLowerCase();
+  const code = errCode(err).toLowerCase();
+  return (
+    (message.includes("session expired") &&
+      message.includes("re-authentication failed")) ||
+    message.includes("authpermanentfailure") ||
+    code === "authpermanentfailure" ||
+    code === "unauthorized"
+  );
+}
+
 export function isAccountInitializationError(err: unknown): boolean {
   const message = errMessage(err).toLowerCase();
   const code = errCode(err).toLowerCase();
@@ -506,12 +522,26 @@ export function classifyRetryAction(
 
   const message = errMessage(err).toLowerCase();
   const code = errCode(err).toLowerCase();
+  // Confirmed credential/session failure: switch accounts and mark the
+  // account rejected. This must win over the generic init branch below.
+  if (isConfirmedAuthError(err)) {
+    return makeRetryAction("account_initialization_failed", {
+      switchAccount: true,
+      forceNewChat: true,
+      retryWithFullPrompt: true,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "AuthInitFailed",
+    });
+  }
   if (isAccountInitializationError(err)) {
     return makeRetryAction("account_initialization_failed", {
       switchAccount: true,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
       accountCooldownMs: config.concurrency.initFailureCooldownMs,
-      accountCooldownReason: "AuthInitFailed",
+      // Infrastructure/init failure: cool down but do NOT mark credentials
+      // invalid (page unavailable/timeout/navigation are not auth failures).
+      accountCooldownReason: "InitFailed",
     });
   }
 
