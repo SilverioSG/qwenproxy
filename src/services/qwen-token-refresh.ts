@@ -373,13 +373,7 @@ async function refreshViaLivePage(
     const page = handles?.page as
       | {
           isClosed: () => boolean;
-          evaluate: (
-            fn: (arg: {
-              url: string;
-              headers: Record<string, string>;
-            }) => Promise<{ status: number; token: string }>,
-            arg: { url: string; headers: Record<string, string> },
-          ) => Promise<{ status: number; token: string }>;
+          evaluate: (fn: (arg: any) => Promise<any>, arg?: any) => Promise<any>;
           context: () => {
             cookies: () => Promise<
               Array<{
@@ -389,6 +383,7 @@ async function refreshViaLivePage(
                 expires: number;
               }>
             >;
+            addCookies: (cookies: any[]) => Promise<void>;
           };
         }
       | undefined;
@@ -440,6 +435,35 @@ async function refreshViaLivePage(
       .filter((p) => !p.startsWith("token="));
     parts.push(`token=${result.token}`);
     const rt = qwenCookies.find((c) => c.name === "refresh_token");
+    // Pair coherence: the in-page relay cannot set the Cookie header, so the
+    // browser's `token` cookie must carry the SAME value as the Bearer we
+    // persist. Otherwise the upstream rejects the mismatched pair with 401.
+    try {
+      await page.context().addCookies([
+        {
+          name: "token",
+          value: result.token,
+          domain: ".qwen.ai",
+          path: "/",
+          expires: Math.floor(Date.now() / 1000) + 31_536_000,
+          httpOnly: false,
+          secure: true,
+          sameSite: "Lax",
+        },
+      ]);
+    } catch {
+      // Best effort: the persisted jar is still coherent on its own.
+    }
+    try {
+      await page.evaluate(async (tok: string) => {
+        try {
+          localStorage.setItem("token", tok);
+          document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+        } catch {}
+      }, result.token);
+    } catch {
+      // Best effort: the context cookie above is the authoritative pair.
+    }
     const { saveAuthSession } = await import("../core/database.ts");
     saveAuthSession(accountId, {
       cookie: parts.join("; "),
