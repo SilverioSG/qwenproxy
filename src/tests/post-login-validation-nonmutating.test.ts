@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import { probePageLoggedIn } from "../services/playwright.ts";
+import { classifyPostLoginValidation } from "../services/auth-contract.ts";
 
 interface Call {
   url: string;
@@ -215,7 +216,9 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   const calls = [...prod.matchAll(/isPageLoggedIn\(\s*[A-Za-z_$][\w$]*\s*(?:,\s*[\d_]+\s*)?\)/g)];
   // The loginViaApi catch now uses probePageLoggedIn(nonMutating) instead of a
   // legacy isPageLoggedIn call, so the legacy call-site count drops by one.
-  assert.ok(calls.length >= 6, `expected the legacy call sites, got ${calls.length}`);
+  // The two startup-validation checks are now explicitly non-mutating (L);
+  // the remaining legacy callers keep the full probe.
+  assert.ok(calls.length >= 4, `expected the remaining legacy call sites, got ${calls.length}`);
   // Only the two post-login confirmations may pass an options object, and both
   // must be non-mutating: loginViaApi's post-install validation and the
   // executeReauth confirmation in refreshHeadersInternal.
@@ -238,6 +241,35 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   const probe = prod.slice(start, end);
   assert.ok(probe.includes('fetch("/api/v1/auths/"'), "full probe must keep auths");
   assert.ok(probe.includes("auth.qwen.ai/api/v2/auths/refresh"), "full probe must keep refresh");
+});
+
+/** An expired session is a conclusive rejection, not an inconclusive probe. */
+test("K. expired session (settings 401) is rejected", async () => {
+  const page = makePage({ responses: { [SETTINGS]: { status: 401, body: null } } });
+  const r = await probePageLoggedIn(page as never, 3000, { nonMutating: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "settings-401");
+  assert.equal(classifyPostLoginValidation({ reason: r.reason }), "rejected");
+});
+
+/** Startup/background post-login confirmations must not use the mutating probe. */
+test("L. startup/background post-login checks are non-mutating", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  const matches = [
+    ...src.matchAll(
+      /isPageLoggedIn\(acctPage,\s*[\d_]+,\s*\{\s*nonMutating:\s*true,?\s*\}\)/g,
+    ),
+  ];
+  assert.ok(
+    matches.length >= 2,
+    `expected >=2 non-mutating acctPage checks, got ${matches.length}`,
+  );
+});
+
+/** The login trace must be attributable to the account, never "undefined". */
+test("M. loginViaApi receives the accountId for diagnostics", () => {
+  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
+  assert.match(src, /loginViaApi\(page,\s*email,\s*password,\s*accountId\)/);
 });
 
 /** The post-validation invariant is recorded as a tripwire, never a gate. */

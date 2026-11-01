@@ -5,7 +5,12 @@ process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "qwenproxy-test-key";
 const originalQwenAccounts = process.env.QWEN_ACCOUNTS;
 delete process.env.QWEN_ACCOUNTS;
 
-import { loadAccounts, invalidateAccountsCache } from "../core/accounts.ts";
+import {
+  getAccountAuthState,
+  loadAccounts,
+  invalidateAccountsCache,
+  setAccountAuthState,
+} from "../core/accounts.ts";
 import { closeDatabase, getDatabase } from "../core/database.ts";
 import {
   clearAccountCooldown,
@@ -851,6 +856,54 @@ test("manual verification: visible snapshot without usable cookies → failed, n
   await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
   assert.equal(await waitForState("failed"), "failed");
   assert.deepEqual(calls.clearedCooldown, []);
+});
+
+test("manual verification: settings 401 keeps rejected (no early valid)", async () => {
+  setAccountAuthState(TEST_ID, "rejected");
+  const { emit } = installHarness({
+    loggedIn: false,
+    persist: { validateStatus: 401 },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.equal(getAccountAuthState(TEST_ID), "rejected");
+});
+
+test("manual verification: settings 403 keeps rejected (no early valid)", async () => {
+  setAccountAuthState(TEST_ID, "rejected");
+  const { emit } = installHarness({
+    loggedIn: false,
+    persist: { validateStatus: 403 },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.equal(getAccountAuthState(TEST_ID), "rejected");
+});
+
+test("manual verification: pre 200 + post 401 keeps rejected (no early valid)", async () => {
+  setAccountAuthState(TEST_ID, "rejected");
+  const { emit } = installHarness({
+    loggedIn: false,
+    persist: { validateSequence: [200, 401] },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.equal(getAccountAuthState(TEST_ID), "rejected");
+});
+
+test("manual verification: rejected → valid only after all validations pass", async () => {
+  setAccountAuthState(TEST_ID, "rejected");
+  const { emit } = installHarness({
+    loggedIn: false,
+    persist: { initialCapturedAt: Date.now() - 7200000, validateStatus: 200 },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("verified"), "verified");
+  assert.equal(getAccountAuthState(TEST_ID), "valid");
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

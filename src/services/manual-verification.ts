@@ -1186,13 +1186,6 @@ async function completeSuccess(
     );
     return false;
   }
-  // A manually validated session re-admits the account into the picker.
-  try {
-    const { setAccountAuthState } = await import("../core/accounts.ts");
-    setAccountAuthState(accountId, "valid");
-  } catch {
-    // State bookkeeping must never downgrade a verified session.
-  }
   // Only now release the visible window: the fresh row is already durable,
   // so headless init restores the NEW auth instead of the old one.
   if (visible) {
@@ -1285,6 +1278,14 @@ async function completeSuccess(
   }
   // 7. Cooldown cleared ONLY after validated fresh auth.
   await deps.clearCooldown(accountId);
+  // Re-admit the account only after every post-capture validation passed.
+  // A failed verification must never rehabilitate a rejected account.
+  try {
+    const { setAccountAuthState } = await import("../core/accounts.ts");
+    setAccountAuthState(accountId, "valid");
+  } catch {
+    // State bookkeeping must never downgrade a verified session.
+  }
   void traceLsCheckpoint(accountId, "manual-verify-success-end").catch(() => {});
   finishOnEntry(
     entry,

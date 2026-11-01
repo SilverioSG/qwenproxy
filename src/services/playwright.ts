@@ -2453,14 +2453,21 @@ export async function initPlaywrightForAccount(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          const loggedIn = await isPageLoggedIn(acctPage);
+          const loggedIn = await isPageLoggedIn(acctPage, 5000, {
+            nonMutating: true,
+          });
           if (!loggedIn) {
             if (account.email && account.password) {
               console.warn(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
               const ok = await loginToQwen(account.id, account.email, account.password, "startup-validation");
-              if (!ok || !(await isPageLoggedIn(acctPage))) {
+              if (
+                !ok ||
+                !(await isPageLoggedIn(acctPage, 5000, {
+                  nonMutating: true,
+                }))
+              ) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
                 );
@@ -2852,7 +2859,7 @@ async function loginToQwenInner(
     }
 
     // Try API login first
-    const apiResult = await loginViaApi(page, email, password);
+    const apiResult = await loginViaApi(page, email, password, accountId);
     if (apiResult.validation && apiResult.validation !== "valid") {
       // Conclusive rejection or an inconclusive probe must not fall through to
       // the UI login path or persist a confirmed session.
