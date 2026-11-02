@@ -121,7 +121,7 @@ test("legacy chats/new keeps cookie-only when no persisted Bearer exists", async
   }
 });
 
-test("settings keeps cookie-only (no persisted Bearer injected)", async () => {
+test("settings sends the persisted Bearer before localStorage hydration", async () => {
   const id = "legacy-create-auth-3";
   seed(id);
   registerPlaywrightAccountForTests(id, fakePage() as never, Date.now());
@@ -135,7 +135,7 @@ test("settings keeps cookie-only (no persisted Bearer injected)", async () => {
       undefined,
     );
     assert.equal(res.status, 200);
-    assert.equal(sentAuth(), undefined);
+    assert.equal(sentAuth(), `Bearer ${PERSISTED}`);
   } finally {
     unregisterPlaywrightAccountForTests(id);
     deleteAuthSession(id);

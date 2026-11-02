@@ -2075,17 +2075,17 @@ export async function requestQwenTextInBrowser(
   }
 
   const browserHeaders = getBrowserFetchHeaders(headers);
-  // /api/v2/chats/new is cookie-only for the reference client, but the live
-  // jar can hold a stale/rotated token. The persisted Bearer is the credential
-  // the upstream accepts (the same one DirectTransport sends), so resolve it
-  // here — outside the page — and let the callback attach it. Every other
-  // route keeps its current behavior untouched.
-  let chatNewBearer: string | null = null;
-  if (path.includes("/api/v2/chats/new")) {
+  // A restored context can reach settings before the SPA hydrates localStorage.
+  // Reuse the current persisted Bearer (expiry checked by the existing getter)
+  // for that read, just as create-chat already does. Empty/transient page state
+  // must not discard the fresh credential captured from the authenticated SPA.
+  let persistedBearer: string | null = null;
+  if (path.includes("/api/v2/chats/new") ||
+      (method === "GET" && path.split("?")[0] === "/api/v2/users/user/settings")) {
     try {
-      chatNewBearer = getPersistedBearerToken(accountId)?.token ?? null;
+      persistedBearer = getPersistedBearerToken(accountId)?.token ?? null;
     } catch {
-      chatNewBearer = null;
+      persistedBearer = null;
     }
   }
   if (
@@ -2155,11 +2155,11 @@ export async function requestQwenTextInBrowser(
             delete effHeaders["Authorization"];
             diag.authSource = hadCachedAuth ? "cookie-only" : "none";
           } else if (authBearer) {
-            effHeaders["authorization"] = `Bearer ${authBearer}`;
+            delete effHeaders["authorization"];
             effHeaders["Authorization"] = `Bearer ${authBearer}`;
             diag.authSource = "persisted";
           } else if (liveToken) {
-            effHeaders["authorization"] = `Bearer ${liveToken}`;
+            delete effHeaders["authorization"];
             effHeaders["Authorization"] = `Bearer ${liveToken}`;
             diag.authSource = "live";
           } else {
@@ -2271,7 +2271,7 @@ export async function requestQwenTextInBrowser(
                   document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
                   diag.refreshUpdatedCookie = true;
                   if (!cookieOnlyRoute) {
-                    effHeaders["authorization"] = `Bearer ${freshTok}`;
+                    delete effHeaders["authorization"];
                     effHeaders["Authorization"] = `Bearer ${freshTok}`;
                     diag.refreshUpdatedAuth = true;
                     diag.authSource = "healed";
@@ -2335,7 +2335,7 @@ export async function requestQwenTextInBrowser(
         body,
         referrer: options.referrer,
         timeoutMs: options.timeoutMs ?? Math.min(config.timeouts.page, 20_000),
-        authBearer: chatNewBearer,
+        authBearer: persistedBearer,
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
