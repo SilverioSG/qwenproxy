@@ -182,6 +182,7 @@ function anyUsableAccountHeadersReady(
 ): boolean {
   return accounts.some(
     (a) =>
+      a.auth_state !== "rejected" &&
       (!triedSet || !triedSet.has(a.id)) &&
       !isAccountOnCooldown(a.id) &&
       isAccountHeadersReady(a.id),
@@ -242,6 +243,7 @@ export function getNextAccount(): QwenAccount | null {
     const account = prioritized[currentIndex % prioritized.length];
     currentIndex = (currentIndex + 1) % prioritized.length;
     if (
+      account.auth_state !== "rejected" &&
       !isAccountOnCooldown(account.id) &&
       passesHeadersReadyGate(account.id, anyReady)
     ) {
@@ -253,6 +255,7 @@ export function getNextAccount(): QwenAccount | null {
   let best: QwenAccount | null = null;
   let bestRemaining = Infinity;
   for (const account of prioritized) {
+    if (account.auth_state === "rejected") continue;
     const info = getAccountCooldownInfo(account.id);
     if (info && info.remainingMs < bestRemaining) {
       bestRemaining = info.remainingMs;

@@ -244,6 +244,7 @@ ${sidebarHtml("accounts")}
               <tr>
                 <th>Account</th>
                 <th>Status</th>
+                <th>Auth</th>
                 <th>Cooldown</th>
                 <th>In Flight</th>
                 <th>Headers</th>

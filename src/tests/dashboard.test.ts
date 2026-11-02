@@ -336,7 +336,7 @@ test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveC
     unregisterPlaywrightAccountForTests,
   } = await import("../services/playwright.ts");
   const { getDatabase } = await import("../core/database.ts");
-  const { invalidateAccountsCache } = await import("../core/accounts.ts");
+  const { invalidateAccountsCache, setAccountAuthState } = await import("../core/accounts.ts");
 
   const db = getDatabase();
   const ids = {
@@ -344,6 +344,7 @@ test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveC
     warmingCtx: "semantic-warming-ctx",
     standby: "semantic-standby",
     cooldown: "semantic-cooldown",
+    rejected: "semantic-rejected",
   };
   const insert = db.prepare(
     "INSERT OR REPLACE INTO accounts (id, email, password) VALUES (?, ?, ?)",
@@ -352,6 +353,9 @@ test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveC
   insert.run(ids.warmingCtx, "warming-ctx@example.com", "x");
   insert.run(ids.standby, "standby@example.com", "x");
   insert.run(ids.cooldown, "cooldown@example.com", "x");
+  insert.run(ids.rejected, "rejected@example.com", "x");
+  setAccountAuthState(ids.standby, "valid");
+  setAccountAuthState(ids.rejected, "rejected");
   invalidateAccountsCache();
 
   const stubPage = {
@@ -389,18 +393,31 @@ test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveC
     assert.equal(standbyAcc.hasActiveContext, false, "standby: no context");
     assert.equal(standbyAcc.ready, false, "standby: not ready");
     assert.equal(standbyAcc.cooldown, false);
-    assert.equal(standbyAcc.available, true, "standby: available = !cooldown");
+    assert.equal(standbyAcc.available, true, "valid standby: available");
+    assert.equal(standbyAcc.eligible, true, "valid standby: eligible");
+    assert.equal(standbyAcc.authState, "valid");
 
     const cooldownAcc = byId.get(ids.cooldown)!;
     assert.equal(cooldownAcc.cooldown, true, "cooldown: on cooldown");
     assert.equal(cooldownAcc.available, false, "cooldown: available = false");
     assert.equal(cooldownAcc.ready, false, "cooldown: not ready");
 
-    for (const a of [readyAcc, warmingAcc, standbyAcc, cooldownAcc]) {
+    const rejectedAcc = byId.get(ids.rejected)!;
+    assert.equal(rejectedAcc.authState, "rejected");
+    assert.equal(rejectedAcc.cooldown, false, "rejected: no cooldown");
+    assert.equal(rejectedAcc.operationalAvailable, true, "rejected: operational");
+    assert.equal(rejectedAcc.eligible, false, "rejected: not eligible");
+    assert.equal(rejectedAcc.available, false, "rejected: not available");
+
+    for (const a of [readyAcc, warmingAcc, standbyAcc, cooldownAcc, rejectedAcc]) {
       for (const key of [
         "id",
         "email",
+        "authState",
         "ready",
+        "operationalReady",
+        "eligible",
+        "operationalAvailable",
         "available",
         "headersReady",
         "hasActiveContext",

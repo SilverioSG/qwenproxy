@@ -18,7 +18,7 @@ import {
 } from "../../core/waf-circuit.ts";
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
-import { ClientAbortedError, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
+import { ClientAbortedError, ServiceUnavailable, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
 import {
   assertPromptWithinLimits,
   truncatePromptToIntelligentLimit,
@@ -191,6 +191,8 @@ export interface SelectedAccount {
 	id: string;
 	email: string;
 	password: string;
+	/** Persisted auth eligibility; optional for lightweight test doubles. */
+	auth_state?: "valid" | "rejected" | "inconclusive" | null;
 }
 
 export interface StreamCreationResult {
@@ -198,6 +200,8 @@ export interface StreamCreationResult {
 	uiSessionId: string;
 	activeAccountId: string;
 	activeAccountLabel: string;
+	/** Every account actually attempted for this logical request (outer + inner switches). */
+	attemptedAccountIds: string[];
 	/** True when the request resent the FULL prompt on a new upstream chat
 	 * (account switch / missing thread parent). The 📤 log line uses this to
 	 * show the real payload instead of the thread-native delta. */
@@ -214,6 +218,8 @@ export interface StreamCreationFailure {
 	completionId: string;
 	allOnCooldown: boolean;
 	retryAfterMs?: number;
+	/** Accounts attempted before the failure (pre-stream attribution). */
+	attemptedAccountIds?: string[];
 }
 
 export interface AcquireParams {
@@ -309,8 +315,11 @@ export function resolveInitialAccount(
 
 		const account = getNextAccount();
 		if (!account) {
-			// All accounts on cooldown; caller will handle this.
-			return { account: configuredAccounts[0], configuredAccounts };
+			// All accounts are rejected or on cooldown: fail controlled instead
+			// of resurrecting a rejected account via the old [0] fallback.
+			throw new ServiceUnavailable(
+				"No eligible Qwen account: all configured accounts are rejected or on cooldown",
+			);
 		}
 		return { account, configuredAccounts };
 	}
@@ -400,6 +409,7 @@ function hasFreeAlternateAccount(
 ): boolean {
 	return accounts.some(
 		(candidate) =>
+			candidate.auth_state !== "rejected" &&
 			candidate.id !== currentAccountId &&
 			!triedAccountIds.has(candidate.id) &&
 			!getAccountCooldownInfo(candidate.id) &&
@@ -426,6 +436,7 @@ function getNextFreeAccountForParallel(
 	const ordered = getAccountsByPriority(accounts);
 	const free = ordered.find(
 		(c) =>
+			c.auth_state !== "rejected" &&
 			c.id !== currentAccountId &&
 			!triedAccountIds.has(c.id) &&
 			!getAccountCooldownInfo(c.id) &&
@@ -825,6 +836,9 @@ export async function acquireUpstreamStream(
 					uiSessionId: result.uiSessionId,
 					activeAccountId: result.accountId,
 					activeAccountLabel: result.accountEmail,
+					attemptedAccountIds: [
+						...new Set([...triedAccountIds, ...(result.attemptedAccountIds ?? [])]),
+					],
 					replayedFullContext: mustReplayFullContext,
 					completionId,
 					logicalSessionId:
@@ -982,6 +996,7 @@ export async function acquireUpstreamStream(
 				completionId,
 				allOnCooldown: true,
 				retryAfterMs,
+				attemptedAccountIds: [...triedAccountIds],
 			};
 		}
 	}
@@ -995,6 +1010,7 @@ export async function acquireUpstreamStream(
 			error: busyOrCooldownError,
 			completionId,
 			allOnCooldown: false,
+			attemptedAccountIds: [...triedAccountIds],
 		};
 	}
 
@@ -1002,6 +1018,12 @@ export async function acquireUpstreamStream(
 		error: lastError,
 		completionId,
 		allOnCooldown: false,
+		attemptedAccountIds: [
+			...new Set([
+				...triedAccountIds,
+				...((lastError as any)?.attemptedAccountIds ?? []),
+			]),
+		],
 	};
 }
 
@@ -1010,6 +1032,7 @@ interface CreateStreamSuccess {
 	stream: ReadableStream;
 	uiSessionId: string;
 	accountId: string;
+	attemptedAccountIds: string[];
 	/** Account email that actually served the request (inner rotation may
 	 * switch accounts — parallel escape / other retry policies). */
 	accountEmail: string;
@@ -1023,6 +1046,7 @@ interface CreateStreamSuccess {
 interface CreateStreamFailure {
 	success: false;
 	error: any;
+	attemptedAccountIds?: string[];
 }
 
 /**
@@ -1168,6 +1192,11 @@ async function tryCreateStreamWithRetry(
 	let currentAccountId = accountId;
 	let currentAccountEmail = accountEmail;
 	const triedAccounts = new Set<string>([accountId]);
+	const fail = (err: any): CreateStreamFailure => ({
+		success: false,
+		error: err,
+		attemptedAccountIds: Array.from(triedAccounts),
+	});
 
 	while (attemptsLeft > 0) {
 		attempt++;
@@ -1680,6 +1709,7 @@ async function tryCreateStreamWithRetry(
 				success: true,
 				...result,
 				accountEmail: currentAccountEmail,
+				attemptedAccountIds: Array.from(triedAccounts),
 				releaseAccountLease: accountLease.release,
 			};
 		} catch (err: any) {
@@ -1703,7 +1733,7 @@ async function tryCreateStreamWithRetry(
 		// Once the client request is aborted, do not rotate accounts or retry. The
 		// old request can otherwise keep acquiring leases after the client is gone.
 		if (params.requestSignal?.aborted) {
-			return { success: false, error: err };
+			return fail(err);
 		}
 
 		// Log the error details for debugging (skip quota errors — logged separately below,
@@ -1726,10 +1756,7 @@ async function tryCreateStreamWithRetry(
 
 
 		if (!err) {
-			return {
-				success: false,
-				error: new Error("Failed to create Qwen stream"),
-			};
+			return fail(new Error("Failed to create Qwen stream"));
 		}
 
 		if (
@@ -1748,7 +1775,7 @@ async function tryCreateStreamWithRetry(
 				console.warn(
 					`🛑 [Chat] Second upstream 401 after a valid verification | ${currentAccountEmail} (${accountKey.slice(0, 8)}) | same_material=${sameMaterial === null ? "unknown" : sameMaterial} | ending this account attempt for failover`,
 				);
-				return { success: false, error: err };
+				return fail(err);
 			}
 
 			console.warn(
@@ -1759,7 +1786,7 @@ async function tryCreateStreamWithRetry(
 				currentAccountEmail,
 				accountLease?.leaseId,
 			);
-			if (!reLogin.ok) return { success: false, error: err };
+			if (!reLogin.ok) return fail(err);
 			if (!reLogin.modernVerified) {
 				// Legacy header refresh keeps its original retry behavior; the
 				// one-retry guard applies only to a modern `verified` decision.
@@ -1836,7 +1863,7 @@ async function tryCreateStreamWithRetry(
 					policy.accountCooldownReason || "QuotaExceeded",
 					{ silent: true },
 				);
-				return { success: false, error: err };
+				return fail(err);
 			}
 
 		const policy = classifyRetryAction(err, {
@@ -1967,7 +1994,11 @@ async function tryCreateStreamWithRetry(
 				policy.accountCooldownMs,
 				policy.accountCooldownReason,
 			);
-			return { success: false, error: err };
+			return {
+				success: false,
+				error: err,
+				attemptedAccountIds: Array.from(triedAccounts),
+			};
 		}
 
 		// Prefer switching account for any retryable upstream error when possible.
@@ -2100,7 +2131,7 @@ async function tryCreateStreamWithRetry(
 				clearAllSessionsForAccount(clearTargetId);
 			}
 
-			return { success: false, error: err };
+			return fail(err);
 		}
 
 		const useDelay = Math.max(

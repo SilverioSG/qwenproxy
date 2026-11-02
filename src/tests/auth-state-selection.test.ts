@@ -11,14 +11,20 @@ import assert from "node:assert/strict";
 import {
   addAccount,
   getAccountAuthState,
+  invalidateAccountsCache,
+  loadAccounts,
   removeAccount,
   setAccountAuthState,
 } from "../core/accounts.ts";
+import { getDatabase } from "../core/database.ts";
 import {
   clearAccountCooldown,
+  getNextAccount,
   getNextAvailableAccount,
+  markAccountHeadersReady,
   markAccountRateLimited,
 } from "../core/account-manager.ts";
+import { ServiceUnavailable } from "../core/errors.ts";
 import { resolveInitialAccount } from "../routes/chat/account.ts";
 
 const created: string[] = [];
@@ -36,6 +42,26 @@ function mk(tag: string) {
  *  return the target (or null when it is not selectable). */
 function only(id: string): Set<string> {
   return new Set(created.filter((x) => x !== id));
+}
+
+/** Run fn with every persisted account rejected, restoring exact state after. */
+function withAllRejected<T>(fn: () => T): T {
+  const all = loadAccounts();
+  const before = all.map((a) => ({ id: a.id, state: a.auth_state ?? null }));
+  const db = getDatabase();
+  try {
+    for (const a of all) setAccountAuthState(a.id, "rejected");
+    return fn();
+  } finally {
+    for (const b of before) {
+      if (b.state === null) {
+        db.prepare("UPDATE accounts SET auth_state = NULL WHERE id = ?").run(b.id);
+      } else {
+        setAccountAuthState(b.id, b.state);
+      }
+    }
+    invalidateAccountsCache();
+  }
 }
 
 after(() => {
@@ -106,4 +132,39 @@ test("sticky affinity is preserved for a valid preferred account", () => {
   setAccountAuthState(other.id, "valid");
   const resolved = resolveInitialAccount(preferred.id);
   assert.equal(resolved.account.id, preferred.id);
+});
+
+test("getNextAccount skips rejected and returns the valid peer", () => {
+  const bad = mk("next-bad");
+  const good = mk("next-good");
+  withAllRejected(() => {
+    setAccountAuthState(good.id, "valid");
+    markAccountHeadersReady(good.id);
+    assert.equal(getNextAccount()?.id, good.id);
+    setAccountAuthState(bad.id, "rejected");
+    setAccountAuthState(good.id, "rejected");
+    assert.equal(getNextAccount(), null);
+  });
+});
+
+test("all rejected -> resolveInitialAccount fails controlled", () => {
+  withAllRejected(() => {
+    assert.throws(
+      () => resolveInitialAccount(),
+      (e: unknown) => e instanceof ServiceUnavailable,
+    );
+  });
+});
+
+test("rejected ready does not activate anyReady for a valid cold peer", () => {
+  const bad = mk("gate-bad");
+  const good = mk("gate-good");
+  withAllRejected(() => {
+    setAccountAuthState(bad.id, "rejected");
+    markAccountHeadersReady(bad.id);
+    setAccountAuthState(good.id, "valid");
+    // good stays cold (no headers-ready mark): the rejected peer must not
+    // activate the anyReady gate that would exclude it.
+    assert.equal(getNextAccount()?.id, good.id);
+  });
 });

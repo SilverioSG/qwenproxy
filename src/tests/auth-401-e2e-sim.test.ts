@@ -220,6 +220,10 @@ test("inner 401 + JWT valid + rejected: one attempt, no freshness success", asyn
     );
     assert.equal(result.success, false);
     assert.deepEqual(calls, [a]);
+    assert.ok(
+      result.attemptedAccountIds?.includes(a),
+      "pre-stream failure must attribute the attempted account",
+    );
     assert.equal((installDeps as any).verifyCalls(), 1);
     assert.equal(getAuthRecoveryState(a), "rejected");
   } finally {
@@ -454,6 +458,11 @@ test("OUTER verified then second 401 stops after 2 attempts and fails over B", a
     assert.equal(result.error, undefined);
     assert.equal(result.activeAccountId, b);
     assert.deepEqual(calls, [a, a, b]);
+    assert.ok(
+      result.attemptedAccountIds?.includes(a) &&
+        result.attemptedAccountIds?.includes(b),
+      "success must retain every attempted account for Monitor",
+    );
     assert.equal((installDeps as any).verifyCalls(), 1);
     try {
       result.releaseAccountLease?.();

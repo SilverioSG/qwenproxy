@@ -72,6 +72,13 @@ function makeCooldownBadge(acct) {
   return '<span class="badge badge-neutral">OK</span>';
 }
 
+function makeAuthBadge(acct) {
+  if (acct.authState === 'valid') return '<span class="badge badge-success">valid</span>';
+  if (acct.authState === 'rejected') return '<span class="badge badge-danger">rejected</span>';
+  if (acct.authState === 'inconclusive') return '<span class="badge badge-warning">inconclusive</span>';
+  return '<span class="badge badge-neutral">—</span>';
+}
+
 function renderAccountsTable(accts) {
   if (!Array.isArray(accts) || accts.length === 0) {
     document.getElementById('acctBody').innerHTML = '';
@@ -101,6 +108,9 @@ function renderAccountsTable(accts) {
       '"></span>' +
       label +
       '</div></td>' +
+      '<td>' +
+      makeAuthBadge(a) +
+      '</td>' +
       '<td>' +
       makeCooldownBadge(a) +
       '</td>' +
