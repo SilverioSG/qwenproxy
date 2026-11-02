@@ -22,6 +22,10 @@ import {
   getManualVerificationStatus,
   setManualVerificationDeps,
   resolveManualDisplay,
+  snapshotVisibleAuth,
+  saveManualAuthSession,
+  selectManualAccessToken,
+  classifyManualSettingsResponse,
 } from "../services/manual-verification.ts";
 
 const TEST_ID = "00000000-0000-4000-8000-manualverify1";
@@ -207,7 +211,7 @@ function installHarness(opts: {
       return async () => {
         const seq = opts.persist?.validateSequence;
         const status = seq ? (seq[Math.min(n++, seq.length - 1)] ?? 200) : (opts.persist?.validateStatus ?? 200);
-        return { status };
+        return { status, state: status === 200 ? "valid" as const : status === 401 || status === 403 ? "rejected" as const : "inconclusive" as const };
       };
     })(),
     probeSameContext: async () => {
@@ -914,4 +918,103 @@ test("manual verification: resolveManualDisplay returns usable display or explic
     assert.ok((res as { display: string }).display.length > 0);
     assert.ok((res as { xauthority: string }).xauthority.length > 0);
   }
+});
+
+
+function syntheticJwt(length: number, exp = Math.floor(Date.now() / 1000) + 900): string {
+  const prefix = `${Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")}.${Buffer.from(JSON.stringify({ exp })).toString("base64url")}.`;
+  return prefix + "s".repeat(length - prefix.length);
+}
+
+async function visibleSnapshot(cookieToken: string, accessToken: string, refresh = "") {
+  const page = {
+    evaluate: async (fn: unknown) => {
+      const source = String(fn);
+      if (source.includes('getItem("access_token")')) return { token: "", access: accessToken, refresh: "" };
+      if (source.includes("userAgentData")) return null;
+      return "synthetic-UA";
+    },
+  };
+  const context = { cookies: async () => [
+    { name: "token", value: cookieToken },
+    ...(refresh ? [{ name: "refresh_token", value: refresh }] : []),
+  ] };
+  return snapshotVisibleAuth(page as never, context as never);
+}
+
+test("A/G: visible access_token wins over divergent cookie and persists the transport Bearer", async () => {
+  const { saveValidatedAuthSession, getPersistedBearerToken } = await import("../core/database.ts");
+  const { captureAccountSessionFromPage } = await import("../services/qwen-account-session.ts");
+  const live = syntheticJwt(281);
+  const cookie = syntheticJwt(209);
+  const snapshot = await visibleSnapshot(cookie, live, "refresh-kept");
+  assert.ok(snapshot);
+  assert.equal(snapshot.refreshToken, "refresh-kept");
+  assert.equal(snapshot.tokenExpiresAt, (await import("../utils/jwt.ts")).parseJwtExpiry(live));
+  assert.equal(saveValidatedAuthSession(TEST_ID, { ...snapshot, capturedAt: Date.now() }, "valid").saved, true);
+  assert.equal(getPersistedBearerToken(TEST_ID)?.token, live);
+  const session = await captureAccountSessionFromPage(TEST_ID, {
+    context: () => ({ cookies: async () => [{ name: "token", value: live, domain: ".qwen.ai" }] }),
+    evaluate: async () => ({ token: live, userAgent: "synthetic-UA" }),
+  } as never);
+  assert.equal(session.bearerToken, live);
+  assert.equal((await import("../services/qwen-token-refresh.ts")).getJarPair(session.cookieHeader, "token"), live);
+});
+
+test("D: absent localStorage uses a live cookie; expired live material cannot replace it", async () => {
+  const cookie = syntheticJwt(209);
+  const snapshot = await visibleSnapshot(cookie, "");
+  assert.ok(snapshot?.cookie.includes(`token=${cookie}`));
+  assert.equal(selectManualAccessToken({ token: syntheticJwt(281, 1), access: "" }, cookie)?.token, cookie);
+  assert.equal(selectManualAccessToken({ token: "", access: "" }, syntheticJwt(209, 1)), null);
+});
+
+test("E: snapshot without refresh rotation preserves the previous persisted refresh", async () => {
+  const { saveAuthSession, saveValidatedAuthSession, getRefreshMaterial } = await import("../core/database.ts");
+  saveAuthSession(TEST_ID, { cookie: `token=${syntheticJwt(281)}; refresh_token=old-refresh`, userAgent: "synthetic-UA", refreshToken: "old-refresh" });
+  const snapshot = await visibleSnapshot(syntheticJwt(209), syntheticJwt(281));
+  assert.ok(snapshot);
+  assert.equal(snapshot.refreshToken, undefined);
+  await saveManualAuthSession(TEST_ID, snapshot);
+  assert.equal(getRefreshMaterial(TEST_ID)?.refreshToken, "old-refresh");
+  assert.ok(getRefreshMaterial(TEST_ID)?.jar.includes("refresh_token=old-refresh"));
+});
+
+test("B/F: HTTP 200 logical rejection and ambiguity fail verification without promotion or session loss", async () => {
+  for (const [raw, expected] of [
+    [JSON.stringify({ success: false, data: { code: "Unauthorized" } }), "rejected"],
+    [JSON.stringify({ success: false, data: { code: "InternalError" } }), "inconclusive"],
+    ["not JSON", "inconclusive"],
+  ] as const) {
+    setAccountAuthState(TEST_ID, "rejected");
+    const { saveAuthSession, getRefreshMaterial } = await import("../core/database.ts");
+    saveAuthSession(TEST_ID, { cookie: "token=preserved; refresh_token=preserved-refresh", userAgent: "synthetic-UA", refreshToken: "preserved-refresh" });
+    const { emit, calls } = installHarness({ loggedIn: false });
+    setManualVerificationDeps({ validateLive: async () => ({ status: 200, state: classifyManualSettingsResponse(200, raw) }) });
+    assert.equal(classifyManualSettingsResponse(200, raw), expected);
+    await startManualVerification(TEST_ID);
+    await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+    assert.equal(await waitForState("failed"), "failed");
+    assert.equal(getAccountAuthState(TEST_ID), "rejected");
+    assert.equal(getRefreshMaterial(TEST_ID)?.refreshToken, "preserved-refresh");
+    assert.deepEqual(calls.clearedCooldown, []);
+  }
+});
+
+test("C: authoritative settings success is valid; bare HTTP 200 is inconclusive", () => {
+  assert.equal(classifyManualSettingsResponse(200, JSON.stringify({ success: true, data: {} })), "valid");
+  assert.equal(classifyManualSettingsResponse(200, "{}"), "inconclusive");
+  assert.equal(classifyManualSettingsResponse(401, ""), "rejected");
+});
+
+
+test("B post-capture: logical Unauthorized after a successful pre-check never promotes", async () => {
+  setAccountAuthState(TEST_ID, "rejected");
+  const { emit } = installHarness({ loggedIn: false });
+  let count = 0;
+  setManualVerificationDeps({ validateLive: async () => ({ status: 200, state: ++count === 1 ? "valid" : "rejected" }) });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  assert.equal(await waitForState("failed"), "failed");
+  assert.equal(getAccountAuthState(TEST_ID), "rejected");
 });

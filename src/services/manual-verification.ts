@@ -14,6 +14,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { parseJwtExpiry } from "../utils/jwt.ts";
+import { getJarPair, setCookiePairInJar } from "./qwen-token-refresh.ts";
+import type { AuthValidationState } from "./auth-contract.ts";
 import { chromium, type BrowserContext, type Page } from "patchright";
 
 export type ManualVerificationState =
@@ -121,6 +125,136 @@ interface AccountRef {
   email: string;
 }
 
+
+function authHash(token: string): string {
+  return token ? createHash("sha256").update(token).digest("hex").slice(0, 12) : "absent";
+}
+
+/** Visible SPA credentials precede cookies; expired candidates never replace live material. */
+export function selectManualAccessToken(
+  live: { token: string; access: string }, cookieToken: string,
+): { token: string; source: string } | null {
+  for (const [source, token] of [["localStorage.token", live.token], ["localStorage.access_token", live.access], ["cookie", cookieToken]]) {
+    if (!token) continue;
+    const exp = parseJwtExpiry(token);
+    if (exp !== null && exp <= Date.now() / 1000) continue;
+    return { token, source };
+  }
+  return null;
+}
+
+/** No HTTP-200 shortcut: an ambiguous payload cannot authenticate an account. */
+export function classifyManualSettingsResponse(status: number, raw: string): AuthValidationState {
+  if (status === 401 || status === 403) return "rejected";
+  if (status !== 200) return "inconclusive";
+  let json: any;
+  try { json = JSON.parse(raw); } catch { return "inconclusive"; }
+  if (!json || typeof json !== "object" || Array.isArray(json)) return "inconclusive";
+  const code = String(json.data?.code ?? json.code ?? "");
+  const details = String(json.data?.details ?? json.details ?? json.message ?? "");
+  if (/unauthorized|revoked|forbidden|\b401\b|\b403\b/i.test(`${code} ${details}`)) return "rejected";
+  if (json.success === false) return "inconclusive";
+  return json.success === true ? "valid" : "inconclusive";
+}
+
+/** Snapshot from the context that proved the user chat; never consult the older DB Bearer. */
+export async function snapshotVisibleAuth(page: Page, context: BrowserContext) {
+  // Fresh material from the context that just proved a real chat. Values
+  // stay in memory and go straight to saveAuthSession; only names/counts
+  // are ever logged by callers (which log nothing here at all).
+  const cookies: Array<{ name: string; value: string }> =
+    await context.cookies();
+  const byName = new Map(cookies.map((c) => [c.name, c.value]));
+  const live = await page.evaluate(() => ({
+    token: localStorage.getItem("token") || "",
+    access: localStorage.getItem("access_token") || "",
+    refresh: localStorage.getItem("refresh_token") || "",
+  })).catch(() => ({ token: "", access: "", refresh: "" }));
+  const selected = selectManualAccessToken(live, byName.get("token") || "");
+  if (!selected) return null;
+  const cookie = setCookiePairInJar(
+    cookies.map((c) => `${c.name}=${c.value}`).join("; "), "token", selected.token,
+  );
+  let userAgent = "";
+  try {
+    userAgent = await page.evaluate(() => navigator.userAgent);
+  } catch {
+    userAgent = "";
+  }
+  let secChUa: string | undefined;
+  let secChUaMobile: string | undefined;
+  let secChUaPlatform: string | undefined;
+  try {
+    const hints = await page.evaluate(() => {
+      const ud = (navigator as unknown as { userAgentData?: unknown }).userAgentData as
+        | {
+            brands?: Array<{ brand: string; version: string }>;
+            mobile?: boolean;
+            platform?: string;
+          }
+        | undefined;
+      if (!ud || !Array.isArray(ud.brands)) return null;
+      return {
+        secChUa: ud.brands
+          .map((b) => `"${b.brand}";v="${b.version}"`)
+          .join(", "),
+        secChUaMobile: ud.mobile ? "?1" : "?0",
+        secChUaPlatform: ud.platform ? `"${ud.platform}"` : undefined,
+      };
+    });
+    secChUa = hints?.secChUa;
+    secChUaMobile = hints?.secChUaMobile;
+    secChUaPlatform = hints?.secChUaPlatform;
+  } catch {
+    // Client hints are optional; restore tolerates their absence.
+  }
+  let version: string | undefined;
+  try {
+    const { getQwenWebVersion } = await import("./qwen-headers.ts");
+    version = getQwenWebVersion() || undefined;
+  } catch {
+    version = undefined;
+  }
+  let tokenExpiresAt: number | undefined;
+  tokenExpiresAt = parseJwtExpiry(selected.token) || undefined;
+  let refreshToken: string | null = null;
+  try {
+    refreshToken = getJarPair(cookie, "refresh_token") || live.refresh || null;
+  } catch {
+    refreshToken = null;
+  }
+  console.log(`[ManualAuth] snapshot source=${selected.source} livePresent=${Boolean(live.token || live.access)} liveLength=${(live.token || live.access).length} cookiePresent=${byName.has("token")} cookieLength=${(byName.get("token") || "").length} accessHash=${authHash(selected.token)} expiresAt=${tokenExpiresAt ?? "unknown"}`);
+  return {
+    cookie: refreshToken ? setCookiePairInJar(cookie, "refresh_token", refreshToken) : cookie,
+    userAgent,
+    bxV: byName.get("bx-v") || "2.5.37",
+    bxUa: byName.get("bx-ua") || "",
+    bxUmidtoken: byName.get("bx-umidtoken") || "",
+    secChUa,
+    secChUaMobile,
+    secChUaPlatform,
+    version,
+    tokenExpiresAt,
+    // Opportunistic refresh bookkeeping (manual login path): null/undefined
+    // keeps the stored value, an explicit value updates it.
+    refreshToken: refreshToken ?? undefined,
+  };
+}
+
+/** Preserve an unrotated refresh in both SQLite bookkeeping and the coherent jar. */
+export async function saveManualAuthSession(
+  accountId: string,
+  session: Parameters<typeof import("../core/database.ts").saveValidatedAuthSession>[1],
+): Promise<void> {
+  const { saveValidatedAuthSession, getRefreshMaterial } = await import("../core/database.ts");
+  const refresh = session.refreshToken ?? getJarPair(session.cookie, "refresh_token") ?? getRefreshMaterial(accountId)?.refreshToken;
+  const cookie = refresh ? setCookiePairInJar(session.cookie, "refresh_token", refresh) : session.cookie;
+  const result = saveValidatedAuthSession(accountId, {
+    ...session, cookie, refreshToken: refresh ?? undefined, capturedAt: Date.now(),
+  }, "valid");
+  if (!result.saved) throw new Error(`Manual session not persisted: ${result.reason ?? "unknown"}`);
+}
+
 const deps: {
   launchBrowser: BrowserLauncher;
   probeLogin: (
@@ -178,7 +312,7 @@ const deps: {
       tokenExpiresAt?: number;
     },
   ) => Promise<void>;
-  validateLive: (accountId: string) => Promise<{ status: number }>;
+  validateLive: (accountId: string) => Promise<{ status: number; state: AuthValidationState }>;
   probeSameContext: (page: Page) => Promise<{
     settingsStatus: number;
     settingsAppAuthFailure: boolean;
@@ -285,102 +419,11 @@ const deps: {
     const capturedAt = Number(row?.captured_at) || 0;
     return { exists: capturedAt > 0, capturedAt };
   },
-  snapshotVisible: async (page: Page, context: BrowserContext) => {
-    // Fresh material from the context that just proved a real chat. Values
-    // stay in memory and go straight to saveAuthSession; only names/counts
-    // are ever logged by callers (which log nothing here at all).
-    const cookies: Array<{ name: string; value: string }> =
-      await context.cookies();
-    if (cookies.length === 0) return null;
-    const byName = new Map(cookies.map((c) => [c.name, c.value]));
-    if (!byName.get("token")) return null;
-    const cookie = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-    let userAgent = "";
-    try {
-      userAgent = await page.evaluate(() => navigator.userAgent);
-    } catch {
-      userAgent = "";
-    }
-    let secChUa: string | undefined;
-    let secChUaMobile: string | undefined;
-    let secChUaPlatform: string | undefined;
-    try {
-      const hints = await page.evaluate(() => {
-        const ud = (navigator as unknown as { userAgentData?: unknown }).userAgentData as
-          | {
-              brands?: Array<{ brand: string; version: string }>;
-              mobile?: boolean;
-              platform?: string;
-            }
-          | undefined;
-        if (!ud || !Array.isArray(ud.brands)) return null;
-        return {
-          secChUa: ud.brands
-            .map((b) => `"${b.brand}";v="${b.version}"`)
-            .join(", "),
-          secChUaMobile: ud.mobile ? "?1" : "?0",
-          secChUaPlatform: ud.platform ? `"${ud.platform}"` : undefined,
-        };
-      });
-      secChUa = hints?.secChUa;
-      secChUaMobile = hints?.secChUaMobile;
-      secChUaPlatform = hints?.secChUaPlatform;
-    } catch {
-      // Client hints are optional; restore tolerates their absence.
-    }
-    let version: string | undefined;
-    try {
-      const { getQwenWebVersion } = await import("./qwen-headers.ts");
-      version = getQwenWebVersion() || undefined;
-    } catch {
-      version = undefined;
-    }
-    let tokenExpiresAt: number | undefined;
-    try {
-      const { parseJwtExpiry } = await import("../utils/jwt.ts");
-      tokenExpiresAt = parseJwtExpiry(cookie) || undefined;
-    } catch {
-      tokenExpiresAt = undefined;
-    }
-    let refreshToken: string | null = null;
-    try {
-      const { getJarPair } = await import("./qwen-token-refresh.ts");
-      refreshToken = getJarPair(cookie, "refresh_token");
-    } catch {
-      refreshToken = null;
-    }
-    return {
-      cookie,
-      userAgent,
-      bxV: byName.get("bx-v") || "2.5.37",
-      bxUa: byName.get("bx-ua") || "",
-      bxUmidtoken: byName.get("bx-umidtoken") || "",
-      secChUa,
-      secChUaMobile,
-      secChUaPlatform,
-      version,
-      tokenExpiresAt,
-      // Opportunistic refresh bookkeeping (manual login path): null/undefined
-      // keeps the stored value, an explicit value updates it.
-      refreshToken: refreshToken ?? undefined,
-    };
-  },
-  saveSession: async (accountId, session) => {
-    const { saveValidatedAuthSession } = await import("../core/database.ts");
-    const result = saveValidatedAuthSession(
-      accountId,
-      { ...session, capturedAt: Date.now() },
-      "valid",
-    );
-    if (!result.saved) {
-      throw new Error(
-        `Manual session not persisted: ${result.reason ?? "unknown"}`,
-      );
-    }
-  },
+  snapshotVisible: snapshotVisibleAuth,
+  saveSession: saveManualAuthSession,
   validateLive: async (accountId: string) => {
     // Authoritative check against the OPERATIONAL (headless) context: the
-    // same browser transport production will use. Status only, no bodies.
+    // same browser transport production will use. HTTP and logical auth must pass.
     const { getBasicHeaders } = await import("./playwright.ts");
     const {
       buildCapturedQwenHeaders,
@@ -406,7 +449,10 @@ const deps: {
       undefined,
       { referrer: qwenUrl("/settings/personalization") },
     );
-    return { status: res.status };
+    const state = classifyManualSettingsResponse(res.status, await res.text());
+    const { getPersistedBearerToken } = await import("../core/database.ts");
+    console.log(`[ManualAuth] settings account=${accountId.slice(0, 8)} status=${res.status} state=${state} persistedHash=${authHash(getPersistedBearerToken(accountId)?.token || "")} transportCookieHash=${authHash(getJarPair(basic.cookie, "token") || "")}`);
+    return { status: res.status, state };
   },
   probeSameContext: async (page: Page) => {
     // Diagnostic only: same visible page/context that just proved a real
@@ -1198,17 +1244,20 @@ async function completeSuccess(
   }
   // 4. PRE-CAPTURE live validation on the operational context.
   let liveStatus = 0;
+  let liveState: AuthValidationState = "inconclusive";
   try {
-    liveStatus = (await deps.validateLive(accountId)).status;
+    const result = await deps.validateLive(accountId);
+    liveStatus = result.status;
+    liveState = result.state;
   } catch {
     liveStatus = 0;
   }
-  logEvent(entry, accountId, `pre-capture settings status=${liveStatus}`);
-  if (liveStatus !== 200) {
+  logEvent(entry, accountId, `pre-capture settings status=${liveStatus} auth=${liveState}`);
+  if (liveStatus !== 200 || liveState !== "valid") {
     finishOnEntry(
       entry,
       "failed",
-      `Pre-capture live validation failed (settings ${liveStatus})`,
+      `Pre-capture live validation failed (settings ${liveStatus}, ${liveState})`,
     );
     return false;
   }
@@ -1257,13 +1306,16 @@ async function completeSuccess(
   }
   // 6. POST-CAPTURE live validation on the exact post-capture context.
   let postStatus = 0;
+  let postState: AuthValidationState = "inconclusive";
   try {
-    postStatus = (await deps.validateLive(accountId)).status;
+    const result = await deps.validateLive(accountId);
+    postStatus = result.status;
+    postState = result.state;
   } catch {
     postStatus = 0;
   }
-  logEvent(entry, accountId, `post-capture settings status=${postStatus}`);
-  if (postStatus !== 200) {
+  logEvent(entry, accountId, `post-capture settings status=${postStatus} auth=${postState}`);
+  if (postStatus !== 200 || postState !== "valid") {
     try {
       await deps.closeHeadless(accountId);
     } catch {
@@ -1272,7 +1324,7 @@ async function completeSuccess(
     finishOnEntry(
       entry,
       "failed",
-      `Post-capture live validation failed (settings ${postStatus})`,
+      `Post-capture live validation failed (settings ${postStatus}, ${postState})`,
     );
     return false;
   }
