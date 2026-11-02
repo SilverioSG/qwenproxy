@@ -109,6 +109,38 @@ test("Mutex: release is idempotent", async () => {
   assert.strictEqual(m.isIdle(), true);
 });
 
+test("Mutex: stale owner release cannot release the recovered holder (A/B/C)", async () => {
+  const m = new Mutex("t-epoch", 60);
+  const releaseA = await m.acquire(1000, "A");
+
+  let bAcquired = false;
+  const bPromise = m.acquire(1000, "B").then((r) => {
+    bAcquired = true;
+    return r;
+  });
+  await tick(10);
+  assert.strictEqual(bAcquired, false, "B must wait behind A");
+
+  // A expires and C recovers the stale lock while B is still queued.
+  await tick(70);
+  const releaseC = await m.acquire(1000, "C");
+  assert.strictEqual(m.state().heldBy, "C");
+
+  // A's obsolete release must NOT release C's lock.
+  releaseA();
+  assert.strictEqual(m.state().locked, true);
+  assert.strictEqual(m.state().heldBy, "C");
+  assert.strictEqual(bAcquired, false, "B must not enter while C holds");
+
+  // C releases -> B enters in FIFO order.
+  releaseC();
+  const releaseB = await bPromise;
+  assert.strictEqual(bAcquired, true);
+  assert.strictEqual(m.state().heldBy, "B");
+  releaseB();
+  assert.strictEqual(m.isIdle(), true);
+});
+
 test("Mutex: touch extends hold time and prevents premature stale force-release", async () => {
   const m = new Mutex("t-touch", 60); // 60ms hold limit
   const release = await m.acquire(1000, "active-stream");
