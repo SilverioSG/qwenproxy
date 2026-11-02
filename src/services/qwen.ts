@@ -1962,16 +1962,13 @@ export function bearerMatchesLiveToken(
 }
 
 /**
- * Chat routes that must use cookie/session-centric browser auth: NO explicit
+ * Legacy create-chat routes eligible for cookie/session-centric browser auth: NO explicit
  * Authorization header (mirrors the reference client). Pure and unit-tested;
  * the in-page transport mirrors this predicate inline (bundler __name
  * constraints forbid importing it there) with a consistency test below.
  */
 export function isCookieOnlyRoute(url: string): boolean {
-  return (
-    url.includes("/api/v2/chats/new") ||
-    url.includes("/api/v2/users/user/settings")
-  );
+  return url.includes("/api/v2/chats/new");
 }
 
 /** Return headers without any Authorization variant (new object). */
@@ -2143,13 +2140,11 @@ export async function requestQwenTextInBrowser(
             liveToken = null;
           }
           diag.liveTokenPresent = liveToken !== null;
-          // Cookie-only routes (chat + chat personalization): reproduce the
-          // cookie/session-centric behavior of the reference client — NO
-          // explicit Authorization; credentials:include + live browser
-          // cookies govern. All other routes keep current behavior.
+          // Only legacy create-chat may fall back to cookie-only. Settings
+          // uses the live Bearer, as the SPA does: an equivalent cookie jar
+          // alone can return HTTP 200 with logical Unauthorized.
           const cookieOnlyRoute =
-            url.includes("/api/v2/users/user/settings") ||
-            (url.includes("/api/v2/chats/new") && !authBearer);
+            url.includes("/api/v2/chats/new") && !authBearer;
           diag.cookieOnlyRoute = cookieOnlyRoute;
           const effHeaders: Record<string, string> = { ...headers };
           const hadCachedAuth = Boolean(

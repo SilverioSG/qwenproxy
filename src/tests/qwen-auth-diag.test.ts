@@ -203,19 +203,19 @@ test("qwen-auth-diag: cookie-only routes strip Authorization (both cases)", () =
   assert.equal(stripped["Cookie"], "a=b");
   assert.equal(withAuth["Authorization"], "Bearer x");
   assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/chats/new"), true);
-  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings"), true);
-  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings/update"), true);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings"), false);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings/update"), false);
   assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/files/getstsToken"), false);
   assert.equal(isCookieOnlyRoute("https://auth.qwen.ai/api/v2/auths/refresh"), false);
 });
 
 test("qwen-auth-diag: in-page transport mirrors cookie-only routing", () => {
   const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
-  const start = src.indexOf("Cookie-only routes (chat + chat personalization)");
+  const start = src.indexOf("Only legacy create-chat may fall back to cookie-only.");
   assert.ok(start >= 0);
-  const block = src.slice(start, start + 1500);
+  const block = src.slice(start, start + 2200);
   assert.ok(block.includes("/api/v2/chats/new"));
-  assert.ok(block.includes("/api/v2/users/user/settings"));
+  assert.ok(!block.slice(0, block.indexOf("diag.cookieOnlyRoute")).includes("/api/v2/users/user/settings"));
   assert.ok(block.includes('delete effHeaders["authorization"]'));
   assert.ok(block.includes('delete effHeaders["Authorization"]'));
   assert.ok(block.includes("credentials:"));
@@ -735,4 +735,60 @@ test("qwen-auth-diag: accountIdForPage is a reverse lookup with no side effects"
   assert.ok(block.includes("if (p === page) return id;"));
   assert.ok(block.includes("return null;"));
   assert.ok(!/accountPages\.(delete|clear|set)/.test(block));
+});
+
+// Execute the actual browser closure, rather than duplicating its routing rule.
+// The same synthetic session must authenticate in visible and restored contexts.
+async function settingsTransportCase(liveToken: string | null, expected: "valid" | "rejected") {
+  const { registerPlaywrightAccountForTests, unregisterPlaywrightAccountForTests } = await import("../services/playwright.ts");
+  const { requestQwenTextInBrowser, buildCapturedQwenHeaders } = await import("../services/qwen.ts");
+  const { classifyManualSettingsResponse } = await import("../services/manual-verification.ts");
+  const id = "settings-auth-regression";
+  const seen: Array<{ authorization?: string; credentials?: string }> = [];
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    context: () => ({ cookies: async () => [] }),
+    evaluate: async (fn: (arg: unknown) => Promise<unknown>, arg: unknown) => {
+      const g = globalThis as unknown as Record<string, unknown>;
+      const previous = { fetch: g.fetch, localStorage: g.localStorage, document: g.document };
+      g.localStorage = { getItem: (key: string) => key === "token" ? liveToken : null, setItem: () => {} };
+      g.document = { cookie: "token=synthetic-session" };
+      g.fetch = async (url: string, init: RequestInit) => {
+        const headers = init.headers as Record<string, string>;
+        const authorization = headers.Authorization || headers.authorization;
+        if (!url.includes("/auths/refresh")) seen.push({ authorization, credentials: init.credentials });
+        const valid = !url.includes("/auths/refresh") && authorization === "Bearer synthetic-live-access";
+        return new Response(JSON.stringify(valid ? { success: true, data: {} } : { success: false, data: { code: "Unauthorized" } }), { status: 200 });
+      };
+      try { return await fn(arg); } finally { Object.assign(g, previous); }
+    },
+  };
+  const mock = process.env.TEST_MOCK_QWEN_AUTH;
+  process.env.TEST_MOCK_QWEN_AUTH = "false";
+  registerPlaywrightAccountForTests(id, page as never, Date.now());
+  try {
+    const headers = buildCapturedQwenHeaders({ cookie: "token=synthetic-session", "user-agent": "synthetic-UA", "bx-v": "2.5.37" });
+    const response = await requestQwenTextInBrowser(id, "GET", "/api/v2/users/user/settings", headers);
+    assert.equal(classifyManualSettingsResponse(response.status, await response.text()), expected);
+    assert.equal(seen[0].authorization, liveToken ? `Bearer ${liveToken}` : undefined);
+    assert.equal(seen[0].credentials, "include");
+  } finally {
+    unregisterPlaywrightAccountForTests(id);
+    if (mock === undefined) delete process.env.TEST_MOCK_QWEN_AUTH;
+    else process.env.TEST_MOCK_QWEN_AUTH = mock;
+  }
+}
+
+test("settings transports the live Bearer for equivalent visible and restored sessions", async () => {
+  await settingsTransportCase("synthetic-live-access", "valid");
+  await settingsTransportCase("synthetic-live-access", "valid");
+});
+
+test("settings without a live Bearer rejects logical HTTP-200 Unauthorized", async () => {
+  await settingsTransportCase(null, "rejected");
+});
+
+test("settings with an invalid Bearer cannot pass authoritative validation", async () => {
+  await settingsTransportCase("synthetic-invalid-access", "rejected");
 });
