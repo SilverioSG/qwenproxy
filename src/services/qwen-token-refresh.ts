@@ -598,12 +598,8 @@ export async function tryRefreshToken(
   console.log(
     `[AuthRefresh] ok | account=${accountId.slice(0, 8)} | source=${source} | access=${out.access.length} chars${out.rotated ? " | refresh rotated" : " | refresh kept"}`,
   );
-  // A validated renewal re-admits an account that a previous 401 had rejected.
-  try {
-    setAccountAuthState(accountId, "valid");
-  } catch {
-    // State bookkeeping must never break a successful refresh.
-  }
+  // A token renewal is NOT authentication. Do not promote auth_state here:
+  // only ensureAccountSession() may promote after the authoritative verifier.
   return { ok: true, rotated: out.rotated };
 }
 
@@ -837,6 +833,13 @@ export async function ensureAccountSession(
   if (!fresh.tokenValid) {
     const rejected =
       fresh.refreshPerformed && refreshCodeLooksRejected(fresh.refreshCode);
+    if (rejected) {
+      try {
+        setAccountAuthState(accountId, "rejected");
+      } catch {
+        // State bookkeeping must never break refresh handling.
+      }
+    }
     return {
       ...fresh,
       sessionVerified: rejected ? "rejected" : "inconclusive",
@@ -852,6 +855,18 @@ export async function ensureAccountSession(
       : await defaultSessionVerifier(accountId);
   } catch {
     verification = { state: "inconclusive", reason: "verify-error" };
+  }
+  // Only the authoritative verifier may change auth_state. Inconclusive
+  // preserves the previous state (never fabricates valid, never downgrades
+  // on ambiguity); rejected keeps a confirmed rejection sticky.
+  try {
+    if (verification.state === "valid") {
+      setAccountAuthState(accountId, "valid");
+    } else if (verification.state === "rejected") {
+      setAccountAuthState(accountId, "rejected");
+    }
+  } catch {
+    // State bookkeeping must never break session verification.
   }
   return {
     ...fresh,

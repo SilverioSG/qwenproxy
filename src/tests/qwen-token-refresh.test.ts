@@ -11,10 +11,12 @@ import os from "node:os";
 import path from "node:path";
 import {
   deleteAuthSession,
+  getDatabase,
   getRefreshMaterial,
   getValidAuthSession,
   saveAuthSession,
 } from "../core/database.ts";
+import { getAccountAuthState, invalidateAccountsCache } from "../core/accounts.ts";
 import { getDataDir, getDbPath, resolveDataDir } from "../core/paths.ts";
 import {
   QWEN_REFRESH_MARGIN_MS,
@@ -107,12 +109,28 @@ beforeEach(() => {
   _setRefreshFetchForTests(null);
 });
 
+function seedAccountRow(
+  id: string,
+  state: "valid" | "rejected" | "inconclusive" = "rejected",
+): void {
+  getDatabase()
+    .prepare(
+      "INSERT OR REPLACE INTO accounts (id, email, password, auth_state) VALUES (?, ?, ?, ?)",
+    )
+    .run(id, `${id}@example.test`, "x", state);
+  invalidateAccountsCache();
+}
+
 afterEach(() => {
   for (const id of createdIds.splice(0)) {
     try {
       deleteAuthSession(id);
     } catch {}
+    try {
+      getDatabase().prepare("DELETE FROM accounts WHERE id = ?").run(id);
+    } catch {}
   }
+  invalidateAccountsCache();
   _resetRefreshSingleFlightForTests();
   _setRefreshFetchForTests(null);
 });
@@ -403,6 +421,7 @@ test("13: JWT fresh alone is not authentication; verifier decides", async () => 
   const id = seedSession({
     tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
   });
+  seedAccountRow(id, "rejected");
   const state = await ensureAccountSession(id, {
     verify: async () => ({ state: "valid", reason: "settings-ok" }),
   });
@@ -410,6 +429,7 @@ test("13: JWT fresh alone is not authentication; verifier decides", async () => 
   assert.equal(state.tokenValid, true);
   assert.equal(state.refreshPerformed, false);
   assert.equal(state.sessionVerified, "valid");
+  assert.equal(getAccountAuthState(id), "valid");
 });
 
 test("14: verifier rejection wins over a fresh JWT (401 and 403)", async () => {
@@ -417,12 +437,14 @@ test("14: verifier rejection wins over a fresh JWT (401 and 403)", async () => {
     const id = seedSession({
       tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
     });
+    seedAccountRow(id, "valid");
     const state = await ensureAccountSession(id, {
       verify: async () => ({ state: "rejected", reason }),
     });
     assert.equal(state.tokenValid, true);
     assert.equal(state.refreshPerformed, false);
     assert.equal(state.sessionVerified, "rejected", reason);
+    assert.equal(getAccountAuthState(id), "rejected");
   }
 });
 
@@ -431,6 +453,7 @@ test("15: inconclusive keeps material without declaring auth", async () => {
     const id = seedSession({
       tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
     });
+    seedAccountRow(id, "valid");
     const before = getRefreshMaterial(id)!.jar;
     const state = await ensureAccountSession(id, {
       verify: async () => ({ state: "inconclusive", reason }),
@@ -438,6 +461,7 @@ test("15: inconclusive keeps material without declaring auth", async () => {
     assert.equal(state.tokenValid, true);
     assert.equal(state.sessionVerified, "inconclusive", reason);
     assert.equal(getRefreshMaterial(id)!.jar, before, reason);
+    assert.equal(getAccountAuthState(id), "valid", "inconclusive preserves state");
   }
 });
 
@@ -446,6 +470,7 @@ test("16: a successful refresh does not equal session verification", async () =>
     access: expiredJwt(),
     tokenExpiresAt: Math.floor(Date.now() / 1000) + 60,
   });
+  seedAccountRow(id, "valid");
   const state = await ensureAccountSession(id, {
     fetchFn: async () =>
       jsonResponse({
@@ -458,6 +483,47 @@ test("16: a successful refresh does not equal session verification", async () =>
   assert.equal(state.refreshOk, true);
   assert.equal(state.tokenValid, true);
   assert.equal(state.sessionVerified, "rejected");
+  assert.equal(getAccountAuthState(id), "rejected");
+});
+
+test("19: refresh failure never promotes auth_state to valid", async () => {
+  const id = seedSession({
+    access: expiredJwt(),
+    tokenExpiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  seedAccountRow(id, "rejected");
+  const state = await ensureAccountSession(id, {
+    fetchFn: async () =>
+      jsonResponse({ success: false, data: { code: "Unauthorized" } }, 401),
+    verify: async () => ({ state: "valid", reason: "should-not-run" }),
+  });
+  assert.equal(state.tokenValid, false);
+  assert.equal(state.sessionVerified, "rejected");
+  assert.equal(getAccountAuthState(id), "rejected");
+});
+
+test("20: inconclusive refresh failure preserves the previous state", async () => {
+  const id = seedSession({
+    access: expiredJwt(),
+    tokenExpiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  seedAccountRow(id, "valid");
+  const state = await ensureAccountSession(id, {
+    fetchFn: async () =>
+      jsonResponse({ success: false, data: { code: "NetworkError" } }, 500),
+    verify: async () => ({ state: "valid", reason: "should-not-run" }),
+  });
+  assert.equal(state.tokenValid, false);
+  assert.equal(state.sessionVerified, "inconclusive");
+  assert.equal(getAccountAuthState(id), "valid");
+});
+
+test("21: tryRefreshToken never promotes auth_state", () => {
+  const src = fs.readFileSync("src/services/qwen-token-refresh.ts", "utf-8");
+  const start = src.indexOf("function tryRefreshToken");
+  const end = src.indexOf("// Single-flight", start);
+  assert.ok(start >= 0 && end > start);
+  assert.ok(!src.slice(start, end).includes("setAccountAuthState"));
 });
 
 test("17: no material is inconclusive, not a login confirmation", async () => {
