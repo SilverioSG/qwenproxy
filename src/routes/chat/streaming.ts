@@ -1967,24 +1967,18 @@ export async function processStreamingResponse(
       // Post-stream: error check + flush remaining content
       const upstreamError = parseQwenErrorPayload(buffer);
       if (upstreamError) {
-        await writeEvent({
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: createdTimestamp,
-          model: body.model,
-          choices: [makeChoice({ content: upstreamError.message })],
-        });
-        await writeEvent({
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: createdTimestamp,
-          model: body.model,
-          choices: [makeChoice({}, "stop")],
-        });
-        flushWrites();
-        await streamWriter.write("data: [DONE]\n\n");
-        // Upstream error already emitted as content + [DONE]. Same stop as the
-        // success path: logical end is the [DONE] write, before finally cleanup.
+        // A technical upstream failure must never be serialized as assistant
+        // content with finish_reason=stop. Emit one OpenAI-compatible error
+        // event and exactly one [DONE], then end the logical request.
+        await streamWriter.write(
+          `data: ${JSON.stringify({
+            error: {
+              message: upstreamError.message,
+              type: "upstream_error",
+              code: upstreamError.code || "upstream_error",
+            },
+          })}\n\ndata: [DONE]\n\n`,
+        );
         observeStreamEnd({
           success: false,
           error: upstreamError.message,
@@ -2790,28 +2784,33 @@ export async function processStreamingResponse(
       logger.error("[Chat] Stream callback error", errorDetails);
     }
     // The HTTP response is already committed at this point.
-    // 1. Emit an explicit assistant message delta so CLI/TUI clients that only
-    //    listen for choices[].delta.content (e.g. OpenCode, Claude Code, etc.)
-    //    render the error visibly in the chat instead of appearing blank/frozen.
-    // 2. Emit a terminal OpenAI-compatible SSE error event + [DONE].
+    // 1. Moderation/content_filter keeps a visible notice (a safety message is
+    //    user-facing content). Technical/transport errors must NOT masquerade
+    //    as a normal assistant message with finish_reason=stop.
+    // 2. Always emit a terminal OpenAI-compatible SSE error event + [DONE].
+    const isModeration =
+      normalizedErrorCode === "data_inspection_failed" ||
+      normalizedErrorCode === "content_policy_violation" ||
+      /content moderation|data_inspection_failed/i.test(err.message || "");
     try {
-      const userFriendlyNotice = `\n\n⚠️ **[Qwen Security / Erro]** ${err.message || "A resposta foi interrompida pelo Qwen."}\n\n`;
-      const errorDelta = {
-        id: completionId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [
-          {
-            index: 0,
-            delta: { content: userFriendlyNotice },
-            logprobs: null,
-            finish_reason: "stop",
-          },
-        ],
-      };
-
-      await errorStream.write(`data: ${JSON.stringify(errorDelta)}\n\n`);
+      if (isModeration) {
+        const userFriendlyNotice = `\n\n⚠️ **[Qwen Security / Erro]** ${err.message || "A resposta foi interrompida pelo Qwen."}\n\n`;
+        const errorDelta = {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta: { content: userFriendlyNotice },
+              logprobs: null,
+              finish_reason: "stop",
+            },
+          ],
+        };
+        await errorStream.write(`data: ${JSON.stringify(errorDelta)}\n\n`);
+      }
       await errorStream.write(
         `data: ${JSON.stringify({
           error: {
