@@ -60,7 +60,7 @@ import { traceSessionEvent } from "./session-tracer.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
 // only depends on config/logger, so playwright -> account-concurrency stays
 // acyclic, while the reverse direction would drag the browser layer into core.
-import { hasActiveAccountLease, isAccountTemporarilyBusy } from "../core/account-concurrency.ts";
+import { hasActiveAccountLease, isAccountTemporarilyBusy, tryBeginAccountContextClose } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
 import { maskEmail, logger } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
@@ -5734,8 +5734,14 @@ async function closeIdleAccountIfStillUnclaimed(accountId: string): Promise<bool
   try {
     if (isAccountServingStream(accountId) || isAccountTemporarilyBusy(accountId)) return false;
     if (!accountContexts.has(accountId) && !accountPages.has(accountId)) return false;
-    await closePlaywrightForAccountLocked(accountId);
-    return true;
+    const finishClose = tryBeginAccountContextClose(accountId);
+    if (!finishClose) return false;
+    try {
+      await closePlaywrightForAccountLocked(accountId);
+      return true;
+    } finally {
+      finishClose();
+    }
   } finally {
     release();
   }
@@ -6156,9 +6162,11 @@ export function registerPlaywrightAccountForTests(
   accountId: string,
   page: Page,
   lastActivityAt: number,
+  context?: BrowserContext,
 ): void {
   getAccountMutex(accountId);
   accountPages.set(accountId, page);
+  if (context) accountContexts.set(accountId, context);
   lastAccountActivity.set(accountId, lastActivityAt);
 }
 

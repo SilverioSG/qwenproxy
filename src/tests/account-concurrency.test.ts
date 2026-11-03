@@ -13,9 +13,52 @@ import {
   clearTemporaryBusy,
   getAccountConcurrencySnapshot,
   resetAccountConcurrencyForTests,
+  tryBeginAccountContextClose,
 } from "../core/account-concurrency.ts";
 
 // config.concurrency.maxStreamsPerAccount defaults to 1 in test mode
+
+test("AccountConcurrency: context close blocks immediate leases and releases a waiter", async () => {
+  resetAccountConcurrencyForTests();
+  const finishClose = tryBeginAccountContextClose("closing-account");
+  assert.ok(finishClose);
+  assert.strictEqual(isAccountBusy("closing-account"), true);
+  assert.strictEqual(tryAcquireAccountLease("closing-account"), null);
+  let granted = false;
+  const waiting = acquireAccountLease("closing-account", { timeoutMs: 1000 }).then((lease) => {
+    granted = true;
+    return lease;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(granted, false);
+  finishClose();
+  const lease = await waiting;
+  assert.strictEqual(granted, true);
+  lease.release();
+  finishClose();
+});
+
+test("AccountConcurrency: aborting a waiter does not release a context close", async () => {
+  resetAccountConcurrencyForTests();
+  const finishClose = tryBeginAccountContextClose("closing-abort");
+  assert.ok(finishClose);
+  const controller = new AbortController();
+  const waiting = acquireAccountLease("closing-abort", { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(waiting, /Aborted/);
+  assert.strictEqual(tryAcquireAccountLease("closing-abort"), null);
+  finishClose();
+  const lease = tryAcquireAccountLease("closing-abort");
+  assert.ok(lease);
+  lease.release();
+});
+
+test("AccountConcurrency: context close cannot start with a live lease", async () => {
+  resetAccountConcurrencyForTests();
+  const lease = await acquireAccountLease("closing-live");
+  assert.strictEqual(tryBeginAccountContextClose("closing-live"), null);
+  lease.release();
+});
 
 test("AccountConcurrency: first lease is acquired immediately", async () => {
   resetAccountConcurrencyForTests();
