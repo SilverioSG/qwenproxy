@@ -159,6 +159,10 @@ function installHarness(opts: {
         ? { ok: true, reason: "ok" }
         : { ok: false, reason: opts.probeReason ?? "auths-status" };
     },
+    // Existing tests drive the response explicitly via emit(); the default
+    // auto-send is a no-op unless a test overrides it.
+    sendWaitingMessage: async () => ({ sent: false, reason: "disabled-for-test" }),
+    autoSendComposerGraceMs: 100,
     // Yield a real macrotask: a zero-duration sleep must still let the event
     // loop interleave, otherwise wall-clock poll loops starve timers.
     sleep: async () => {
@@ -908,6 +912,102 @@ test("manual verification: rejected → valid only after all validations pass", 
   await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
   assert.equal(await waitForState("verified"), "verified");
   assert.equal(getAccountAuthState(TEST_ID), "valid");
+});
+
+test("manual verification: waiting auto-sends one test message and verifies", async () => {
+  const { emit } = installHarness({ loggedIn: true });
+  const sent: string[] = [];
+  setManualVerificationDeps({
+    sendWaitingMessage: async (_page, accountId, prompt) => {
+      assert.equal(accountId, TEST_ID);
+      sent.push(prompt);
+      setTimeout(() => {
+        void emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+      }, 50);
+      return { sent: true, reason: "sent" };
+    },
+    autoSendComposerGraceMs: 100,
+  });
+  await startManualVerification(TEST_ID);
+  assert.equal(await waitForState("verified"), "verified");
+  assert.deepEqual(sent, ["¿Cuánto es 2 + 2?"]);
+});
+
+test("manual verification: challenge skips auto-send and waits for human", async () => {
+  installHarness({ loggedIn: true });
+  let calls = 0;
+  setManualVerificationDeps({
+    sendWaitingMessage: async () => {
+      calls += 1;
+      return { sent: false, reason: "challenge" };
+    },
+    autoSendComposerGraceMs: 100,
+  });
+  await startManualVerification(TEST_ID);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(calls, 1);
+  assert.notEqual(getManualVerificationStatus(TEST_ID)?.state, "verified");
+});
+
+test("manual verification: missing composer fails controlled without auth promotion", async () => {
+  installHarness({ loggedIn: true });
+  setManualVerificationDeps({
+    sendWaitingMessage: async () => ({ sent: false, reason: "composer-missing" }),
+    autoSendComposerGraceMs: 100,
+  });
+  await startManualVerification(TEST_ID);
+  assert.equal(await waitForState("failed"), "failed");
+  assert.notEqual(getAccountAuthState(TEST_ID), "valid");
+});
+
+test("manual verification: in-progress response is not duplicated", async () => {
+  const { emit } = installHarness({ loggedIn: true });
+  let calls = 0;
+  setManualVerificationDeps({
+    sendWaitingMessage: async () => {
+      calls += 1;
+      setTimeout(() => {
+        void emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+      }, 100);
+      return { sent: false, reason: "in-progress" };
+    },
+    autoSendComposerGraceMs: 100,
+  });
+  await startManualVerification(TEST_ID);
+  assert.equal(await waitForState("verified"), "verified");
+  assert.equal(calls, 1);
+});
+
+test("manual verification: one auto-send only while waiting for evidence", async () => {
+  installHarness({ loggedIn: true });
+  let calls = 0;
+  setManualVerificationDeps({
+    sendWaitingMessage: async () => {
+      calls += 1;
+      return { sent: true, reason: "sent" };
+    },
+    autoSendComposerGraceMs: 100,
+  });
+  await startManualVerification(TEST_ID);
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(calls, 1);
+  assert.notEqual(getManualVerificationStatus(TEST_ID)?.state, "verified");
+});
+
+test("manual verification: preferred choice requires human, no ambiguous send", async () => {
+  installHarness({ loggedIn: true });
+  let calls = 0;
+  setManualVerificationDeps({
+    sendWaitingMessage: async () => {
+      calls += 1;
+      return { sent: false, reason: "preferred-choice-required" };
+    },
+    autoSendComposerGraceMs: 100,
+  });
+  await startManualVerification(TEST_ID);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(calls, 1);
+  assert.notEqual(getManualVerificationStatus(TEST_ID)?.state, "verified");
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

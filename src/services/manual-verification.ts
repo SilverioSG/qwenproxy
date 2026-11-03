@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { parseJwtExpiry } from "../utils/jwt.ts";
 import { getJarPair, setCookiePairInJar } from "./qwen-token-refresh.ts";
 import type { AuthValidationState } from "./auth-contract.ts";
+import { COMPOSER_SELECTORS, SEND_BUTTON_SELECTORS } from "./composer-probe.ts";
 import { chromium, type BrowserContext, type Page } from "patchright";
 
 export type ManualVerificationState =
@@ -255,12 +256,146 @@ export async function saveManualAuthSession(
   if (!result.saved) throw new Error(`Manual session not persisted: ${result.reason ?? "unknown"}`);
 }
 
+export interface AutoSendResult {
+  sent: boolean;
+  reason:
+    | "sent"
+    | "challenge"
+    | "in-progress"
+    | "composer-missing"
+    | "composer-has-text"
+    | "preferred-choice-required"
+    | "error"
+    | string;
+  detail?: string;
+}
+
+/**
+ * Send one test message in the already-visible official Chromium page.
+ * Only called while the flow is waiting and the page is authenticated.
+ * Never selects a CAPTCHA/OTP, never sends during an active response and
+ * never chooses an ambiguous preferred-response control.
+ */
+export async function defaultSendWaitingMessage(
+  page: Page,
+  accountId: string,
+  prompt: string,
+): Promise<AutoSendResult> {
+  try {
+    if (page.isClosed()) {
+      return { sent: false, reason: "composer-missing", detail: "page closed" };
+    }
+    const url = page.url();
+    if (url.includes("/auth") || url.includes("/login")) {
+      return { sent: false, reason: "challenge", detail: "auth-url" };
+    }
+    const state = await page
+      .evaluate(() => {
+        const challenge = Boolean(
+          document.querySelector(
+            "[class*='captcha'], [id*='captcha'], [class*='punish'], [class*='challenge']",
+          ),
+        );
+        const busy = Boolean(
+          document.querySelector(
+            "button[aria-label*='Stop' i], .stop-button, [class*='stop-button'], [class*='generating'], [data-generating='true'], [class*='streaming'], [aria-busy='true']",
+          ),
+        );
+        // Only an explicitly identified preferred-response control blocks
+        // automation; no ambiguous button is clicked.
+        const preferred = Boolean(
+          document.querySelector(
+            "[data-testid='preferred-response'], [data-testid*='preferred-response']",
+          ),
+        );
+        return { challenge, busy, preferred };
+      })
+      .catch(() => ({ challenge: false, busy: false, preferred: false }));
+    if (state.challenge) return { sent: false, reason: "challenge" };
+    if (state.busy) return { sent: false, reason: "in-progress" };
+    if (state.preferred) return { sent: false, reason: "preferred-choice-required" };
+
+    const selector = COMPOSER_SELECTORS.join(", ");
+    const input = page.locator(selector).first();
+    if ((await input.count()) === 0) {
+      return { sent: false, reason: "composer-missing", detail: "not found" };
+    }
+    await input
+      .waitFor({ state: "visible", timeout: 5000 })
+      .catch(() => undefined);
+    if (!(await input.isVisible().catch(() => false))) {
+      return { sent: false, reason: "composer-missing", detail: "not visible" };
+    }
+    if (await input.isDisabled().catch(() => true)) {
+      return { sent: false, reason: "composer-missing", detail: "disabled" };
+    }
+    const existing = await input.inputValue().catch(() => "");
+    if (existing.trim().length > 0) {
+      return { sent: false, reason: "composer-has-text" };
+    }
+
+    await input.focus().catch(() => undefined);
+    await input.fill(prompt).catch(() => undefined);
+    let landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
+    if (!landed) {
+      await page
+        .evaluate(
+          ({ sel, text }) => {
+            const el = document.querySelector(sel) as HTMLTextAreaElement | null;
+            if (!el) return;
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype,
+              "value",
+            )?.set;
+            if (setter) setter.call(el, text);
+            else el.value = text;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          },
+          { sel: selector, text: prompt },
+        )
+        .catch(() => undefined);
+      landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
+      if (!landed) {
+        return { sent: false, reason: "composer-missing", detail: "value not landed" };
+      }
+    }
+
+    let clicked = false;
+    for (const sendSelector of SEND_BUTTON_SELECTORS) {
+      const btn = page.locator(sendSelector).first();
+      if ((await btn.count()) === 0) continue;
+      if (!(await btn.isVisible().catch(() => false))) continue;
+      if (await btn.isDisabled().catch(() => true)) continue;
+      await btn.click({ delay: 50 }).catch(() => undefined);
+      clicked = true;
+      break;
+    }
+    if (!clicked) await page.keyboard.press("Enter").catch(() => undefined);
+    return { sent: true, reason: "sent", detail: `account=${accountId.slice(0, 8)}` };
+  } catch (err) {
+    return {
+      sent: false,
+      reason: "error",
+      detail: String((err as Error)?.message || err).slice(0, 160),
+    };
+  }
+}
+
 const deps: {
   launchBrowser: BrowserLauncher;
   probeLogin: (
     page: Page,
     timeoutMs: number,
   ) => Promise<{ ok: boolean; reason: string }>;
+  sendWaitingMessage: (
+    page: Page,
+    accountId: string,
+    prompt: string,
+  ) => Promise<AutoSendResult>;
+  /** Grace for a missing composer before failing the automatic send. */
+  autoSendComposerGraceMs?: number;
   sleep: (ms: number) => Promise<void>;
   headedChromeExists: () => boolean;
   singletonLocked: (profileDir: string) => boolean;
@@ -341,6 +476,8 @@ const deps: {
     const { probePageLoggedIn } = await import("./playwright.ts");
     return probePageLoggedIn(page, timeoutMs);
   },
+  sendWaitingMessage: defaultSendWaitingMessage,
+  autoSendComposerGraceMs: 15_000,
   sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
   headedChromeExists: () => fs.existsSync(HEADED_CHROME_PATH),
   singletonLocked: (profileDir: string) => singletonLockPresent(profileDir),
@@ -1022,6 +1159,10 @@ async function runVerification(accountId: string): Promise<void> {
     let loginHint = false;
     let lastLogAt = 0;
     let sawClose = false;
+    let autoSendAttempted = false;
+    let autoSendAt = 0;
+    let autoSendResult: AutoSendResult | null = null;
+    const autoPrompt = "¿Cuánto es 2 + 2?";
     const maybeLog = (): void => {
       if (now() - lastLogAt < 10000) return;
       lastLogAt = now();
@@ -1058,8 +1199,64 @@ async function runVerification(accountId: string): Promise<void> {
             "Authenticated — send a test message in Qwen",
           );
         }
+        // Automatic test message: only once, only when the official page is
+        // authenticated and no completion is already in flight. CAPTCHA/OTP,
+        // active generations, missing composers and ambiguous preference UIs
+        // are left to the human; they are never automated.
+        if (probe.ok && evidence() === "none" && !autoSendAttempted) {
+          autoSendAttempted = true;
+          autoSendAt = now();
+          try {
+            autoSendResult = await deps.sendWaitingMessage(
+              page,
+              accountId,
+              autoPrompt,
+            );
+          } catch (err) {
+            autoSendResult = {
+              sent: false,
+              reason: "error",
+              detail: String((err as Error)?.message || err).slice(0, 160),
+            };
+          }
+          const autoId = `auto-${accountId.slice(0, 8)}-${autoSendAt}`;
+          logEvent(
+            entry,
+            accountId,
+            `auto-send id=${autoId} account=${accountId.slice(0, 8)} result=${autoSendResult.reason}${autoSendResult.detail ? ` | ${autoSendResult.detail}` : ""}`,
+          );
+          if (autoSendResult.sent) {
+            setStatus(
+              entry,
+              "waiting",
+              "Automatic test message sent — waiting for Qwen response",
+            );
+          } else if (autoSendResult.reason === "challenge") {
+            setStatus(
+              entry,
+              "waiting",
+              "Verification challenge detected — solve it manually",
+            );
+          } else if (autoSendResult.reason === "preferred-choice-required") {
+            setStatus(
+              entry,
+              "waiting",
+              "Preferred response choice requires human intervention",
+            );
+          }
+        }
       } catch {
         lastLoginClass = "evaluate-error";
+      }
+      if (
+        autoSendResult?.reason === "composer-missing" &&
+        autoSendAt > 0 &&
+        now() - autoSendAt > (deps.autoSendComposerGraceMs ?? 15_000) &&
+        evidence() !== "done"
+      ) {
+        detachListener();
+        finish("failed", "Composer not available for automatic test message");
+        return;
       }
       if (evidence() === "done") break;
       maybeLog();
