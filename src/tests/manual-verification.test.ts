@@ -691,7 +691,7 @@ test("manual verification: autofillQwenLoginForm no-form without touching passwo
   assert.deepEqual(filled, []);
 });
 
-test("manual verification: autofillQwenLoginForm authenticated composer is not no-form", async () => {
+test("manual verification: guest composer is not accepted as logged-in", async () => {
   const { autofillQwenLoginForm } = await import("../services/playwright.ts");
   let filled: string[] = [];
   let gotoCalls = 0;
@@ -720,9 +720,10 @@ test("manual verification: autofillQwenLoginForm authenticated composer is not n
     },
   };
   const r = await autofillQwenLoginForm(page as never, "e@x.com", "s3cret");
-  assert.deepEqual(r, { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" });
+  assert.equal(r.reason, "no-form");
+  assert.equal(r.alreadyLoggedIn, false);
   assert.deepEqual(filled, []);
-  assert.equal(gotoCalls, 0, "authenticated composer must not navigate to /auth");
+  assert.ok(gotoCalls >= 1, "guest composer must not short-circuit login");
 });
 
 test("manual verification: autofill implementation never solves captcha", async () => {
@@ -1092,6 +1093,76 @@ test("manual verification: cancelled auto-send does not dispatch after cancellat
   assert.equal(r.reason, "cancelled");
   assert.equal(filled, false);
   assert.equal(clicked, false);
+});
+
+test("manual verification: swallowed send click is not reported as sent", async () => {
+  const prompt = "¿Cuánto es 2 + 2?";
+  let filled = false;
+  let value = "";
+  const input = {
+    count: async () => 1,
+    waitFor: async () => {},
+    isVisible: async () => true,
+    isDisabled: async () => false,
+    inputValue: async () => value,
+    focus: async () => {},
+    fill: async () => {
+      filled = true;
+      value = prompt;
+    },
+    click: async () => {
+      throw new Error("click intercepted by modal");
+    },
+  };
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    evaluate: async () => ({ challenge: false, busy: false, preferred: false, birthYear: false }),
+    locator: () => ({ first: () => input }),
+    keyboard: {
+      press: async () => {
+        throw new Error("Enter intercepted");
+      },
+    },
+  };
+  const r = await defaultSendWaitingMessage(page as never, TEST_ID, prompt);
+  assert.equal(r.reason, "send-action-failed");
+  assert.equal(r.sent, false);
+  assert.equal(filled, true);
+});
+
+test("manual verification: birth-year modal blocks auto-send", async () => {
+  let filled = false;
+  const input = {
+    count: async () => 1,
+    waitFor: async () => {},
+    isVisible: async () => true,
+    isDisabled: async () => false,
+    inputValue: async () => "",
+    focus: async () => {},
+    fill: async () => {
+      filled = true;
+    },
+    click: async () => {},
+  };
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    evaluate: async () => ({ challenge: false, busy: false, preferred: false, birthYear: true }),
+    locator: () => ({ first: () => input }),
+    keyboard: { press: async () => {} },
+  };
+  const r = await defaultSendWaitingMessage(page as never, TEST_ID, "¿Cuánto es 2 + 2?");
+  assert.equal(r.reason, "birth-year-required");
+  assert.equal(r.sent, false);
+  assert.equal(filled, false);
+});
+
+test("manual verification: stealth script never invents a birth year", async () => {
+  const { getStealthScript } = await import("../services/playwright.ts");
+  const script = getStealthScript({} as never);
+  assert.ok(!script.includes("1995-06-15"));
+  assert.ok(!script.includes("parsed.birthday"));
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

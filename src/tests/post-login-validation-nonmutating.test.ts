@@ -218,10 +218,12 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   // legacy isPageLoggedIn call, so the legacy call-site count drops by one.
   // The two startup-validation checks are now explicitly non-mutating (L);
   // the remaining legacy callers keep the full probe.
-  assert.ok(calls.length >= 4, `expected the remaining legacy call sites, got ${calls.length}`);
-  // Only the two post-login confirmations may pass an options object, and both
-  // must be non-mutating: loginViaApi's post-install validation and the
-  // executeReauth confirmation in refreshHeadersInternal.
+  // The manual-verification autofill now performs the non-mutating settings
+  // proof, so the remaining legacy isPageLoggedIn callers are three.
+  assert.ok(calls.length >= 3, `expected the remaining legacy call sites, got ${calls.length}`);
+  // Only post-login confirmations and the manual-verification autofill
+  // preflight may pass options: executeReauth plus the two captureQwenHeaders
+  // gates, plus the autofill auth proof. All are non-mutating.
   // Only post-login confirmations may pass options: executeReauth plus the two
   // captureQwenHeaders gates. Counted by the option itself, not by "{" (the
   // isPageLoggedIn signature itself also takes an options object).
@@ -232,7 +234,7 @@ test("J. other isPageLoggedIn callers keep the previous contract", () => {
   ];
   assert.equal(
     withOptions.length,
-    3,
+    4,
     "only the post-login confirmations may pass options",
   );
   // And the full probe still calls auths + refresh.

@@ -265,6 +265,8 @@ export interface AutoSendResult {
     | "composer-missing"
     | "composer-has-text"
     | "preferred-choice-required"
+    | "birth-year-required"
+    | "send-action-failed"
     | "cancelled"
     | "error"
     | string;
@@ -312,13 +314,21 @@ export async function defaultSendWaitingMessage(
             "[data-testid='preferred-response'], [data-testid*='preferred-response']",
           ),
         );
-        return { challenge, busy, preferred };
+        // Age/birth-year confirmation is HUMAN-ONLY. It is not a CAPTCHA/OTP
+        // and must never be confirmed with an invented biographical value.
+        const birthYear = Boolean(
+          document.querySelector(
+            ".age-confirmation-modal, [data-testid*='birth-year'], [data-testid*='birthYear'], [class*='age-confirmation']",
+          ),
+        );
+        return { challenge, busy, preferred, birthYear };
       })
-      .catch(() => ({ challenge: false, busy: false, preferred: false }));
+      .catch(() => ({ challenge: false, busy: false, preferred: false, birthYear: false }));
     if (cancelled()) return { sent: false, reason: "cancelled" };
     if (state.challenge) return { sent: false, reason: "challenge" };
     if (state.busy) return { sent: false, reason: "in-progress" };
     if (state.preferred) return { sent: false, reason: "preferred-choice-required" };
+    if (state.birthYear) return { sent: false, reason: "birth-year-required" };
 
     const selector = COMPOSER_SELECTORS.join(", ");
     const input = page.locator(selector).first();
@@ -376,11 +386,27 @@ export async function defaultSendWaitingMessage(
       if ((await btn.count()) === 0) continue;
       if (!(await btn.isVisible().catch(() => false))) continue;
       if (await btn.isDisabled().catch(() => true)) continue;
-      await btn.click({ delay: 50 }).catch(() => undefined);
-      clicked = true;
-      break;
+      try {
+        await btn.click({ delay: 50 });
+        clicked = true;
+        break;
+      } catch {
+        // The SPA may reject the click (overlay, unauthenticated composer,
+        // hydration). Do not report success for a swallowed click.
+        continue;
+      }
     }
-    if (!clicked) await page.keyboard.press("Enter").catch(() => undefined);
+    if (!clicked) {
+      try {
+        await page.keyboard.press("Enter");
+        clicked = true;
+      } catch {
+        // Fall through to an explicit failure.
+      }
+    }
+    if (!clicked) {
+      return { sent: false, reason: "send-action-failed" };
+    }
     return { sent: true, reason: "sent", detail: `account=${accountId.slice(0, 8)}` };
   } catch (err) {
     return {
@@ -1264,6 +1290,12 @@ async function runVerification(accountId: string): Promise<void> {
               entry,
               "waiting",
               "Preferred response choice requires human intervention",
+            );
+          } else if (autoSendResult.reason === "birth-year-required") {
+            setStatus(
+              entry,
+              "waiting",
+              "Birth year confirmation required — human intervention",
             );
           }
         }

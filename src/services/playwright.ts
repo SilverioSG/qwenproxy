@@ -81,7 +81,6 @@ import {
   subtlePageActivity,
 } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
-import { COMPOSER_SELECTORS } from "./composer-probe.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
@@ -1081,8 +1080,16 @@ async function clearVisibleChallenge(page: Page): Promise<void> {
   }
 
   // 2. Dismiss any overlay modals (Welcome to Qwen, Terms/Consent, Whats New, etc.)
-  // that can block the chat textarea or send button
+  // that can block the chat textarea or send button. Age/birth-year
+  // confirmation is deliberately excluded: it requires a human decision and
+  // must not be accepted with an invented value.
   try {
+    const ageModal = page
+      .locator(".age-confirmation-modal, [data-testid*='birth-year'], [data-testid*='birthYear']")
+      .first();
+    if (await ageModal.isVisible({ timeout: 150 }).catch(() => false)) {
+      return;
+    }
     const modalCloseSelectors = [
       ".ant-modal-close",
       ".ant-modal-close-x",
@@ -1561,19 +1568,11 @@ export function getStealthScript(profile: FingerprintProfile): string {
         }
       } catch(e) {}
 
-      // --- Auto-resolve birthday compliance & eliminate false logout markers ---
+      // --- Remove false logout markers only ---
+      // Birth-year / age confirmation is HUMAN-ONLY. Never invent or persist a
+      // biographical value here.
       try {
         localStorage.removeItem("qwen_token_logged_out_marker");
-        const b = localStorage.getItem("qwen_account_birthday");
-        if (b) {
-          try {
-            const parsed = JSON.parse(b);
-            if (!parsed.birthday) {
-              parsed.birthday = "1995-06-15";
-              localStorage.setItem("qwen_account_birthday", JSON.stringify(parsed));
-            }
-          } catch {}
-        }
       } catch(e) {}
     })();
   `;
@@ -4040,30 +4039,15 @@ export async function autofillQwenLoginForm(
     return { submitted: false, alreadyLoggedIn: false, reason: "no-credentials" };
   }
   try {
-    if (await isPageLoggedIn(page, 5000)) {
+    // Non-mutating settings is the authority here. The full auths probe has a
+    // known auths-schema false negative, and a visible composer alone can be a
+    // guest/expired-session composer. Do not navigate or send based on the
+    // composer without this authenticated proof.
+    if (await isPageLoggedIn(page, 5000, { nonMutating: true })) {
       return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
     }
   } catch {
     // Fall through to form fill on probe failure.
-  }
-  // Auths-schema is a known false negative. Check the authenticated chat
-  // composer BEFORE navigating to /auth: otherwise a valid session is sent to
-  // the login page, where the auto-send correctly refuses on auth-url and the
-  // account is misclassified as challenge/human.
-  try {
-    const preUrl = typeof page.url === "function" ? page.url() : "";
-    if (!preUrl.includes("/auth") && !preUrl.includes("/login")) {
-      const composerSelector = COMPOSER_SELECTORS.slice(0, 3).join(", ");
-      const composerVisible = await page
-        .waitForSelector(composerSelector, { state: "visible", timeout: 2000 })
-        .then(() => true)
-        .catch(() => false);
-      if (composerVisible) {
-        return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
-      }
-    }
-  } catch {
-    // Fall through to the normal login flow.
   }
   try {
     const url = typeof page.url === "function" ? page.url() : "";
@@ -4128,19 +4112,6 @@ export async function autofillQwenLoginForm(
           return { submitted: false, alreadyLoggedIn: false, reason: "challenge-wall" };
         }
       } catch {}
-      // Auths-schema is a known false negative. If the SPA is already
-      // authenticated, /auth may redirect to chat and expose the composer
-      // instead of an email field. Treat that as "already logged in", not as
-      // a permanent no-form failure. A real logged-out/changed login page has
-      // no authenticated composer, so it still returns no-form.
-      const composerSelector = COMPOSER_SELECTORS.slice(0, 3).join(", ");
-      const composerVisible = await page
-        .waitForSelector(composerSelector, { state: "visible", timeout: 3000 })
-        .then(() => true)
-        .catch(() => false);
-      if (composerVisible) {
-        return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
-      }
       return { submitted: false, alreadyLoggedIn: false, reason: "no-form" };
     }
     try {
