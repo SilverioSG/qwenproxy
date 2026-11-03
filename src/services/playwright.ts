@@ -60,7 +60,7 @@ import { traceSessionEvent } from "./session-tracer.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
 // only depends on config/logger, so playwright -> account-concurrency stays
 // acyclic, while the reverse direction would drag the browser layer into core.
-import { hasActiveAccountLease } from "../core/account-concurrency.ts";
+import { hasActiveAccountLease, isAccountTemporarilyBusy } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
 import { maskEmail, logger } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
@@ -5685,7 +5685,7 @@ export function getActivePlaywrightAccountIds(): string[] {
 export function getIdlePlaywrightAccountIds(idleMs: number): string[] {
   const now = Date.now();
   return Array.from(accountPages.keys()).filter((accountId) => {
-    if (isAccountServingStream(accountId)) return false;
+    if (isAccountServingStream(accountId) || isAccountTemporarilyBusy(accountId)) return false;
     const mutex = accountMutexes.get(accountId);
     if (!mutex?.isIdle()) return false;
     const lastActivity = lastAccountActivity.get(accountId) ?? 0;
@@ -5728,6 +5728,19 @@ function priorityOrderForEviction(accountIds: string[]): string[] {
   );
 }
 
+/** Recheck account activity after acquiring the same mutex used for closing. */
+async function closeIdleAccountIfStillUnclaimed(accountId: string): Promise<boolean> {
+  const release = await acquireAccountMutex(accountId, `close:${accountId.substring(0, 12)}`);
+  try {
+    if (isAccountServingStream(accountId) || isAccountTemporarilyBusy(accountId)) return false;
+    if (!accountContexts.has(accountId) && !accountPages.has(accountId)) return false;
+    await closePlaywrightForAccountLocked(accountId);
+    return true;
+  } finally {
+    release();
+  }
+}
+
 export async function closeIdlePlaywrightAccounts(
   idleMs: number,
 ): Promise<number> {
@@ -5756,7 +5769,7 @@ export async function closeIdlePlaywrightAccounts(
 
     // Re-checked per account: closing the previous one is awaited, and a
     // request can have claimed this account in the meantime.
-    if (isAccountServingStream(candidate.accountId)) continue;
+    if (isAccountServingStream(candidate.accountId) || isAccountTemporarilyBusy(candidate.accountId)) continue;
 
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
@@ -5767,12 +5780,13 @@ export async function closeIdlePlaywrightAccounts(
     void import("./session-tracer.ts").then((m) =>
       m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
     ).catch(() => {});
-    await closePlaywrightForAccount(candidate.accountId).catch((error) => {
+    const didClose = await closeIdleAccountIfStillUnclaimed(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
       );
+      return false;
     });
-    closed++;
+    if (didClose) closed++;
   }
   return closed;
 }
@@ -5790,7 +5804,7 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   const candidates = priorityOrderForEviction(
     Array.from(accountPages.keys()).filter((accountId) => {
       const mutex = accountMutexes.get(accountId);
-      return mutex?.isIdle() && !isAccountServingStream(accountId);
+      return mutex?.isIdle() && !isAccountServingStream(accountId) && !isAccountTemporarilyBusy(accountId);
     }),
   ).map((accountId) => ({
     accountId,
@@ -5801,7 +5815,7 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   let closed = 0;
   for (const candidate of candidates) {
     if (accountPages.size <= max) break;
-    if (isAccountServingStream(candidate.accountId)) continue;
+    if (isAccountServingStream(candidate.accountId) || isAccountTemporarilyBusy(candidate.accountId)) continue;
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
@@ -5811,12 +5825,13 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
     void import("./session-tracer.ts").then((m) =>
       m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
     ).catch(() => {});
-    await closePlaywrightForAccount(candidate.accountId).catch((error) => {
+    const didClose = await closeIdleAccountIfStillUnclaimed(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
       );
+      return false;
     });
-    closed++;
+    if (didClose) closed++;
   }
 
   return closed;

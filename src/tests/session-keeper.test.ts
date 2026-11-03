@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import { config } from "../core/config.ts";
 import {
   acquireAccountLease,
+  markAccountTemporarilyBusy,
+  clearTemporaryBusy,
   resetAccountConcurrencyForTests,
 } from "../core/account-concurrency.ts";
 import {
   closeIdlePlaywrightAccounts,
+  evictIdlePlaywrightContextsToLimit,
   closePlaywrightForAccount,
   getIdlePlaywrightAccountIds,
   isPlaywrightInitialized,
@@ -107,6 +110,106 @@ test("idle sweep never closes a context that holds a stream lease", async () => 
   } finally {
     config.playwright.maxActiveContexts = originalMax;
     await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("idle sweep preserves the account context while manual verification is busy", async () => {
+  resetAccountConcurrencyForTests();
+  const originalMax = config.playwright.maxActiveContexts;
+  config.playwright.maxActiveContexts = 0;
+  const accountId = "manual-verification-busy";
+  registerPlaywrightAccountForTests(accountId, stubPage(), STALE_ACTIVITY_AT);
+  markAccountTemporarilyBusy(accountId, 120_000);
+  try {
+    assert.deepEqual(getIdlePlaywrightAccountIds(IDLE_MS), []);
+    assert.equal(await closeIdlePlaywrightAccounts(IDLE_MS), 0);
+    assert.equal(isPlaywrightInitialized(accountId), true);
+  } finally {
+    clearTemporaryBusy(accountId);
+    config.playwright.maxActiveContexts = originalMax;
+    await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("context limit evicts another idle context instead of the account being verified", async () => {
+  resetAccountConcurrencyForTests();
+  const originalMax = config.playwright.maxActiveContexts;
+  config.playwright.maxActiveContexts = 1;
+  const busy = "manual-verification-busy-limit";
+  const idle = "manual-verification-idle-limit";
+  registerPlaywrightAccountForTests(idle, stubPage(), STALE_ACTIVITY_AT);
+  registerPlaywrightAccountForTests(busy, stubPage(), STALE_ACTIVITY_AT - 1);
+  markAccountTemporarilyBusy(busy, 120_000);
+  try {
+    assert.equal(await evictIdlePlaywrightContextsToLimit(), 1);
+    assert.equal(isPlaywrightInitialized(busy), true);
+    assert.equal(isPlaywrightInitialized(idle), false);
+  } finally {
+    clearTemporaryBusy(busy);
+    config.playwright.maxActiveContexts = originalMax;
+    await closePlaywrightForAccount(busy).catch(() => {});
+    await closePlaywrightForAccount(idle).catch(() => {});
+  }
+});
+
+test("context limit preserves all active stream leases even above the limit", async () => {
+  resetAccountConcurrencyForTests();
+  const originalMax = config.playwright.maxActiveContexts;
+  config.playwright.maxActiveContexts = 1;
+  const accounts = ["eviction-stream-a", "eviction-stream-b"];
+  for (const accountId of accounts) {
+    registerPlaywrightAccountForTests(accountId, stubPage(), STALE_ACTIVITY_AT);
+  }
+  const leases = await Promise.all(accounts.map((accountId) => acquireAccountLease(accountId)));
+  try {
+    assert.equal(await evictIdlePlaywrightContextsToLimit(), 0);
+    for (const accountId of accounts) assert.equal(isPlaywrightInitialized(accountId), true);
+  } finally {
+    for (const lease of leases) lease.release();
+    config.playwright.maxActiveContexts = originalMax;
+    for (const accountId of accounts) await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("context limit closes the idle context while preserving an active stream", async () => {
+  resetAccountConcurrencyForTests();
+  const originalMax = config.playwright.maxActiveContexts;
+  config.playwright.maxActiveContexts = 1;
+  const active = "eviction-stream-active";
+  const idle = "eviction-stream-idle";
+  registerPlaywrightAccountForTests(idle, stubPage(), STALE_ACTIVITY_AT);
+  registerPlaywrightAccountForTests(active, stubPage(), STALE_ACTIVITY_AT);
+  const lease = await acquireAccountLease(active);
+  try {
+    assert.equal(await evictIdlePlaywrightContextsToLimit(), 1);
+    assert.equal(isPlaywrightInitialized(active), true);
+    assert.equal(isPlaywrightInitialized(idle), false);
+  } finally {
+    lease.release();
+    config.playwright.maxActiveContexts = originalMax;
+    await closePlaywrightForAccount(active).catch(() => {});
+    await closePlaywrightForAccount(idle).catch(() => {});
+  }
+});
+
+test("context eviction preserves a stream lease acquired while closure waits for its mutex", async () => {
+  resetAccountConcurrencyForTests();
+  const originalMax = config.playwright.maxActiveContexts;
+  config.playwright.maxActiveContexts = 1;
+  const idle = "eviction-race-other";
+  const target = "eviction-race-new-lease";
+  registerPlaywrightAccountForTests(idle, stubPage(), STALE_ACTIVITY_AT);
+  registerPlaywrightAccountForTests(target, stubPage(), STALE_ACTIVITY_AT);
+  const eviction = evictIdlePlaywrightContextsToLimit();
+  const lease = await acquireAccountLease(target);
+  try {
+    await eviction;
+    assert.equal(isPlaywrightInitialized(target), true);
+  } finally {
+    lease.release();
+    config.playwright.maxActiveContexts = originalMax;
+    await closePlaywrightForAccount(target).catch(() => {});
+    await closePlaywrightForAccount(idle).catch(() => {});
   }
 });
 
