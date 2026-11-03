@@ -265,6 +265,7 @@ export interface AutoSendResult {
     | "composer-missing"
     | "composer-has-text"
     | "preferred-choice-required"
+    | "cancelled"
     | "error"
     | string;
   detail?: string;
@@ -280,8 +281,11 @@ export async function defaultSendWaitingMessage(
   page: Page,
   accountId: string,
   prompt: string,
+  isCancelled?: () => boolean,
 ): Promise<AutoSendResult> {
+  const cancelled = (): boolean => isCancelled?.() === true;
   try {
+    if (cancelled()) return { sent: false, reason: "cancelled" };
     if (page.isClosed()) {
       return { sent: false, reason: "composer-missing", detail: "page closed" };
     }
@@ -311,6 +315,7 @@ export async function defaultSendWaitingMessage(
         return { challenge, busy, preferred };
       })
       .catch(() => ({ challenge: false, busy: false, preferred: false }));
+    if (cancelled()) return { sent: false, reason: "cancelled" };
     if (state.challenge) return { sent: false, reason: "challenge" };
     if (state.busy) return { sent: false, reason: "in-progress" };
     if (state.preferred) return { sent: false, reason: "preferred-choice-required" };
@@ -323,6 +328,7 @@ export async function defaultSendWaitingMessage(
     await input
       .waitFor({ state: "visible", timeout: 5000 })
       .catch(() => undefined);
+    if (cancelled()) return { sent: false, reason: "cancelled" };
     if (!(await input.isVisible().catch(() => false))) {
       return { sent: false, reason: "composer-missing", detail: "not visible" };
     }
@@ -334,6 +340,7 @@ export async function defaultSendWaitingMessage(
       return { sent: false, reason: "composer-has-text" };
     }
 
+    if (cancelled()) return { sent: false, reason: "cancelled" };
     await input.focus().catch(() => undefined);
     await input.fill(prompt).catch(() => undefined);
     let landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
@@ -362,6 +369,7 @@ export async function defaultSendWaitingMessage(
       }
     }
 
+    if (cancelled()) return { sent: false, reason: "cancelled" };
     let clicked = false;
     for (const sendSelector of SEND_BUTTON_SELECTORS) {
       const btn = page.locator(sendSelector).first();
@@ -393,6 +401,7 @@ const deps: {
     page: Page,
     accountId: string,
     prompt: string,
+    isCancelled?: () => boolean,
   ) => Promise<AutoSendResult>;
   /** Grace for a missing composer before failing the automatic send. */
   autoSendComposerGraceMs?: number;
@@ -1223,6 +1232,7 @@ async function runVerification(accountId: string): Promise<void> {
               page,
               accountId,
               autoPrompt,
+              () => entry.cancelRequested === true,
             );
           } catch (err) {
             autoSendResult = {

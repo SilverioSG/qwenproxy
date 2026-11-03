@@ -26,6 +26,7 @@ import {
   saveManualAuthSession,
   selectManualAccessToken,
   classifyManualSettingsResponse,
+  defaultSendWaitingMessage,
 } from "../services/manual-verification.ts";
 
 const TEST_ID = "00000000-0000-4000-8000-manualverify1";
@@ -690,6 +691,36 @@ test("manual verification: autofillQwenLoginForm no-form without touching passwo
   assert.deepEqual(filled, []);
 });
 
+test("manual verification: autofillQwenLoginForm authenticated composer is not no-form", async () => {
+  const { autofillQwenLoginForm } = await import("../services/playwright.ts");
+  let filled: string[] = [];
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    evaluate: async () => false,
+    waitForSelector: async (sel: string) => {
+      if (/email|correo/i.test(sel)) throw new Error("no email form");
+      if (sel.includes("message-input-textarea")) return {} as never;
+      throw new Error("timeout");
+    },
+    fill: async (sel: string) => {
+      filled.push(sel);
+    },
+    locator: () => ({
+      first: () => ({
+        isVisible: async () => false,
+        click: async () => {},
+      }),
+    }),
+    getByText: () => ({ first: () => ({ isVisible: async () => false, click: async () => {} }) }),
+    keyboard: { press: async () => {} },
+    goto: async () => {},
+  };
+  const r = await autofillQwenLoginForm(page as never, "e@x.com", "s3cret");
+  assert.deepEqual(r, { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" });
+  assert.deepEqual(filled, []);
+});
+
 test("manual verification: autofill implementation never solves captcha", async () => {
   const fs = await import("node:fs");
   const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
@@ -1015,6 +1046,48 @@ test("manual verification: preferred choice requires human, no ambiguous send", 
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(calls, 1);
   assert.notEqual(getManualVerificationStatus(TEST_ID)?.state, "verified");
+});
+
+test("manual verification: cancelled auto-send does not dispatch after cancellation", async () => {
+  let cancelled = false;
+  let filled = false;
+  let clicked = false;
+  const input = {
+    count: async () => 1,
+    waitFor: async () => {
+      cancelled = true;
+    },
+    isVisible: async () => true,
+    isDisabled: async () => false,
+    inputValue: async () => "",
+    focus: async () => {},
+    fill: async () => {
+      filled = true;
+    },
+    click: async () => {
+      clicked = true;
+    },
+  };
+  const page: unknown = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    evaluate: async () => ({ challenge: false, busy: false, preferred: false }),
+    locator: () => ({ first: () => input }),
+    keyboard: {
+      press: async () => {
+        clicked = true;
+      },
+    },
+  };
+  const r = await defaultSendWaitingMessage(
+    page as never,
+    TEST_ID,
+    "¿Cuánto es 2 + 2?",
+    () => cancelled,
+  );
+  assert.equal(r.reason, "cancelled");
+  assert.equal(filled, false);
+  assert.equal(clicked, false);
 });
 
 test("manual verification: resolveManualDisplay returns usable display or explicit error", () => {

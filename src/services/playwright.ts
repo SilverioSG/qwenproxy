@@ -81,6 +81,7 @@ import {
   subtlePageActivity,
 } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
+import { COMPOSER_SELECTORS } from "./composer-probe.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
@@ -4108,6 +4109,19 @@ export async function autofillQwenLoginForm(
           return { submitted: false, alreadyLoggedIn: false, reason: "challenge-wall" };
         }
       } catch {}
+      // Auths-schema is a known false negative. If the SPA is already
+      // authenticated, /auth may redirect to chat and expose the composer
+      // instead of an email field. Treat that as "already logged in", not as
+      // a permanent no-form failure. A real logged-out/changed login page has
+      // no authenticated composer, so it still returns no-form.
+      const composerSelector = COMPOSER_SELECTORS.slice(0, 3).join(", ");
+      const composerVisible = await page
+        .waitForSelector(composerSelector, { state: "visible", timeout: 3000 })
+        .then(() => true)
+        .catch(() => false);
+      if (composerVisible) {
+        return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
+      }
       return { submitted: false, alreadyLoggedIn: false, reason: "no-form" };
     }
     try {
