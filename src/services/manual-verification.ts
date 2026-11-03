@@ -257,9 +257,9 @@ export async function saveManualAuthSession(
 }
 
 export interface AutoSendResult {
-  sent: boolean;
+  actionExecuted: boolean;
   reason:
-    | "sent"
+    | "action-executed"
     | "challenge"
     | "in-progress"
     | "composer-missing"
@@ -287,13 +287,13 @@ export async function defaultSendWaitingMessage(
 ): Promise<AutoSendResult> {
   const cancelled = (): boolean => isCancelled?.() === true;
   try {
-    if (cancelled()) return { sent: false, reason: "cancelled" };
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
     if (page.isClosed()) {
-      return { sent: false, reason: "composer-missing", detail: "page closed" };
+      return { actionExecuted: false, reason: "composer-missing", detail: "page closed" };
     }
     const url = page.url();
     if (url.includes("/auth") || url.includes("/login")) {
-      return { sent: false, reason: "challenge", detail: "auth-url" };
+      return { actionExecuted: false, reason: "challenge", detail: "auth-url" };
     }
     const state = await page
       .evaluate(() => {
@@ -324,33 +324,33 @@ export async function defaultSendWaitingMessage(
         return { challenge, busy, preferred, birthYear };
       })
       .catch(() => ({ challenge: false, busy: false, preferred: false, birthYear: false }));
-    if (cancelled()) return { sent: false, reason: "cancelled" };
-    if (state.challenge) return { sent: false, reason: "challenge" };
-    if (state.busy) return { sent: false, reason: "in-progress" };
-    if (state.preferred) return { sent: false, reason: "preferred-choice-required" };
-    if (state.birthYear) return { sent: false, reason: "birth-year-required" };
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
+    if (state.challenge) return { actionExecuted: false, reason: "challenge" };
+    if (state.busy) return { actionExecuted: false, reason: "in-progress" };
+    if (state.preferred) return { actionExecuted: false, reason: "preferred-choice-required" };
+    if (state.birthYear) return { actionExecuted: false, reason: "birth-year-required" };
 
     const selector = COMPOSER_SELECTORS.join(", ");
     const input = page.locator(selector).first();
     if ((await input.count()) === 0) {
-      return { sent: false, reason: "composer-missing", detail: "not found" };
+      return { actionExecuted: false, reason: "composer-missing", detail: "not found" };
     }
     await input
       .waitFor({ state: "visible", timeout: 5000 })
       .catch(() => undefined);
-    if (cancelled()) return { sent: false, reason: "cancelled" };
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
     if (!(await input.isVisible().catch(() => false))) {
-      return { sent: false, reason: "composer-missing", detail: "not visible" };
+      return { actionExecuted: false, reason: "composer-missing", detail: "not visible" };
     }
     if (await input.isDisabled().catch(() => true)) {
-      return { sent: false, reason: "composer-missing", detail: "disabled" };
+      return { actionExecuted: false, reason: "composer-missing", detail: "disabled" };
     }
     const existing = await input.inputValue().catch(() => "");
     if (existing.trim().length > 0) {
-      return { sent: false, reason: "composer-has-text" };
+      return { actionExecuted: false, reason: "composer-has-text" };
     }
 
-    if (cancelled()) return { sent: false, reason: "cancelled" };
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
     await input.focus().catch(() => undefined);
     await input.fill(prompt).catch(() => undefined);
     let landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
@@ -375,11 +375,11 @@ export async function defaultSendWaitingMessage(
         .catch(() => undefined);
       landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
       if (!landed) {
-        return { sent: false, reason: "composer-missing", detail: "value not landed" };
+        return { actionExecuted: false, reason: "composer-missing", detail: "value not landed" };
       }
     }
 
-    if (cancelled()) return { sent: false, reason: "cancelled" };
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
     let clicked = false;
     for (const sendSelector of SEND_BUTTON_SELECTORS) {
       const btn = page.locator(sendSelector).first();
@@ -405,12 +405,12 @@ export async function defaultSendWaitingMessage(
       }
     }
     if (!clicked) {
-      return { sent: false, reason: "send-action-failed" };
+      return { actionExecuted: false, reason: "send-action-failed" };
     }
-    return { sent: true, reason: "sent", detail: `account=${accountId.slice(0, 8)}` };
+    return { actionExecuted: true, reason: "action-executed", detail: `account=${accountId.slice(0, 8)}` };
   } catch (err) {
     return {
-      sent: false,
+      actionExecuted: false,
       reason: "error",
       detail: String((err as Error)?.message || err).slice(0, 160),
     };
@@ -1262,7 +1262,7 @@ async function runVerification(accountId: string): Promise<void> {
             );
           } catch (err) {
             autoSendResult = {
-              sent: false,
+              actionExecuted: false,
               reason: "error",
               detail: String((err as Error)?.message || err).slice(0, 160),
             };
@@ -1273,11 +1273,11 @@ async function runVerification(accountId: string): Promise<void> {
             accountId,
             `auto-send id=${autoId} account=${accountId.slice(0, 8)} result=${autoSendResult.reason}${autoSendResult.detail ? ` | ${autoSendResult.detail}` : ""}`,
           );
-          if (autoSendResult.sent) {
+          if (autoSendResult.actionExecuted) {
             setStatus(
               entry,
               "waiting",
-              "Automatic test message sent — waiting for Qwen response",
+              "Automatic send action executed — waiting for chat activity",
             );
           } else if (autoSendResult.reason === "challenge") {
             setStatus(

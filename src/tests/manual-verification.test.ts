@@ -162,7 +162,7 @@ function installHarness(opts: {
     },
     // Existing tests drive the response explicitly via emit(); the default
     // auto-send is a no-op unless a test overrides it.
-    sendWaitingMessage: async () => ({ sent: false, reason: "disabled-for-test" }),
+    sendWaitingMessage: async () => ({ actionExecuted: false, reason: "disabled-for-test" }),
     autoSendComposerGraceMs: 100,
     autoSendArmMs: 10,
     // Yield a real macrotask: a zero-duration sleep must still let the event
@@ -967,7 +967,7 @@ test("manual verification: waiting auto-sends one test message and verifies", as
       setTimeout(() => {
         void emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
       }, 50);
-      return { sent: true, reason: "sent" };
+      return { actionExecuted: true, reason: "action-executed" };
     },
     autoSendComposerGraceMs: 100,
   });
@@ -982,7 +982,7 @@ test("manual verification: challenge skips auto-send and waits for human", async
   setManualVerificationDeps({
     sendWaitingMessage: async () => {
       calls += 1;
-      return { sent: false, reason: "challenge" };
+      return { actionExecuted: false, reason: "challenge" };
     },
     autoSendComposerGraceMs: 100,
   });
@@ -995,7 +995,7 @@ test("manual verification: challenge skips auto-send and waits for human", async
 test("manual verification: missing composer fails controlled without auth promotion", async () => {
   installHarness({ loggedIn: true });
   setManualVerificationDeps({
-    sendWaitingMessage: async () => ({ sent: false, reason: "composer-missing" }),
+    sendWaitingMessage: async () => ({ actionExecuted: false, reason: "composer-missing" }),
     autoSendComposerGraceMs: 100,
   });
   await startManualVerification(TEST_ID);
@@ -1012,7 +1012,7 @@ test("manual verification: in-progress response is not duplicated", async () => 
       setTimeout(() => {
         void emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
       }, 100);
-      return { sent: false, reason: "in-progress" };
+      return { actionExecuted: false, reason: "in-progress" };
     },
     autoSendComposerGraceMs: 100,
   });
@@ -1027,7 +1027,7 @@ test("manual verification: one auto-send only while waiting for evidence", async
   setManualVerificationDeps({
     sendWaitingMessage: async () => {
       calls += 1;
-      return { sent: true, reason: "sent" };
+      return { actionExecuted: true, reason: "action-executed" };
     },
     autoSendComposerGraceMs: 100,
   });
@@ -1037,13 +1037,31 @@ test("manual verification: one auto-send only while waiting for evidence", async
   assert.notEqual(getManualVerificationStatus(TEST_ID)?.state, "verified");
 });
 
+test("manual verification: completed send action without a chat request is not reported as sent", async () => {
+  installHarness({ loggedIn: false, probeReason: "auths-schema" });
+  let calls = 0;
+  setManualVerificationDeps({
+    sendWaitingMessage: async () => {
+      calls += 1;
+      return { actionExecuted: true, reason: "action-executed" };
+    },
+  });
+  await startManualVerification(TEST_ID);
+  await new Promise((r) => setTimeout(r, 150));
+  const status = getManualVerificationStatus(TEST_ID);
+  assert.equal(calls, 1);
+  assert.equal(status?.state, "waiting");
+  assert.match(status?.detail ?? "", /action executed/i);
+  assert.doesNotMatch(status?.detail ?? "", /message sent/i);
+});
+
 test("manual verification: preferred choice requires human, no ambiguous send", async () => {
   installHarness({ loggedIn: true });
   let calls = 0;
   setManualVerificationDeps({
     sendWaitingMessage: async () => {
       calls += 1;
-      return { sent: false, reason: "preferred-choice-required" };
+      return { actionExecuted: false, reason: "preferred-choice-required" };
     },
     autoSendComposerGraceMs: 100,
   });
@@ -1127,7 +1145,7 @@ test("manual verification: swallowed send click is not reported as sent", async 
   };
   const r = await defaultSendWaitingMessage(page as never, TEST_ID, prompt);
   assert.equal(r.reason, "send-action-failed");
-  assert.equal(r.sent, false);
+  assert.equal(r.actionExecuted, false);
   assert.equal(filled, true);
 });
 
@@ -1154,7 +1172,7 @@ test("manual verification: birth-year modal blocks auto-send", async () => {
   };
   const r = await defaultSendWaitingMessage(page as never, TEST_ID, "¿Cuánto es 2 + 2?");
   assert.equal(r.reason, "birth-year-required");
-  assert.equal(r.sent, false);
+  assert.equal(r.actionExecuted, false);
   assert.equal(filled, false);
 });
 
