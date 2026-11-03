@@ -694,6 +694,7 @@ test("manual verification: autofillQwenLoginForm no-form without touching passwo
 test("manual verification: autofillQwenLoginForm authenticated composer is not no-form", async () => {
   const { autofillQwenLoginForm } = await import("../services/playwright.ts");
   let filled: string[] = [];
+  let gotoCalls = 0;
   const page: unknown = {
     isClosed: () => false,
     url: () => "https://chat.qwen.ai/",
@@ -714,11 +715,14 @@ test("manual verification: autofillQwenLoginForm authenticated composer is not n
     }),
     getByText: () => ({ first: () => ({ isVisible: async () => false, click: async () => {} }) }),
     keyboard: { press: async () => {} },
-    goto: async () => {},
+    goto: async () => {
+      gotoCalls += 1;
+    },
   };
   const r = await autofillQwenLoginForm(page as never, "e@x.com", "s3cret");
   assert.deepEqual(r, { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" });
   assert.deepEqual(filled, []);
+  assert.equal(gotoCalls, 0, "authenticated composer must not navigate to /auth");
 });
 
 test("manual verification: autofill implementation never solves captcha", async () => {

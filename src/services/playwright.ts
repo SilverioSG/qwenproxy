@@ -4046,6 +4046,25 @@ export async function autofillQwenLoginForm(
   } catch {
     // Fall through to form fill on probe failure.
   }
+  // Auths-schema is a known false negative. Check the authenticated chat
+  // composer BEFORE navigating to /auth: otherwise a valid session is sent to
+  // the login page, where the auto-send correctly refuses on auth-url and the
+  // account is misclassified as challenge/human.
+  try {
+    const preUrl = typeof page.url === "function" ? page.url() : "";
+    if (!preUrl.includes("/auth") && !preUrl.includes("/login")) {
+      const composerSelector = COMPOSER_SELECTORS.slice(0, 3).join(", ");
+      const composerVisible = await page
+        .waitForSelector(composerSelector, { state: "visible", timeout: 2000 })
+        .then(() => true)
+        .catch(() => false);
+      if (composerVisible) {
+        return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
+      }
+    }
+  } catch {
+    // Fall through to the normal login flow.
+  }
   try {
     const url = typeof page.url === "function" ? page.url() : "";
     const onAuthPage = url.includes("/auth") || url.includes("/login");
