@@ -163,6 +163,7 @@ function installHarness(opts: {
     // auto-send is a no-op unless a test overrides it.
     sendWaitingMessage: async () => ({ sent: false, reason: "disabled-for-test" }),
     autoSendComposerGraceMs: 100,
+    autoSendArmMs: 10,
     // Yield a real macrotask: a zero-duration sleep must still let the event
     // loop interleave, otherwise wall-clock poll loops starve timers.
     sleep: async () => {
@@ -915,7 +916,13 @@ test("manual verification: rejected → valid only after all validations pass", 
 });
 
 test("manual verification: waiting auto-sends one test message and verifies", async () => {
-  const { emit } = installHarness({ loggedIn: true });
+  // Reproduce the production auths-schema false negative: probeLogin is false
+  // but the visible SPA/composer is authenticated. The composer gate must send.
+  const { emit } = installHarness({
+    loggedIn: false,
+    probeReason: "auths-schema",
+    persist: { initialCapturedAt: Date.now() - 7200000, validateStatus: 200 },
+  });
   const sent: string[] = [];
   setManualVerificationDeps({
     sendWaitingMessage: async (_page, accountId, prompt) => {

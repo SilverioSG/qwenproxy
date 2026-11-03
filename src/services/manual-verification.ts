@@ -396,6 +396,8 @@ const deps: {
   ) => Promise<AutoSendResult>;
   /** Grace for a missing composer before failing the automatic send. */
   autoSendComposerGraceMs?: number;
+  /** Hydration delay before the first composer attempt. */
+  autoSendArmMs?: number;
   sleep: (ms: number) => Promise<void>;
   headedChromeExists: () => boolean;
   singletonLocked: (profileDir: string) => boolean;
@@ -478,6 +480,7 @@ const deps: {
   },
   sendWaitingMessage: defaultSendWaitingMessage,
   autoSendComposerGraceMs: 15_000,
+  autoSendArmMs: 5_000,
   sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
   headedChromeExists: () => fs.existsSync(HEADED_CHROME_PATH),
   singletonLocked: (profileDir: string) => singletonLockPresent(profileDir),
@@ -1154,6 +1157,10 @@ async function runVerification(accountId: string): Promise<void> {
       setStatus(entry, "waiting", entry.detail);
     }
     const deadline = now() + VERIFY_TIMEOUT_MS;
+    // Give the visible SPA a short hydration window before touching the
+    // composer; then the composer/challenge guards (not the login probe,
+    // which has an auths-schema false negative) decide.
+    const autoSendArmAt = now() + (deps.autoSendArmMs ?? 5_000);
     let poll = 0;
     let lastLoginClass = "unknown";
     let loginHint = false;
@@ -1203,7 +1210,12 @@ async function runVerification(accountId: string): Promise<void> {
         // authenticated and no completion is already in flight. CAPTCHA/OTP,
         // active generations, missing composers and ambiguous preference UIs
         // are left to the human; they are never automated.
-        if (probe.ok && evidence() === "none" && !autoSendAttempted) {
+        if (
+          now() >= autoSendArmAt &&
+          evidence() === "none" &&
+          !autoSendAttempted &&
+          !isClosed(page, context)
+        ) {
           autoSendAttempted = true;
           autoSendAt = now();
           try {
