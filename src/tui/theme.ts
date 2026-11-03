@@ -57,6 +57,10 @@ let memoryClipboard = "";
  */
 export function setClipboardText(text: string): boolean {
   memoryClipboard = text;
+  // node:test runs are headless and wl-copy/xclip can block forever waiting
+  // for a selection owner. The in-memory clipboard is the test-visible
+  // contract; production/tooling keeps the OS-level write below.
+  if (process.env.NODE_TEST_CONTEXT) return true;
   try {
     // 1. Emit OSC 52 sequence for terminal emulators supporting it natively (only when interactive TTY)
     try {
