@@ -203,7 +203,7 @@ export const accountsHtml = `<!DOCTYPE html>
 <title>QwenProxy — Accounts</title>
 ${THEME_BOOTSTRAP}
 <link rel="stylesheet" href="/dashboard/static/shared.css">
-<link rel="stylesheet" href="/dashboard/static/accounts.css">
+<link rel="stylesheet" href="/dashboard/static/accounts.css?v=account-status-3">
 </head>
 <body>
 <div class="dashboard-layout">
@@ -278,7 +278,7 @@ ${sidebarHtml("accounts")}
 <div class="toast-container" id="toastContainer"></div>
 
   <script src="/dashboard/static/shared.js"></script>
-  <script src="/dashboard/static/accounts.js"></script>
+  <script src="/dashboard/static/accounts.js?v=account-status-3"></script>
 </body>
 </html>`;
 

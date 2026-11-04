@@ -155,10 +155,36 @@
 
 /* Auth status indicators */
 .auth-status {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 0.75rem;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.auth-status.status-rejected, .auth-status.status-verification-failed {
+  background: #5b1d26;
+  color: #fff0f1;
+  border-color: #f07883;
+}
+.auth-status.status-live, .auth-status.status-standby {
+  background: #12442b;
+  color: #e4ffed;
+  border-color: #68c98e;
+}
+.auth-status.status-cooldown, .auth-status.status-unconfirmed,
+.auth-status.status-verifying, .auth-status.status-verification-cancelled,
+.auth-status.status-warming {
+  background: #5b4111;
+  color: #fff4cf;
+  border-color: #e6bd5b;
+}
+#acctTable tbody tr.account-row-rejected td:first-child,
+#acctTable tbody tr.account-row-verification-failed td:first-child {
+  border-left: 4px solid #f07883;
 }
 .auth-dot {
   width: 8px;
@@ -171,6 +197,9 @@
   background: var(--success);
   box-shadow: 0 0 0 2px var(--success-soft);
 }
+.auth-dot.rejected, .auth-dot.verification-failed { background: var(--danger); }
+.auth-dot.cooldown, .auth-dot.unconfirmed, .auth-dot.verifying, .auth-dot.verification-cancelled, .auth-dot.warming { background: var(--warning); }
+.auth-dot.standby { background: var(--success); }
 .auth-dot.expired {
   background: var(--text-secondary);
 }

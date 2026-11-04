@@ -11,12 +11,40 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 
 process.env.API_KEY = "dashboard-test-key";
 
 const { app } = await import("../api/server.ts");
 
 const AUTH = { Authorization: "Bearer dashboard-test-key" };
+
+test("accounts table distinguishes rejected, standby and active verification", () => {
+  const elements: Record<string, { innerHTML: string; style: { display: string } }> = {
+    acctBody: { innerHTML: "", style: { display: "" } },
+    emptyState: { innerHTML: "", style: { display: "" } },
+  };
+  let summary = "";
+  const context = {
+    document: { readyState: "loading", addEventListener: () => {}, getElementById: (id: string) => elements[id] },
+    setText: (_id: string, value: string) => { summary = value; },
+    escHtml: (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"),
+  };
+  const script = readFileSync(new URL("../routes/dashboard/public/accounts.js", import.meta.url), "utf8");
+  runInNewContext(script + `\nrenderAccountsTable([
+    {id:'a',email:'rejected@example.test',authState:'rejected',eligible:false},
+    {id:'b',email:'valid@example.test',authState:'valid',eligible:true},
+    {id:'c',email:'waiting@example.test',authState:'rejected',eligible:false,manualVerificationState:'waiting'},
+    {id:'d',email:'failed@example.test',authState:'rejected',eligible:false,manualVerificationState:'failed'}
+  ]);`, context);
+  assert.match(elements.acctBody.innerHTML, /NO DISPONIBLE · RECHAZADA/);
+  assert.match(elements.acctBody.innerHTML, /DISPONIBLE · EN ESPERA/);
+  assert.match(elements.acctBody.innerHTML, /VERIFICACIÓN EN CURSO/);
+  assert.match(elements.acctBody.innerHTML, /VERIFICACIÓN FALLIDA/);
+  assert.match(elements.acctBody.innerHTML, /data-action="verify" disabled>Verification in progress/);
+  assert.equal(summary, "4 cuentas · 1 disponibles · 3 rechazadas");
+});
 
 async function get(path: string, auth = true): Promise<Response> {
   return app.request(path, { headers: auth ? AUTH : {} });
@@ -404,6 +432,7 @@ test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveC
 
     const rejectedAcc = byId.get(ids.rejected)!;
     assert.equal(rejectedAcc.authState, "rejected");
+    assert.equal(rejectedAcc.manualVerificationState, null);
     assert.equal(rejectedAcc.cooldown, false, "rejected: no cooldown");
     assert.equal(rejectedAcc.operationalAvailable, true, "rejected: operational");
     assert.equal(rejectedAcc.eligible, false, "rejected: not eligible");
@@ -414,6 +443,7 @@ test("/accounts semantic mapping: ready/warming/standby/cooldown with hasActiveC
         "id",
         "email",
         "authState",
+        "manualVerificationState",
         "ready",
         "operationalReady",
         "eligible",

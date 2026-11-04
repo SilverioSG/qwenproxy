@@ -49,17 +49,31 @@ function setError(msg) {
 
 /* ── Accounts Table (real QwenProxy fields) ── */
 function getStatus(acct) {
+  if (isVerificationActive(acct)) return 'verifying';
+  if (acct.manualVerificationState === 'failed') return 'verification-failed';
+  if (acct.manualVerificationState === 'cancelled') return 'verification-cancelled';
+  if (acct.authState === 'rejected') return 'rejected';
   if (acct.cooldown) return 'cooldown';
+  if (acct.authState !== 'valid') return 'unconfirmed';
   if (acct.ready) return 'live';
   if (acct.hasActiveContext && !acct.headersReady) return 'warming';
   return 'standby';
 }
 
+function isVerificationActive(acct) {
+  return ['opening', 'autofilling', 'waiting', 'authenticated', 'verifying'].indexOf(acct.manualVerificationState) !== -1;
+}
+
 function getStatusLabel(status) {
-  if (status === 'live') return 'Ready';
-  if (status === 'cooldown') return 'Cooldown';
-  if (status === 'warming') return 'Warming';
-  return 'Standby';
+  if (status === 'live') return 'DISPONIBLE · LISTA';
+  if (status === 'verifying') return 'VERIFICACIÓN EN CURSO';
+  if (status === 'verification-failed') return 'VERIFICACIÓN FALLIDA';
+  if (status === 'verification-cancelled') return 'VERIFICACIÓN CANCELADA';
+  if (status === 'rejected') return 'NO DISPONIBLE · RECHAZADA';
+  if (status === 'unconfirmed') return 'AUTENTICACIÓN SIN CONFIRMAR';
+  if (status === 'cooldown') return 'NO DISPONIBLE · COOLDOWN';
+  if (status === 'warming') return 'DISPONIBLE · INICIANDO';
+  return 'DISPONIBLE · EN ESPERA';
 }
 
 function makeCooldownBadge(acct) {
@@ -73,10 +87,10 @@ function makeCooldownBadge(acct) {
 }
 
 function makeAuthBadge(acct) {
-  if (acct.authState === 'valid') return '<span class="badge badge-success">valid</span>';
-  if (acct.authState === 'rejected') return '<span class="badge badge-danger">rejected</span>';
-  if (acct.authState === 'inconclusive') return '<span class="badge badge-warning">inconclusive</span>';
-  return '<span class="badge badge-neutral">—</span>';
+  if (acct.authState === 'valid') return '<span class="badge badge-success">Válida</span>';
+  if (acct.authState === 'rejected') return '<span class="badge badge-danger">Rechazada</span>';
+  if (acct.authState === 'inconclusive') return '<span class="badge badge-warning">No concluyente</span>';
+  return '<span class="badge badge-neutral">Desconocida</span>';
 }
 
 function renderAccountsTable(accts) {
@@ -87,7 +101,9 @@ function renderAccountsTable(accts) {
     return;
   }
   document.getElementById('emptyState').style.display = 'none';
-  setText('acctCount', accts.length + ' total');
+  var eligible = accts.filter(function (a) { return a.eligible === true; }).length;
+  var rejected = accts.filter(function (a) { return a.authState === 'rejected'; }).length;
+  setText('acctCount', accts.length + ' cuentas · ' + eligible + ' disponibles · ' + rejected + ' rechazadas');
   var rows = '';
   for (var i = 0; i < accts.length; i++) {
     var a = accts[i];
@@ -99,11 +115,11 @@ function renderAccountsTable(accts) {
         ? '<span class="badge badge-neutral">warming</span>'
         : '<span class="badge badge-neutral">standby</span>';
     rows +=
-      '<tr>' +
+      '<tr class="account-row-' + status + '">' +
       '<td>' +
       escHtml(a.email) +
       '</td>' +
-      '<td><div class="auth-status"><span class="auth-dot ' +
+      '<td><div class="auth-status status-' + status + '"><span class="auth-dot ' +
       status +
       '"></span>' +
       label +
@@ -129,7 +145,8 @@ function renderAccountsTable(accts) {
       '" data-action="reset">Reset cooldown</button>' +
       '<button class="account-btn small" data-id="' +
       escHtml(a.id) +
-      '" data-action="verify">Verify manually</button>' +
+      '" data-action="verify"' + (isVerificationActive(a) ? ' disabled' : '') + '>' +
+      (isVerificationActive(a) ? 'Verification in progress' : 'Verify manually') + '</button>' +
       '<button class="account-btn small danger" data-id="' +
       escHtml(a.id) +
       '" data-email="' +

@@ -39,6 +39,7 @@ import {
 import { getAccountsByPriority } from "../core/account-priority.js";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.js";
 import { getActivePlaywrightAccountIds } from "../services/playwright.ts";
+import { getManualVerificationStatus, type ManualVerificationState } from "../services/manual-verification.ts";
 import { config } from "../core/config.js";
 import { getRecentDashboardLogs } from "../core/logger.js";
 import {
@@ -143,6 +144,7 @@ export interface DashboardAccount {
   email: string;
   /** Auth eligibility persisted in the accounts table (no secrets). */
   authState: "valid" | "rejected" | "inconclusive" | null;
+  manualVerificationState: ManualVerificationState | null;
   ready: boolean;
   /** Operational readiness (headers captured, no cooldown), even if rejected. */
   operationalReady: boolean;
@@ -206,6 +208,7 @@ export function buildAccountsList(): DashboardAccount[] {
       id: a.id,
       email: a.email,
       authState,
+      manualVerificationState: getManualVerificationStatus(a.id)?.state ?? null,
       ready: operationalReady && authState !== "rejected",
       operationalReady,
       eligible,
