@@ -419,6 +419,7 @@ export async function defaultSendWaitingMessage(
 
 const deps: {
   launchBrowser: BrowserLauncher;
+  guestSignInVisible: (page: Page) => Promise<boolean>;
   probeLogin: (
     page: Page,
     timeoutMs: number,
@@ -509,6 +510,15 @@ const deps: {
   }>;
 } = {
   launchBrowser: defaultBrowserLauncher,
+  guestSignInVisible: async (page: Page) => {
+    try {
+      return await page.getByRole("button", {
+        name: /^(?:iniciar sesi[oó]n|log in|sign in)$/i,
+      }).first().isVisible({ timeout: 500 });
+    } catch {
+      return false;
+    }
+  },
   probeLogin: async (page: Page, timeoutMs: number) => {
     const { probePageLoggedIn } = await import("./playwright.ts");
     return probePageLoggedIn(page, timeoutMs);
@@ -1032,6 +1042,7 @@ async function runVerification(accountId: string): Promise<void> {
     // Login probing below is INFORMATIONAL ONLY: it never gates verification.
     const chat: { evidence: "none" | "streaming" | "done" } = { evidence: "none" };
     const evidence = (): "none" | "streaming" | "done" => chat.evidence;
+    let guestEpoch = 0;
     let pendingChatClassification = 0;
     let pendingSnapshot: {
       at: number;
@@ -1101,11 +1112,15 @@ async function runVerification(accountId: string): Promise<void> {
       // used only for the boolean predicate — never stored or logged.
       pendingChatClassification += 1;
       const capturedStatus = status;
+      const capturedEpoch = guestEpoch;
       void (async () => {
         try {
+          const guestAtResponse = await deps.guestSignInVisible(page);
           const body = await res.text();
           if (
             !entry.finished &&
+            !guestAtResponse &&
+            capturedEpoch === guestEpoch &&
             isValidChatCompletion(capturedStatus, body)
           ) {
             chat.evidence = "done";
@@ -1229,6 +1244,19 @@ async function runVerification(accountId: string): Promise<void> {
         }
         sawClose = true;
         break;
+      }
+      // Qwen's guest home has a working composer. A completed guest chat is
+      // not evidence of login and must never cause a session snapshot.
+      if (await deps.guestSignInVisible(page)) {
+        guestEpoch += 1;
+        if (chat.evidence !== "none") {
+          chat.evidence = "none";
+          pendingSnapshot = null;
+        }
+        setStatus(entry, "waiting", "Sign in to Qwen before sending the test message");
+        maybeLog();
+        await deps.sleep(POLL_INTERVAL_MS);
+        continue;
       }
       try {
         const probe = await deps.probeLogin(page, 5000);
@@ -1366,6 +1394,8 @@ async function runVerification(accountId: string): Promise<void> {
       await deps.clearBusy(accountId);
     } catch {
       // Never leave the caller hanging on cleanup failure.
+    } finally {
+      entry.finalizing = false;
     }
   }
 }

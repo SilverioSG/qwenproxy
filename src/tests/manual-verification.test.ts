@@ -147,6 +147,7 @@ function installHarness(opts: {
     capturedAt: opts.persist?.initialCapturedAt ?? 0,
   };
   setManualVerificationDeps({
+    guestSignInVisible: async () => false,
     launchBrowser: async (profileDir: string, env: Record<string, string>) => {
       calls.launched.push({ profileDir, DISPLAY: env.DISPLAY ?? "", XAUTHORITY: env.XAUTHORITY ?? "" });
       current = mkPair();
@@ -508,6 +509,27 @@ test("manual verification: login probe false/timeout/destroyed + valid chat → 
     assert.equal(await waitForState("verified"), "verified", `reason=${reason}`);
     assert.deepEqual(calls.clearedCooldown, [TEST_ID]);
   }
+});
+
+test("manual verification: guest chat does not close the window or persist a session", async () => {
+  const { emit, contexts, calls } = installHarness({ loggedIn: false });
+  let guest = true;
+  let saves = 0;
+  setManualVerificationDeps({
+    guestSignInVisible: async () => guest,
+    saveSession: async () => { saves += 1; },
+  });
+  await startManualVerification(TEST_ID);
+  await emit({ url: CHAT_URL, status: 200, body: VALID_SSE });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(getManualVerificationStatus(TEST_ID)?.state, "waiting");
+  assert.match(getManualVerificationStatus(TEST_ID)?.detail ?? "", /Sign in/);
+  assert.equal(saves, 0);
+  assert.equal(contexts[0].closed, false);
+  assert.deepEqual(calls.clearedCooldown, []);
+  guest = false;
+  cancelManualVerification(TEST_ID);
+  assert.equal(await waitForState("cancelled"), "cancelled");
 });
 
 test("manual verification: pending body + close → grace; valid during grace → verified", async () => {
