@@ -739,6 +739,19 @@ async function prepareAccountRuntime(
     modelId: string,
   ) => Promise<void>,
 ): Promise<boolean> {
+  // Manual verification marks the account temporarily busy before it closes
+  // the headless context. The standby/warmup must not reopen that profile in
+  // the meantime: doing so recreates SingletonLock and the visible browser
+  // can never acquire it ("Profile lock still held after headless close").
+  const { isAccountTemporarilyBusy } = await import(
+    "../core/account-concurrency.ts"
+  );
+  if (isAccountTemporarilyBusy(account.id)) {
+    console.log(
+      `⏸️  [Server] Standby skip | account=${maskEmail(account.email)} | temporarily busy (manual verification)`,
+    );
+    return false;
+  }
   return prepareQwenRuntime({
     accountId: account.id,
     successMessage: `[Server] Account ready: ${maskEmail(account.email)}`,

@@ -7,14 +7,17 @@
 import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   deleteAuthSession,
+  getDatabase,
   getRefreshMaterial,
   getValidAuthSession,
   saveAuthSession,
 } from "../core/database.ts";
-import { getDbPath, resolveDataDir } from "../core/paths.ts";
+import { getAccountAuthState, invalidateAccountsCache } from "../core/accounts.ts";
+import { getDataDir, getDbPath, resolveDataDir } from "../core/paths.ts";
 import {
   QWEN_REFRESH_MARGIN_MS,
   QWEN_REFRESH_URL,
@@ -22,6 +25,7 @@ import {
   _resetRefreshSingleFlightForTests,
   _setRefreshFetchForTests,
   ensureAccountFresh,
+  ensureAccountSession,
   getJarPair,
   hasRefreshMaterial,
   mergeSetCookiesIntoJar,
@@ -105,12 +109,28 @@ beforeEach(() => {
   _setRefreshFetchForTests(null);
 });
 
+function seedAccountRow(
+  id: string,
+  state: "valid" | "rejected" | "inconclusive" = "rejected",
+): void {
+  getDatabase()
+    .prepare(
+      "INSERT OR REPLACE INTO accounts (id, email, password, auth_state) VALUES (?, ?, ?, ?)",
+    )
+    .run(id, `${id}@example.test`, "x", state);
+  invalidateAccountsCache();
+}
+
 afterEach(() => {
   for (const id of createdIds.splice(0)) {
     try {
       deleteAuthSession(id);
     } catch {}
+    try {
+      getDatabase().prepare("DELETE FROM accounts WHERE id = ?").run(id);
+    } catch {}
   }
+  invalidateAccountsCache();
   _resetRefreshSingleFlightForTests();
   _setRefreshFetchForTests(null);
 });
@@ -212,7 +232,7 @@ test("2/3/4: expired token + material → refresh ok, keeps refresh + jar", asyn
   assert.equal(seen[0].init.body, undefined);
   assert.equal(headers.get("source"), "web");
   assert.equal(headers.get("x-request-origin"), "https://chat.qwen.ai");
-  assert.equal(headers.get("Version"), "0.3.11");
+  assert.equal(headers.get("Version"), "0.3.26");
   assert.ok((headers.get("X-Request-Id") ?? "").length >= 8);
   assert.ok((headers.get("Timezone") ?? "").length > 0);
   assert.equal(headers.get("accept"), "application/json, text/plain, */*");
@@ -288,9 +308,10 @@ test("6: concurrent ensureAccountFresh shares one refresh", async () => {
 
 test("7: refresh path never touches the browser", async () => {
   // Static guarantee: the refresh module must not statically import any
-  // browser layer, open profiles, or close browsers. The single dynamic
-  // import("./playwright.ts") is the best-effort in-memory cache push (no
-  // profile open, no navigation) — allowed, everything else is forbidden.
+  // browser layer, open profiles, or close browsers. The dynamic
+  // import("./playwright.ts") bridges are limited to the live-jar observe,
+  // the in-memory cache push and the in-page refresh (no profile open, no
+  // navigation) — everything else is forbidden.
   const src = fs.readFileSync(
     path.resolve("src/services/qwen-token-refresh.ts"),
     "utf-8",
@@ -303,8 +324,8 @@ test("7: refresh path never touches the browser", async () => {
   const dynamicUses = (src.match(/import\("\.\/playwright\.ts"\)/g) ?? []).length;
   assert.equal(
     dynamicUses,
-    2,
-    "only the live-jar observe + cache-push bridges may touch playwright",
+    3,
+    "only the live-jar observe, cache-push and in-page refresh bridges may touch playwright",
   );
 
   // Behavioral: an expired session renews with zero browser state involved.
@@ -396,14 +417,147 @@ test("9: legacy account without new fields still loads", async () => {
 
 // ─── 10. isolation ──────────────────────────────────────────────────────────
 
+test("13: JWT fresh alone is not authentication; verifier decides", async () => {
+  const id = seedSession({
+    tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+  });
+  seedAccountRow(id, "rejected");
+  const state = await ensureAccountSession(id, {
+    verify: async () => ({ state: "valid", reason: "settings-ok" }),
+  });
+  assert.equal(state.materialPresent, true);
+  assert.equal(state.tokenValid, true);
+  assert.equal(state.refreshPerformed, false);
+  assert.equal(state.sessionVerified, "valid");
+  assert.equal(getAccountAuthState(id), "valid");
+});
+
+test("14: verifier rejection wins over a fresh JWT (401 and 403)", async () => {
+  for (const reason of ["settings-401", "settings-403"]) {
+    const id = seedSession({
+      tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+    });
+    seedAccountRow(id, "valid");
+    const state = await ensureAccountSession(id, {
+      verify: async () => ({ state: "rejected", reason }),
+    });
+    assert.equal(state.tokenValid, true);
+    assert.equal(state.refreshPerformed, false);
+    assert.equal(state.sessionVerified, "rejected", reason);
+    assert.equal(getAccountAuthState(id), "rejected");
+  }
+});
+
+test("15: inconclusive keeps material without declaring auth", async () => {
+  for (const reason of ["timeout", "evaluate-error"]) {
+    const id = seedSession({
+      tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+    });
+    seedAccountRow(id, "valid");
+    const before = getRefreshMaterial(id)!.jar;
+    const state = await ensureAccountSession(id, {
+      verify: async () => ({ state: "inconclusive", reason }),
+    });
+    assert.equal(state.tokenValid, true);
+    assert.equal(state.sessionVerified, "inconclusive", reason);
+    assert.equal(getRefreshMaterial(id)!.jar, before, reason);
+    assert.equal(getAccountAuthState(id), "valid", "inconclusive preserves state");
+  }
+});
+
+test("16: a successful refresh does not equal session verification", async () => {
+  const id = seedSession({
+    access: expiredJwt(),
+    tokenExpiresAt: Math.floor(Date.now() / 1000) + 60,
+  });
+  seedAccountRow(id, "valid");
+  const state = await ensureAccountSession(id, {
+    fetchFn: async () =>
+      jsonResponse({
+        success: true,
+        data: { access_token: freshAccessJwt() },
+      }),
+    verify: async () => ({ state: "rejected", reason: "settings-401" }),
+  });
+  assert.equal(state.refreshPerformed, true);
+  assert.equal(state.refreshOk, true);
+  assert.equal(state.tokenValid, true);
+  assert.equal(state.sessionVerified, "rejected");
+  assert.equal(getAccountAuthState(id), "rejected");
+});
+
+test("19: refresh failure never promotes auth_state to valid", async () => {
+  const id = seedSession({
+    access: expiredJwt(),
+    tokenExpiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  seedAccountRow(id, "rejected");
+  const state = await ensureAccountSession(id, {
+    fetchFn: async () =>
+      jsonResponse({ success: false, data: { code: "Unauthorized" } }, 401),
+    verify: async () => ({ state: "valid", reason: "should-not-run" }),
+  });
+  assert.equal(state.tokenValid, false);
+  assert.equal(state.sessionVerified, "rejected");
+  assert.equal(getAccountAuthState(id), "rejected");
+});
+
+test("20: inconclusive refresh failure preserves the previous state", async () => {
+  const id = seedSession({
+    access: expiredJwt(),
+    tokenExpiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  seedAccountRow(id, "valid");
+  const state = await ensureAccountSession(id, {
+    fetchFn: async () =>
+      jsonResponse({ success: false, data: { code: "NetworkError" } }, 500),
+    verify: async () => ({ state: "valid", reason: "should-not-run" }),
+  });
+  assert.equal(state.tokenValid, false);
+  assert.equal(state.sessionVerified, "inconclusive");
+  assert.equal(getAccountAuthState(id), "valid");
+});
+
+test("21: tryRefreshToken never promotes auth_state", () => {
+  const src = fs.readFileSync("src/services/qwen-token-refresh.ts", "utf-8");
+  const start = src.indexOf("function tryRefreshToken");
+  const end = src.indexOf("// Single-flight", start);
+  assert.ok(start >= 0 && end > start);
+  assert.ok(!src.slice(start, end).includes("setAccountAuthState"));
+});
+
+test("17: no material is inconclusive, not a login confirmation", async () => {
+  const id = `refresh-test-no-material-${Date.now()}`;
+  const state = await ensureAccountSession(id, {
+    verify: async () => ({ state: "valid", reason: "should-not-run" }),
+  });
+  assert.equal(state.materialPresent, false);
+  assert.equal(state.sessionVerified, "inconclusive");
+  assert.equal(state.verificationReason, "no-auth-material");
+});
+
+test("18: no live page is inconclusive, not a login confirmation", async () => {
+  const id = seedSession({
+    tokenExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+  });
+  const state = await ensureAccountSession(id);
+  assert.equal(state.tokenValid, true);
+  assert.equal(state.sessionVerified, "inconclusive");
+  assert.equal(state.verificationReason, "no-live-page");
+});
+
+// ─── 10. isolation ──────────────────────────────────────────────────────────
+
 test("10: tests run against an isolated database, never production", () => {
   // Under node:test the data dir resolves to the throwaway data-test/.
+  const dbPath = getDbPath();
   assert.ok(
-    getDbPath().includes("data-test"),
-    `expected isolated db, got ${getDbPath()}`,
+    dbPath.includes("data-test") ||
+      path.resolve(getDataDir()).startsWith(path.resolve(os.tmpdir()) + path.sep),
+    `expected isolated db, got ${dbPath}`,
   );
   // Explicit env override is honored for temp dirs.
-  const tmp = fs.mkdtempSync(path.join("/tmp/opencode", "qwenproxy-test-"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qwenproxy-test-"));
   try {
     assert.ok(resolveDataDir({ envDataDir: tmp }).startsWith(tmp));
   } finally {

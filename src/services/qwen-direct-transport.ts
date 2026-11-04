@@ -41,6 +41,7 @@
  */
 
 import { config } from "../core/config.ts";
+import { isRunningUnderNodeTest } from "../core/paths.ts";
 import {
   getDefaultQwenUserAgent,
   getQwenWebVersion,
@@ -148,7 +149,7 @@ export function getLastBaxiaProbe(): { reason: string } | null {
 
 export function _resetDirectTransportCachesForTests(): void {
   versionCache = null;
-  versionFetchedAt = 0;
+  versionCheckedAt = 0;
   versionInflight = null;
   lastBaxiaProbe = null;
 }
@@ -175,57 +176,149 @@ export async function getBaxiaMaterial(
 }
 
 let versionCache: string | null = null;
-let versionFetchedAt = 0;
+let versionCheckedAt = 0;
 let versionInflight: Promise<string | null> | null = null;
 
 /**
- * Bundle version for the DIRECT transport: the configured default, period.
- *
- * Proven live: completions answer 200/OK with the configured default
- * (0.2.91) and 401 Unauthorized with live-observed values (0.3.11, 0.3.12),
- * while chats/new (which omits the version) returns 200 either way. Live
- * scrapes and mixed-source globals observe non-chat bundle releases, so
- * neither may feed this header. When the upstream chat bundle actually moves,
- * QWEN_WEB_VERSION is the lever (already env-overridable).
+ * Pull the chat frontend version out of the homepage HTML.
+ * The bundle is referenced as .../qwenweb/qwen-chat-fe/<VERSION>/js/main.js.
+ * Pure and exported so the accepted format is testable without network.
  */
-export async function getDirectBundleVersion(): Promise<string | null> {
-  return config.qwen.webVersion;
+export function extractFrontendVersion(html: string): string | null {
+  const source = String(html || "");
+  const m =
+    source.match(/qwenweb\/qwen-chat-fe\/(\d+\.\d+\.\d+)/) ??
+    source.match(/qwen-chat-fe\/(\d+\.\d+\.\d+)/);
+  return m && m[1] ? m[1] : null;
 }
+
+/**
+ * Bundle version for the DIRECT transport.
+ *
+ * AUTO (default): the shared process-wide scrape below — 30 min TTL, one
+ * in-flight probe, last-known-good on failure. PINNED: a literal
+ * QWEN_WEB_VERSION wins and discovery never runs.
+ */
+export async function getDirectBundleVersion(
+  opts: { force?: boolean } = {},
+): Promise<string | null> {
+  if (!config.qwen.webVersionAuto) return config.qwen.webVersion;
+  return getFrontendVersion(opts);
+}
+
+/**
+ * Fetch the public homepage over plain HTTP. Some networks get the Aliyun JS
+ * challenge here instead of the app shell, so the caller falls back to curl.
+ */
+async function fetchHomepageHtml(): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(qwenUrl("/"), {
+        headers: {
+          "User-Agent": getDirectUserAgent(),
+          Accept: "text/html,application/xhtml+xml",
+        },
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      return await res.text();
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Second discovery attempt using the system curl binary.
+ *
+ * Node's fetch/undici fingerprint is answered with the Aliyun JS challenge
+ * (`<body onload="check()">`) on this host, while curl receives the real app
+ * shell containing the bundle path. No new npm dependency: if curl is absent
+ * the probe simply fails and the last known good version is preserved.
+ */
+async function fetchHomepageViaCurl(): Promise<string | null> {
+  // Deterministic tests: never spawn a real network process.
+  if (isRunningUnderNodeTest()) return null;
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const run = promisify(execFile);
+    const { stdout } = await run(
+      "curl",
+      [
+        "-sS",
+        "-L",
+        "--max-time",
+        "10",
+        "-A",
+        getDirectUserAgent(),
+        qwenUrl("/"),
+      ],
+      { maxBuffer: 4 * 1024 * 1024, timeout: 12_000 },
+    );
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Shared frontend-version discovery (AUTO mode).
+ *
+ * Mirrors the proven Qwen-Free-Api flow: scrape the homepage bundle path,
+ * cache for 30 minutes, keep the last valid value when discovery fails, and
+ * coalesce concurrent callers onto a single in-flight probe. Failed scrapes
+ * also stamp the clock, so a broken upstream cannot turn into a request loop.
+ */
 export async function getFrontendVersion(
   opts: { force?: boolean } = {},
 ): Promise<string> {
   const now = Date.now();
-  if (!opts.force && versionCache && now - versionFetchedAt < VERSION_CACHE_TTL_MS) {
-    return versionCache;
+  if (
+    !opts.force &&
+    versionCheckedAt > 0 &&
+    now - versionCheckedAt < VERSION_CACHE_TTL_MS
+  ) {
+    // Cached value (or the last-known-good fallback after a failed probe).
+    return versionCache || getQwenWebVersion();
   }
   if (!versionInflight) {
     versionInflight = (async (): Promise<string | null> => {
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
-        try {
-          const res = await fetch(qwenUrl("/"), {
-            headers: {
-              "User-Agent": getDirectUserAgent(),
-              Accept: "text/html,application/xhtml+xml",
-            },
-            signal: controller.signal,
-          });
-          const html = await res.text();
-          const m =
-            html.match(/qwenweb\/qwen-chat-fe\/(\d+\.\d+\.\d+)/) ??
-            html.match(/qwen-chat-fe\/(\d+\.\d+\.\d+)/);
-          if (m && m[1]) {
-            versionCache = m[1];
-            versionFetchedAt = Date.now();
-            updateQwenWebVersion(m[1]);
-            return m[1];
-          }
-        } finally {
-          clearTimeout(timer);
+        const direct = await fetchHomepageHtml();
+        let found = direct ? extractFrontendVersion(direct) : null;
+        let source = "http";
+        if (!found) {
+          const viaCurl = await fetchHomepageViaCurl();
+          found = viaCurl ? extractFrontendVersion(viaCurl) : null;
+          source = "curl";
         }
-      } catch {
-        // Keep whatever we have.
+        if (found) {
+          const previous = versionCache;
+          if (previous !== found) {
+            console.log(
+              previous
+                ? `[Version] Frontend updated: ${previous} → ${found} (${source})`
+                : `[Version] Resolved frontend version: ${found} (${source})`,
+            );
+          }
+          versionCache = found;
+          updateQwenWebVersion(found);
+          return found;
+        }
+        console.warn(
+          `[Version] Frontend version not found — keeping ${versionCache || getQwenWebVersion()}`,
+        );
+      } catch (err) {
+        console.warn(
+          `[Version] Frontend version scrape failed (${err instanceof Error ? err.message : String(err)}) — keeping ${versionCache || getQwenWebVersion()}`,
+        );
+      } finally {
+        versionCheckedAt = Date.now();
       }
       return null;
     })().finally(() => {
@@ -236,8 +329,63 @@ export async function getFrontendVersion(
   return scraped || getQwenWebVersion();
 }
 
+/** @internal test seam: clear the shared version cache. */
+export function _resetVersionCacheForTests(): void {
+  versionCache = null;
+  versionCheckedAt = 0;
+  versionInflight = null;
+}
+
+/** @internal test seam: inspect the shared version cache. */
+export function _getVersionCacheForTests(): {
+  version: string | null;
+  checkedAt: number;
+} {
+  return { version: versionCache, checkedAt: versionCheckedAt };
+}
+
+/** @internal test seam: age the shared cache without waiting 30 minutes. */
+export function _setVersionCacheAgeForTests(ageMs: number): void {
+  versionCheckedAt = Date.now() - ageMs;
+}
+
 function getDirectUserAgent(): string {
   return getDefaultQwenUserAgent();
+}
+
+export interface ClientHints {
+  chUa: string;
+  mobile: string;
+  platform: string;
+}
+
+/**
+ * Client Hints derived from the session's OWN captured User-Agent.
+ *
+ * The direct transport used to hardcode Chrome/151 + Windows, which
+ * contradicted a Chrome/153 UA and a Linux platform in the same request — an
+ * internally inconsistent fingerprint. Deriving both from the same captured UA
+ * keeps them coherent without inventing or spoofing anything.
+ */
+export function clientHintsFromUserAgent(userAgent?: string | null): ClientHints {
+  const ua = String(userAgent || "");
+  const major =
+    (ua.match(/Chrome\/(\d+)/) || ua.match(/Chromium\/(\d+)/) || [])[1] || "151";
+  const mobile = /Android|iPhone|iPad|Mobile/i.test(ua) ? "?1" : "?0";
+  const platform = /Windows NT/i.test(ua)
+    ? '"Windows"'
+    : /Macintosh|Mac OS X/i.test(ua)
+      ? '"macOS"'
+      : /Android/i.test(ua)
+        ? '"Android"'
+        : /iPhone|iPad/i.test(ua)
+          ? '"iOS"'
+          : '"Linux"';
+  return {
+    chUa: `"Google Chrome";v="${major}", "Chromium";v="${major}", "Not.A/Brand";v="99"`,
+    mobile,
+    platform,
+  };
 }
 
 export interface DirectHeaderInput {
@@ -279,6 +427,8 @@ export interface DirectHeaderInput {
 }
 
 export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string, string> {
+  // Keep the fingerprint coherent: hints come from the same UA we send.
+  const hints = clientHintsFromUserAgent(input.userAgent);
   const headers: Record<string, string> = {
     Accept: "application/json",
     "Accept-Language":
@@ -305,9 +455,9 @@ export function buildDirectQwenHeaders(input: DirectHeaderInput): Record<string,
     // REQUIRED by /api/v2/chat/completions; rejected by /chats/new when stale.
     ...(input.omitVersion ? {} : { version: input.version || getQwenWebVersion() }),
     timezone: new Date().toString().split(" (")[0],
-    "sec-ch-ua": '"Chromium";v="151", "Not.A/Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua": hints.chUa,
+    "sec-ch-ua-mobile": hints.mobile,
+    "sec-ch-ua-platform": hints.platform,
     ...(input.extra ?? {}),
   };
   if (input.bearerToken) headers["Authorization"] = `Bearer ${input.bearerToken}`;

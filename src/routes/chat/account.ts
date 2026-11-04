@@ -5,6 +5,7 @@ import {
 	getNextAvailableAccount,
 	markAccountRateLimited,
 	syncCooldownsFromDb,
+	unmarkAccountHeadersReady,
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
@@ -17,7 +18,7 @@ import {
 } from "../../core/waf-circuit.ts";
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
-import { ClientAbortedError, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
+import { ClientAbortedError, ServiceUnavailable, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
 import {
   assertPromptWithinLimits,
   truncatePromptToIntelligentLimit,
@@ -79,6 +80,7 @@ import {
 	isAntiBotError as isAntiBotPolicyError,
 	isAccountInitializationError,
 	isChatInProgressError,
+	isConfirmedAuthError,
 	isQuotaLikeError,
 	isTerminalLocalError,
 	shouldRetryInvalidInputOnSameAccount,
@@ -189,6 +191,8 @@ export interface SelectedAccount {
 	id: string;
 	email: string;
 	password: string;
+	/** Persisted auth eligibility; optional for lightweight test doubles. */
+	auth_state?: "valid" | "rejected" | "inconclusive" | null;
 }
 
 export interface StreamCreationResult {
@@ -196,6 +200,8 @@ export interface StreamCreationResult {
 	uiSessionId: string;
 	activeAccountId: string;
 	activeAccountLabel: string;
+	/** Every account actually attempted for this logical request (outer + inner switches). */
+	attemptedAccountIds: string[];
 	/** True when the request resent the FULL prompt on a new upstream chat
 	 * (account switch / missing thread parent). The 📤 log line uses this to
 	 * show the real payload instead of the thread-native delta. */
@@ -212,6 +218,8 @@ export interface StreamCreationFailure {
 	completionId: string;
 	allOnCooldown: boolean;
 	retryAfterMs?: number;
+	/** Accounts attempted before the failure (pre-stream attribution). */
+	attemptedAccountIds?: string[];
 }
 
 export interface AcquireParams {
@@ -286,7 +294,13 @@ export function resolveInitialAccount(
 			const preferred = configuredAccounts.find(
 				(candidate) => candidate.id === preferredAccountId,
 			);
-			if (preferred && !getAccountCooldownInfo(preferred.id)) {
+			// Sticky affinity must not resurrect an account whose authentication
+			// was confirmed rejected. Fall through to the normal picker instead.
+			if (
+				preferred &&
+				preferred.auth_state !== "rejected" &&
+				!getAccountCooldownInfo(preferred.id)
+			) {
 				return { account: preferred, configuredAccounts };
 			}
 			// Preferred is missing/on cooldown: fall through to next available.
@@ -301,8 +315,11 @@ export function resolveInitialAccount(
 
 		const account = getNextAccount();
 		if (!account) {
-			// All accounts on cooldown; caller will handle this.
-			return { account: configuredAccounts[0], configuredAccounts };
+			// All accounts are rejected or on cooldown: fail controlled instead
+			// of resurrecting a rejected account via the old [0] fallback.
+			throw new ServiceUnavailable(
+				"No eligible Qwen account: all configured accounts are rejected or on cooldown",
+			);
 		}
 		return { account, configuredAccounts };
 	}
@@ -392,6 +409,7 @@ function hasFreeAlternateAccount(
 ): boolean {
 	return accounts.some(
 		(candidate) =>
+			candidate.auth_state !== "rejected" &&
 			candidate.id !== currentAccountId &&
 			!triedAccountIds.has(candidate.id) &&
 			!getAccountCooldownInfo(candidate.id) &&
@@ -418,6 +436,7 @@ function getNextFreeAccountForParallel(
 	const ordered = getAccountsByPriority(accounts);
 	const free = ordered.find(
 		(c) =>
+			c.auth_state !== "rejected" &&
 			c.id !== currentAccountId &&
 			!triedAccountIds.has(c.id) &&
 			!getAccountCooldownInfo(c.id) &&
@@ -432,28 +451,47 @@ function getNextFreeAccountForParallel(
 }
 
 
+interface AttemptReloginResult {
+	ok: boolean;
+	/** True only when the modern session decision was `verified`. */
+	modernVerified: boolean;
+}
+
 async function attemptRelogin(
 	accountId: string,
 	accountEmail: string,
-): Promise<boolean> {
+	ownerLeaseId?: string,
+): Promise<AttemptReloginResult> {
 	// MODERN_AUTH_PRESENT first: an account with usable modern persisted auth
 	// must never run the password-login machinery just because no browser
-	// context exists. Fresh → retry serves it via the cold bridge/direct path;
-	// stale modern material → return false so the request rotates with
-	// classification instead of paying password retries. LEGACY_ONLY accounts
-	// fall through to the existing password path unchanged.
+	// context exists. A fresh JWT is NOT enough: the coordinator classifies the
+	// upstream session and may return verified/rejected/inconclusive/deferred/
+	// page-required. The current request's own lease is excluded by its unique
+	// leaseId; other streams still block, even with the same session/email
+	// label. Only a verified session may continue on the same account;
+	// everything else fails over instead of retrying freshness.
 	try {
-		const { revalidateModernAccountSession } = await import(
+		const { revalidateModernAccountSessionDecision } = await import(
 			"../../services/qwen-account-session.ts"
 		);
-		const modern = await revalidateModernAccountSession(accountId).catch(
-			() => null,
-		);
-		if (modern !== null) {
+		const decision = await revalidateModernAccountSessionDecision(
+			accountId,
+			{ ownerLeaseId },
+		).catch(() => ({ kind: "inconclusive" as const, reason: "revalidation-error" }));
+		if (decision.kind !== "legacy") {
+			if (decision.kind === "rejected") {
+				// Conclusive upstream rejection: remove READY. Inconclusive,
+				// deferred and page-required preserve the previously verified
+				// READY state and the recovery material.
+				unmarkAccountHeadersReady(accountId);
+			}
 			console.warn(
-				`🔄 [Chat] Modern session revalidation for ${maskEmail(accountEmail)} (${accountId.slice(0, 8)}): fresh=${modern}, no legacy login attempted`,
+				`🔄 [Chat] Modern session decision for ${maskEmail(accountEmail)} (${accountId.slice(0, 8)}): ${decision.kind}, no legacy login attempted`,
 			);
-			return modern;
+			return {
+				ok: decision.kind === "verified",
+				modernVerified: decision.kind === "verified",
+			};
 		}
 	} catch {
 		// Fall through to the legacy path.
@@ -463,7 +501,7 @@ async function attemptRelogin(
 		console.log(
 			`✅ [Chat] Playwright headers refreshed for ${maskEmail(accountEmail)}. Retrying...`,
 		);
-		return true;
+		return { ok: true, modernVerified: false };
 	} catch (refreshErr: unknown) {
 		logger.error("[Chat] Playwright header refresh failed", {
 			accountEmail: maskEmail(accountEmail),
@@ -475,14 +513,30 @@ async function attemptRelogin(
 					: typeof refreshErr,
 		});
 	}
-	return false;
+	return { ok: false, modernVerified: false };
 }
 
-/** @internal test seam: modern-first relogin without the request loop. */
-export const _attemptReloginForTests = attemptRelogin;
+/** @internal test seam: boolean view of the modern-first relogin. */
+export const _attemptReloginForTests = async (
+	accountId: string,
+	accountEmail: string,
+	ownerLeaseId?: string,
+): Promise<boolean> =>
+	(await attemptRelogin(accountId, accountEmail, ownerLeaseId)).ok;
+export const _tryCreateStreamWithRetryForTests = tryCreateStreamWithRetry;
+
+/**
+ * Test-only seam for the 401 simulation. Production callers never pass it, so
+ * the real transport and the real retry/relogin path stay unchanged.
+ */
+export interface UpstreamStreamTestDeps {
+	createStreamForAccount?: typeof createStreamForAccount;
+	fetchQwenModels?: typeof fetchQwenModels;
+}
 
 export async function acquireUpstreamStream(
 	params: AcquireParams,
+	testDeps: UpstreamStreamTestDeps = {},
 ): Promise<StreamCreationResult | StreamCreationFailure> {
 	const {
 		finalPrompt,
@@ -765,6 +819,7 @@ export async function acquireUpstreamStream(
 				},
 				accountId,
 				accountEmail,
+				testDeps,
 			);
 
 			if (result.success) {
@@ -781,6 +836,9 @@ export async function acquireUpstreamStream(
 					uiSessionId: result.uiSessionId,
 					activeAccountId: result.accountId,
 					activeAccountLabel: result.accountEmail,
+					attemptedAccountIds: [
+						...new Set([...triedAccountIds, ...(result.attemptedAccountIds ?? [])]),
+					],
 					replayedFullContext: mustReplayFullContext,
 					completionId,
 					logicalSessionId:
@@ -938,6 +996,7 @@ export async function acquireUpstreamStream(
 				completionId,
 				allOnCooldown: true,
 				retryAfterMs,
+				attemptedAccountIds: [...triedAccountIds],
 			};
 		}
 	}
@@ -951,6 +1010,7 @@ export async function acquireUpstreamStream(
 			error: busyOrCooldownError,
 			completionId,
 			allOnCooldown: false,
+			attemptedAccountIds: [...triedAccountIds],
 		};
 	}
 
@@ -958,6 +1018,12 @@ export async function acquireUpstreamStream(
 		error: lastError,
 		completionId,
 		allOnCooldown: false,
+		attemptedAccountIds: [
+			...new Set([
+				...triedAccountIds,
+				...((lastError as any)?.attemptedAccountIds ?? []),
+			]),
+		],
 	};
 }
 
@@ -966,6 +1032,7 @@ interface CreateStreamSuccess {
 	stream: ReadableStream;
 	uiSessionId: string;
 	accountId: string;
+	attemptedAccountIds: string[];
 	/** Account email that actually served the request (inner rotation may
 	 * switch accounts — parallel escape / other retry policies). */
 	accountEmail: string;
@@ -979,6 +1046,7 @@ interface CreateStreamSuccess {
 interface CreateStreamFailure {
 	success: false;
 	error: any;
+	attemptedAccountIds?: string[];
 }
 
 /**
@@ -1026,6 +1094,34 @@ export function shouldWaitQueueForever(
 	return (isThreadOwnerWaiting && !heldByOtherSession) || !hasFreeAlternate;
 }
 
+/**
+ * Opaque, in-memory fingerprint of the persisted auth material. Never logged.
+ * Used only to distinguish a real refresh (DB row changed) from a settings
+ * probe that merely returned 200 without renewing the transport material.
+ */
+async function authMaterialFingerprint(
+	accountId: string,
+): Promise<string | null> {
+	try {
+		const { getRefreshMaterial } = await import("../../core/database.ts");
+		const material = getRefreshMaterial(accountId);
+		if (!material) return null;
+		return [
+			material.jar,
+			material.userAgent,
+			material.refreshToken ?? "",
+			material.tokenExpiresAtSec == null
+				? ""
+				: String(material.tokenExpiresAtSec),
+		].join("\u0000");
+	} catch {
+		return null;
+	}
+}
+
+/** @internal test seam: material-change detection, no secrets returned/logged. */
+export const _authMaterialFingerprintForTests = authMaterialFingerprint;
+
 async function tryCreateStreamWithRetry(
 	params: {
 		finalPrompt: string;
@@ -1064,7 +1160,10 @@ async function tryCreateStreamWithRetry(
 	},
 	accountId: string,
 	accountEmail: string,
+	testDeps: UpstreamStreamTestDeps = {},
 ): Promise<CreateStreamSuccess | CreateStreamFailure> {
+	const createStream = testDeps.createStreamForAccount ?? createStreamForAccount;
+	const fetchModels = testDeps.fetchQwenModels ?? fetchQwenModels;
 	const maxAttempts = Math.max(1, config.retry.maxAttempts);
 	const maxAccountSwitches = Math.max(0, config.retry.maxAccountSwitches);
 	let attemptsLeft = maxAttempts;
@@ -1074,6 +1173,11 @@ async function tryCreateStreamWithRetry(
 	let accountSwitches = 0;
 	let chatInProgressCount = 0;
 	let chatInProgressEscalated = false;
+	// Per-request/per-account guard for the verified-but-still-401 cycle.
+	// The first valid verification allows one transport retry; a second 401
+	// ends this account attempt without another settings probe/reauth.
+	const validVerified401RetryUsed = new Set<string>();
+	const materialAfterValid401 = new Map<string, string | null>();
 	// Account that accumulated the chat_in_progress failures (the one whose
 	// upstream chat is actually stuck "in progress"). The post-budget
 	// escalation switches to a FRESH chat, and the loop-exit session clear
@@ -1088,6 +1192,11 @@ async function tryCreateStreamWithRetry(
 	let currentAccountId = accountId;
 	let currentAccountEmail = accountEmail;
 	const triedAccounts = new Set<string>([accountId]);
+	const fail = (err: any): CreateStreamFailure => ({
+		success: false,
+		error: err,
+		attemptedAccountIds: Array.from(triedAccounts),
+	});
 
 	while (attemptsLeft > 0) {
 		attempt++;
@@ -1117,7 +1226,7 @@ async function tryCreateStreamWithRetry(
 			// checks use the real context window published by Qwen, not the
 			// conservative registry fallback. The call is cached per account.
 			try {
-				await fetchQwenModels(currentAccountId);
+				await fetchModels(currentAccountId);
 			} catch (metadataError) {
 				logger.warn("[chat] model metadata sync unavailable; using registry fallback", {
 					model: params.contextModelId ?? params.model,
@@ -1417,7 +1526,7 @@ async function tryCreateStreamWithRetry(
 					attemptDeadlineBox.current.extend(acquireDeadlineMs);
 				});
 				result = await Promise.race([
-					runWithLatencyRequest(params.reqId, () => createStreamForAccount({
+					runWithLatencyRequest(params.reqId, () => createStream({
 						prompt: promptForUpstream,
 						isThinkingModel: params.isThinkingModel,
 						model: params.model,
@@ -1600,6 +1709,7 @@ async function tryCreateStreamWithRetry(
 				success: true,
 				...result,
 				accountEmail: currentAccountEmail,
+				attemptedAccountIds: Array.from(triedAccounts),
 				releaseAccountLease: accountLease.release,
 			};
 		} catch (err: any) {
@@ -1623,7 +1733,7 @@ async function tryCreateStreamWithRetry(
 		// Once the client request is aborted, do not rotate accounts or retry. The
 		// old request can otherwise keep acquiring leases after the client is gone.
 		if (params.requestSignal?.aborted) {
-			return { success: false, error: err };
+			return fail(err);
 		}
 
 		// Log the error details for debugging (skip quota errors — logged separately below,
@@ -1646,25 +1756,54 @@ async function tryCreateStreamWithRetry(
 
 
 		if (!err) {
-			return {
-				success: false,
-				error: new Error("Failed to create Qwen stream"),
-			};
+			return fail(new Error("Failed to create Qwen stream"));
 		}
 
 		if (
 			err instanceof QwenSessionExpiredError ||
 			err.name === "QwenSessionExpiredError"
 		) {
+			const accountKey = currentAccountId;
+			const materialBefore = await authMaterialFingerprint(accountKey);
+
+			if (validVerified401RetryUsed.has(accountKey)) {
+				const verifiedMaterial = materialAfterValid401.get(accountKey) ?? null;
+				const sameMaterial =
+					verifiedMaterial !== null && materialBefore !== null
+						? verifiedMaterial === materialBefore
+						: null;
+				console.warn(
+					`🛑 [Chat] Second upstream 401 after a valid verification | ${currentAccountEmail} (${accountKey.slice(0, 8)}) | same_material=${sameMaterial === null ? "unknown" : sameMaterial} | ending this account attempt for failover`,
+				);
+				return fail(err);
+			}
+
 			console.warn(
 				`🔄 [Chat] Session expired for ${currentAccountEmail} (${currentAccountId}). Attempting re-login...`,
 			);
-			const reLoginOk = await attemptRelogin(
+			const reLogin = await attemptRelogin(
 				currentAccountId,
 				currentAccountEmail,
+				accountLease?.leaseId,
 			);
-			if (reLoginOk) continue;
-			return { success: false, error: err };
+			if (!reLogin.ok) return fail(err);
+			if (!reLogin.modernVerified) {
+				// Legacy header refresh keeps its original retry behavior; the
+				// one-retry guard applies only to a modern `verified` decision.
+				continue;
+			}
+
+			const materialAfter = await authMaterialFingerprint(accountKey);
+			const materialChanged =
+				materialBefore !== null && materialAfter !== null
+					? materialBefore !== materialAfter
+					: null;
+			validVerified401RetryUsed.add(accountKey);
+			materialAfterValid401.set(accountKey, materialAfter);
+			console.warn(
+				`🔄 [Chat] Valid session verification allows one retry | ${currentAccountEmail} (${accountKey.slice(0, 8)}) | material_changed=${materialChanged === null ? "unknown" : materialChanged}`,
+			);
+			continue;
 		}
 
 
@@ -1724,7 +1863,7 @@ async function tryCreateStreamWithRetry(
 					policy.accountCooldownReason || "QuotaExceeded",
 					{ silent: true },
 				);
-				return { success: false, error: err };
+				return fail(err);
 			}
 
 		const policy = classifyRetryAction(err, {
@@ -1855,7 +1994,11 @@ async function tryCreateStreamWithRetry(
 				policy.accountCooldownMs,
 				policy.accountCooldownReason,
 			);
-			return { success: false, error: err };
+			return {
+				success: false,
+				error: err,
+				attemptedAccountIds: Array.from(triedAccounts),
+			};
 		}
 
 		// Prefer switching account for any retryable upstream error when possible.
@@ -1914,6 +2057,16 @@ async function tryCreateStreamWithRetry(
 			console.warn(
 				`⚠️  [Chat] No other account available after ${policy.reason} | Retrying on same account`,
 			);
+			// A confirmed auth failure must never be retried on the same
+			// account: there is no alternative and the credentials are dead.
+			// Fail fast instead of repeating the login cycle.
+			if (
+				policy.reason === "account_initialization_failed" &&
+				isConfirmedAuthError(err)
+			) {
+				policy.retryable = false;
+				attemptsLeft = 0;
+			}
 		}
 
 		// Force new chat / full context when policy requests it (invalid_input, chat gone, etc.)
@@ -1978,7 +2131,7 @@ async function tryCreateStreamWithRetry(
 				clearAllSessionsForAccount(clearTargetId);
 			}
 
-			return { success: false, error: err };
+			return fail(err);
 		}
 
 		const useDelay = Math.max(

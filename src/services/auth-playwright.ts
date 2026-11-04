@@ -1,4 +1,5 @@
 import { AuthError } from "../core/errors.ts";
+import { getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountCredentials, loadAccounts } from "../core/accounts.ts";
 import { config } from "../core/config.ts";
 import {
@@ -98,7 +99,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{
       secChUa: "",
       secChUaMobile: "?0",
       secChUaPlatform: "",
-      version: "0.2.89",
+      version: getQwenWebVersion() || "0.3.26",
     };
   }
 

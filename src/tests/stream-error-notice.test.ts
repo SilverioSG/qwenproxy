@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
+import fs from "node:fs";
 import { Hono } from "hono";
 import { stream as honoStream } from "hono/streaming";
 
@@ -33,4 +34,25 @@ test("streaming error handler emits visible content delta and terminal error", a
   assert.ok(text.includes("⚠️ **[Qwen Security / Erro]**"));
   assert.ok(text.includes("data_inspection_failed"));
   assert.ok(text.includes("data: [DONE]"));
+});
+
+test("post-stream technical errors are SSE errors, not assistant stop content", () => {
+  const src = fs.readFileSync("src/routes/chat/streaming.ts", "utf-8");
+  const i = src.lastIndexOf("const upstreamError = parseQwenErrorPayload(buffer);");
+  assert.ok(i >= 0);
+  const region = src.slice(i, i + 1200);
+  assert.ok(
+    !region.includes("content: upstreamError.message"),
+    "technical error must not be emitted as assistant content",
+  );
+  assert.ok(region.includes('type: "upstream_error"'));
+  assert.ok(region.includes("data: [DONE]"));
+});
+
+test("technical errors skip the moderation content notice", () => {
+  const src = fs.readFileSync("src/routes/chat/streaming.ts", "utf-8");
+  const i = src.indexOf("const isModeration");
+  assert.ok(i >= 0);
+  const region = src.slice(i, i + 1600);
+  assert.ok(region.includes("if (isModeration)"));
 });

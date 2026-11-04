@@ -1,6 +1,7 @@
 import {
   QwenAccount,
   loadAccounts,
+  setAccountAuthState,
   updateAccountCooldown,
 } from "./accounts.ts";
 import { getAccountsByPriority } from "./account-priority.ts";
@@ -59,6 +60,20 @@ export function markAccountRateLimited(
     until,
     reason: cooldownReason,
   });
+
+  // Auth failures are not just rate limits: persist the rejection so the
+  // picker keeps the account out after the (short) cooldown expires.
+  if (
+    accountId !== "global" &&
+    (cooldownReason === "AuthInitFailed" ||
+      cooldownReason.startsWith("AuthPermanentFailure"))
+  ) {
+    try {
+      setAccountAuthState(accountId, "rejected");
+    } catch {
+      // State bookkeeping must never break cooldown handling.
+    }
+  }
 
   // Persist to database
   if (accountId !== "global") {
@@ -167,6 +182,7 @@ function anyUsableAccountHeadersReady(
 ): boolean {
   return accounts.some(
     (a) =>
+      a.auth_state !== "rejected" &&
       (!triedSet || !triedSet.has(a.id)) &&
       !isAccountOnCooldown(a.id) &&
       isAccountHeadersReady(a.id),
@@ -227,6 +243,7 @@ export function getNextAccount(): QwenAccount | null {
     const account = prioritized[currentIndex % prioritized.length];
     currentIndex = (currentIndex + 1) % prioritized.length;
     if (
+      account.auth_state !== "rejected" &&
       !isAccountOnCooldown(account.id) &&
       passesHeadersReadyGate(account.id, anyReady)
     ) {
@@ -238,6 +255,7 @@ export function getNextAccount(): QwenAccount | null {
   let best: QwenAccount | null = null;
   let bestRemaining = Infinity;
   for (const account of prioritized) {
+    if (account.auth_state === "rejected") continue;
     const info = getAccountCooldownInfo(account.id);
     if (info && info.remainingMs < bestRemaining) {
       bestRemaining = info.remainingMs;
@@ -274,6 +292,9 @@ export function getNextAvailableAccount(
     const idx = (currentIndex + i) % prioritized.length;
     const account = prioritized[idx];
     if (triedSet.has(account.id)) continue;
+    // A confirmed auth rejection is NOT a cooldown: it must survive cooldown
+    // expiry until a later login/refresh/create validates the account again.
+    if (account.auth_state === "rejected") continue;
     if (
       !isAccountOnCooldown(account.id) &&
       passesHeadersReadyGate(account.id, anyReady)
@@ -288,6 +309,7 @@ export function getNextAvailableAccount(
   let bestRemaining = Infinity;
   for (const account of prioritized) {
     if (triedSet.has(account.id)) continue;
+    if (account.auth_state === "rejected") continue;
     const info = getAccountCooldownInfo(account.id);
     if (info && info.remainingMs < bestRemaining) {
       bestRemaining = info.remainingMs;

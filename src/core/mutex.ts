@@ -14,6 +14,12 @@ export class Mutex {
   private locked = false;
   private lockedAt = 0;
   private lockedByKey = "";
+  /**
+   * Monotonic grant epoch. Every grant (fresh acquire, waiter handoff, stale
+   * recovery) increments it. A release closure captured for an older epoch is
+   * ignored, so a stale owner can never release the current holder's lock.
+   */
+  private generation = 0;
 
   constructor(
     public readonly name: string = "unnamed",
@@ -35,13 +41,15 @@ export class Mutex {
       this.locked = false;
       this.lockedAt = 0;
       this.lockedByKey = "";
+      this.generation += 1;
     }
 
     if (!this.locked) {
       this.locked = true;
       this.lockedAt = Date.now();
       this.lockedByKey = key;
-      return this.createRelease();
+      this.generation += 1;
+      return this.createRelease(this.generation);
     }
 
     const enqueuedAt = Date.now();
@@ -55,7 +63,8 @@ export class Mutex {
         clearTimeout(timer);
         this.lockedByKey = logKey;
         this.lockedAt = Date.now();
-        resolve(this.createRelease());
+        this.generation += 1;
+        resolve(this.createRelease(this.generation));
       };
       const timer = setTimeout(() => {
         const index = this.queue.findIndex((e) => e.waiter === waiter);
@@ -77,11 +86,13 @@ export class Mutex {
     }
   }
 
-  private createRelease(): () => void {
+  private createRelease(generation: number): () => void {
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      // A stale holder's release must never release a newer generation.
+      if (generation !== this.generation) return;
       this.release();
     };
   }

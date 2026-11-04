@@ -12,7 +12,13 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { parseJwtExpiry } from "../utils/jwt.ts";
+import { getJarPair, setCookiePairInJar } from "./qwen-token-refresh.ts";
+import type { AuthValidationState } from "./auth-contract.ts";
+import { COMPOSER_SELECTORS, SEND_BUTTON_SELECTORS } from "./composer-probe.ts";
 import { chromium, type BrowserContext, type Page } from "patchright";
 
 export type ManualVerificationState =
@@ -120,12 +126,314 @@ interface AccountRef {
   email: string;
 }
 
+
+function authHash(token: string): string {
+  return token ? createHash("sha256").update(token).digest("hex").slice(0, 12) : "absent";
+}
+
+/** Visible SPA credentials precede cookies; expired candidates never replace live material. */
+export function selectManualAccessToken(
+  live: { token: string; access: string }, cookieToken: string,
+): { token: string; source: string } | null {
+  for (const [source, token] of [["localStorage.token", live.token], ["localStorage.access_token", live.access], ["cookie", cookieToken]]) {
+    if (!token) continue;
+    const exp = parseJwtExpiry(token);
+    if (exp !== null && exp <= Date.now() / 1000) continue;
+    return { token, source };
+  }
+  return null;
+}
+
+/** No HTTP-200 shortcut: an ambiguous payload cannot authenticate an account. */
+export function classifyManualSettingsResponse(status: number, raw: string): AuthValidationState {
+  if (status === 401 || status === 403) return "rejected";
+  if (status !== 200) return "inconclusive";
+  let json: any;
+  try { json = JSON.parse(raw); } catch { return "inconclusive"; }
+  if (!json || typeof json !== "object" || Array.isArray(json)) return "inconclusive";
+  const code = String(json.data?.code ?? json.code ?? "");
+  const details = String(json.data?.details ?? json.details ?? json.message ?? "");
+  if (/unauthorized|revoked|forbidden|\b401\b|\b403\b/i.test(`${code} ${details}`)) return "rejected";
+  if (json.success === false) return "inconclusive";
+  return json.success === true ? "valid" : "inconclusive";
+}
+
+/** Snapshot from the context that proved the user chat; never consult the older DB Bearer. */
+export async function snapshotVisibleAuth(page: Page, context: BrowserContext) {
+  // Fresh material from the context that just proved a real chat. Values
+  // stay in memory and go straight to saveAuthSession; only names/counts
+  // are ever logged by callers (which log nothing here at all).
+  const cookies: Array<{ name: string; value: string }> =
+    await context.cookies();
+  const byName = new Map(cookies.map((c) => [c.name, c.value]));
+  const live = await page.evaluate(() => ({
+    token: localStorage.getItem("token") || "",
+    access: localStorage.getItem("access_token") || "",
+    refresh: localStorage.getItem("refresh_token") || "",
+  })).catch(() => ({ token: "", access: "", refresh: "" }));
+  const selected = selectManualAccessToken(live, byName.get("token") || "");
+  if (!selected) return null;
+  const cookie = setCookiePairInJar(
+    cookies.map((c) => `${c.name}=${c.value}`).join("; "), "token", selected.token,
+  );
+  let userAgent = "";
+  try {
+    userAgent = await page.evaluate(() => navigator.userAgent);
+  } catch {
+    userAgent = "";
+  }
+  let secChUa: string | undefined;
+  let secChUaMobile: string | undefined;
+  let secChUaPlatform: string | undefined;
+  try {
+    const hints = await page.evaluate(() => {
+      const ud = (navigator as unknown as { userAgentData?: unknown }).userAgentData as
+        | {
+            brands?: Array<{ brand: string; version: string }>;
+            mobile?: boolean;
+            platform?: string;
+          }
+        | undefined;
+      if (!ud || !Array.isArray(ud.brands)) return null;
+      return {
+        secChUa: ud.brands
+          .map((b) => `"${b.brand}";v="${b.version}"`)
+          .join(", "),
+        secChUaMobile: ud.mobile ? "?1" : "?0",
+        secChUaPlatform: ud.platform ? `"${ud.platform}"` : undefined,
+      };
+    });
+    secChUa = hints?.secChUa;
+    secChUaMobile = hints?.secChUaMobile;
+    secChUaPlatform = hints?.secChUaPlatform;
+  } catch {
+    // Client hints are optional; restore tolerates their absence.
+  }
+  let version: string | undefined;
+  try {
+    const { getQwenWebVersion } = await import("./qwen-headers.ts");
+    version = getQwenWebVersion() || undefined;
+  } catch {
+    version = undefined;
+  }
+  let tokenExpiresAt: number | undefined;
+  tokenExpiresAt = parseJwtExpiry(selected.token) || undefined;
+  let refreshToken: string | null = null;
+  try {
+    refreshToken = getJarPair(cookie, "refresh_token") || live.refresh || null;
+  } catch {
+    refreshToken = null;
+  }
+  console.log(`[ManualAuth] snapshot source=${selected.source} livePresent=${Boolean(live.token || live.access)} liveLength=${(live.token || live.access).length} cookiePresent=${byName.has("token")} cookieLength=${(byName.get("token") || "").length} accessHash=${authHash(selected.token)} expiresAt=${tokenExpiresAt ?? "unknown"}`);
+  return {
+    cookie: refreshToken ? setCookiePairInJar(cookie, "refresh_token", refreshToken) : cookie,
+    userAgent,
+    bxV: byName.get("bx-v") || "2.5.37",
+    bxUa: byName.get("bx-ua") || "",
+    bxUmidtoken: byName.get("bx-umidtoken") || "",
+    secChUa,
+    secChUaMobile,
+    secChUaPlatform,
+    version,
+    tokenExpiresAt,
+    // Opportunistic refresh bookkeeping (manual login path): null/undefined
+    // keeps the stored value, an explicit value updates it.
+    refreshToken: refreshToken ?? undefined,
+  };
+}
+
+/** Preserve an unrotated refresh in both SQLite bookkeeping and the coherent jar. */
+export async function saveManualAuthSession(
+  accountId: string,
+  session: Parameters<typeof import("../core/database.ts").saveValidatedAuthSession>[1],
+): Promise<void> {
+  const { saveValidatedAuthSession, getRefreshMaterial } = await import("../core/database.ts");
+  const refresh = session.refreshToken ?? getJarPair(session.cookie, "refresh_token") ?? getRefreshMaterial(accountId)?.refreshToken;
+  const cookie = refresh ? setCookiePairInJar(session.cookie, "refresh_token", refresh) : session.cookie;
+  const result = saveValidatedAuthSession(accountId, {
+    ...session, cookie, refreshToken: refresh ?? undefined, capturedAt: Date.now(),
+  }, "valid");
+  if (!result.saved) throw new Error(`Manual session not persisted: ${result.reason ?? "unknown"}`);
+}
+
+export interface AutoSendResult {
+  actionExecuted: boolean;
+  reason:
+    | "action-executed"
+    | "challenge"
+    | "in-progress"
+    | "composer-missing"
+    | "composer-has-text"
+    | "preferred-choice-required"
+    | "birth-year-required"
+    | "send-action-failed"
+    | "cancelled"
+    | "error"
+    | string;
+  detail?: string;
+}
+
+/**
+ * Send one test message in the already-visible official Chromium page.
+ * Only called while the flow is waiting and the page is authenticated.
+ * Never selects a CAPTCHA/OTP, never sends during an active response and
+ * never chooses an ambiguous preferred-response control.
+ */
+export async function defaultSendWaitingMessage(
+  page: Page,
+  accountId: string,
+  prompt: string,
+  isCancelled?: () => boolean,
+): Promise<AutoSendResult> {
+  const cancelled = (): boolean => isCancelled?.() === true;
+  try {
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
+    if (page.isClosed()) {
+      return { actionExecuted: false, reason: "composer-missing", detail: "page closed" };
+    }
+    const url = page.url();
+    if (url.includes("/auth") || url.includes("/login")) {
+      return { actionExecuted: false, reason: "challenge", detail: "auth-url" };
+    }
+    const state = await page
+      .evaluate(() => {
+        const challenge = Boolean(
+          document.querySelector(
+            "[class*='captcha'], [id*='captcha'], [class*='punish'], [class*='challenge']",
+          ),
+        );
+        const busy = Boolean(
+          document.querySelector(
+            "button[aria-label*='Stop' i], .stop-button, [class*='stop-button'], [class*='generating'], [data-generating='true'], [class*='streaming'], [aria-busy='true']",
+          ),
+        );
+        // Only an explicitly identified preferred-response control blocks
+        // automation; no ambiguous button is clicked.
+        const preferred = Boolean(
+          document.querySelector(
+            "[data-testid='preferred-response'], [data-testid*='preferred-response']",
+          ),
+        );
+        // Age/birth-year confirmation is HUMAN-ONLY. It is not a CAPTCHA/OTP
+        // and must never be confirmed with an invented biographical value.
+        const birthYear = Boolean(
+          document.querySelector(
+            ".age-confirmation-modal, [data-testid*='birth-year'], [data-testid*='birthYear'], [class*='age-confirmation']",
+          ),
+        );
+        return { challenge, busy, preferred, birthYear };
+      })
+      .catch(() => ({ challenge: false, busy: false, preferred: false, birthYear: false }));
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
+    if (state.challenge) return { actionExecuted: false, reason: "challenge" };
+    if (state.busy) return { actionExecuted: false, reason: "in-progress" };
+    if (state.preferred) return { actionExecuted: false, reason: "preferred-choice-required" };
+    if (state.birthYear) return { actionExecuted: false, reason: "birth-year-required" };
+
+    const selector = COMPOSER_SELECTORS.join(", ");
+    const input = page.locator(selector).first();
+    if ((await input.count()) === 0) {
+      return { actionExecuted: false, reason: "composer-missing", detail: "not found" };
+    }
+    await input
+      .waitFor({ state: "visible", timeout: 5000 })
+      .catch(() => undefined);
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
+    if (!(await input.isVisible().catch(() => false))) {
+      return { actionExecuted: false, reason: "composer-missing", detail: "not visible" };
+    }
+    if (await input.isDisabled().catch(() => true)) {
+      return { actionExecuted: false, reason: "composer-missing", detail: "disabled" };
+    }
+    const existing = await input.inputValue().catch(() => "");
+    if (existing.trim().length > 0) {
+      return { actionExecuted: false, reason: "composer-has-text" };
+    }
+
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
+    await input.focus().catch(() => undefined);
+    await input.fill(prompt).catch(() => undefined);
+    let landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
+    if (!landed) {
+      await page
+        .evaluate(
+          ({ sel, text }) => {
+            const el = document.querySelector(sel) as HTMLTextAreaElement | null;
+            if (!el) return;
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype,
+              "value",
+            )?.set;
+            if (setter) setter.call(el, text);
+            else el.value = text;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          },
+          { sel: selector, text: prompt },
+        )
+        .catch(() => undefined);
+      landed = await input.inputValue().then((v) => v.includes(prompt)).catch(() => false);
+      if (!landed) {
+        return { actionExecuted: false, reason: "composer-missing", detail: "value not landed" };
+      }
+    }
+
+    if (cancelled()) return { actionExecuted: false, reason: "cancelled" };
+    let clicked = false;
+    for (const sendSelector of SEND_BUTTON_SELECTORS) {
+      const btn = page.locator(sendSelector).first();
+      if ((await btn.count()) === 0) continue;
+      if (!(await btn.isVisible().catch(() => false))) continue;
+      if (await btn.isDisabled().catch(() => true)) continue;
+      try {
+        await btn.click({ delay: 50 });
+        clicked = true;
+        break;
+      } catch {
+        // The SPA may reject the click (overlay, unauthenticated composer,
+        // hydration). Do not report success for a swallowed click.
+        continue;
+      }
+    }
+    if (!clicked) {
+      try {
+        await page.keyboard.press("Enter");
+        clicked = true;
+      } catch {
+        // Fall through to an explicit failure.
+      }
+    }
+    if (!clicked) {
+      return { actionExecuted: false, reason: "send-action-failed" };
+    }
+    return { actionExecuted: true, reason: "action-executed", detail: `account=${accountId.slice(0, 8)}` };
+  } catch (err) {
+    return {
+      actionExecuted: false,
+      reason: "error",
+      detail: String((err as Error)?.message || err).slice(0, 160),
+    };
+  }
+}
+
 const deps: {
   launchBrowser: BrowserLauncher;
+  guestSignInVisible: (page: Page) => Promise<boolean>;
   probeLogin: (
     page: Page,
     timeoutMs: number,
   ) => Promise<{ ok: boolean; reason: string }>;
+  sendWaitingMessage: (
+    page: Page,
+    accountId: string,
+    prompt: string,
+    isCancelled?: () => boolean,
+  ) => Promise<AutoSendResult>;
+  /** Grace for a missing composer before failing the automatic send. */
+  autoSendComposerGraceMs?: number;
+  /** Hydration delay before the first composer attempt. */
+  autoSendArmMs?: number;
   sleep: (ms: number) => Promise<void>;
   headedChromeExists: () => boolean;
   singletonLocked: (profileDir: string) => boolean;
@@ -177,7 +485,7 @@ const deps: {
       tokenExpiresAt?: number;
     },
   ) => Promise<void>;
-  validateLive: (accountId: string) => Promise<{ status: number }>;
+  validateLive: (accountId: string) => Promise<{ status: number; state: AuthValidationState }>;
   probeSameContext: (page: Page) => Promise<{
     settingsStatus: number;
     settingsAppAuthFailure: boolean;
@@ -202,10 +510,22 @@ const deps: {
   }>;
 } = {
   launchBrowser: defaultBrowserLauncher,
+  guestSignInVisible: async (page: Page) => {
+    try {
+      return await page.getByRole("button", {
+        name: /^(?:iniciar sesi[oó]n|log in|sign in)$/i,
+      }).first().isVisible({ timeout: 500 });
+    } catch {
+      return false;
+    }
+  },
   probeLogin: async (page: Page, timeoutMs: number) => {
     const { probePageLoggedIn } = await import("./playwright.ts");
     return probePageLoggedIn(page, timeoutMs);
   },
+  sendWaitingMessage: defaultSendWaitingMessage,
+  autoSendComposerGraceMs: 15_000,
+  autoSendArmMs: 5_000,
   sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
   headedChromeExists: () => fs.existsSync(HEADED_CHROME_PATH),
   singletonLocked: (profileDir: string) => singletonLockPresent(profileDir),
@@ -284,93 +604,11 @@ const deps: {
     const capturedAt = Number(row?.captured_at) || 0;
     return { exists: capturedAt > 0, capturedAt };
   },
-  snapshotVisible: async (page: Page, context: BrowserContext) => {
-    // Fresh material from the context that just proved a real chat. Values
-    // stay in memory and go straight to saveAuthSession; only names/counts
-    // are ever logged by callers (which log nothing here at all).
-    const cookies: Array<{ name: string; value: string }> =
-      await context.cookies();
-    if (cookies.length === 0) return null;
-    const byName = new Map(cookies.map((c) => [c.name, c.value]));
-    if (!byName.get("token")) return null;
-    const cookie = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-    let userAgent = "";
-    try {
-      userAgent = await page.evaluate(() => navigator.userAgent);
-    } catch {
-      userAgent = "";
-    }
-    let secChUa: string | undefined;
-    let secChUaMobile: string | undefined;
-    let secChUaPlatform: string | undefined;
-    try {
-      const hints = await page.evaluate(() => {
-        const ud = (navigator as unknown as { userAgentData?: unknown }).userAgentData as
-          | {
-              brands?: Array<{ brand: string; version: string }>;
-              mobile?: boolean;
-              platform?: string;
-            }
-          | undefined;
-        if (!ud || !Array.isArray(ud.brands)) return null;
-        return {
-          secChUa: ud.brands
-            .map((b) => `"${b.brand}";v="${b.version}"`)
-            .join(", "),
-          secChUaMobile: ud.mobile ? "?1" : "?0",
-          secChUaPlatform: ud.platform ? `"${ud.platform}"` : undefined,
-        };
-      });
-      secChUa = hints?.secChUa;
-      secChUaMobile = hints?.secChUaMobile;
-      secChUaPlatform = hints?.secChUaPlatform;
-    } catch {
-      // Client hints are optional; restore tolerates their absence.
-    }
-    let version: string | undefined;
-    try {
-      const { getQwenWebVersion } = await import("./qwen-headers.ts");
-      version = getQwenWebVersion() || undefined;
-    } catch {
-      version = undefined;
-    }
-    let tokenExpiresAt: number | undefined;
-    try {
-      const { parseJwtExpiry } = await import("../utils/jwt.ts");
-      tokenExpiresAt = parseJwtExpiry(cookie) || undefined;
-    } catch {
-      tokenExpiresAt = undefined;
-    }
-    let refreshToken: string | null = null;
-    try {
-      const { getJarPair } = await import("./qwen-token-refresh.ts");
-      refreshToken = getJarPair(cookie, "refresh_token");
-    } catch {
-      refreshToken = null;
-    }
-    return {
-      cookie,
-      userAgent,
-      bxV: byName.get("bx-v") || "2.5.37",
-      bxUa: byName.get("bx-ua") || "",
-      bxUmidtoken: byName.get("bx-umidtoken") || "",
-      secChUa,
-      secChUaMobile,
-      secChUaPlatform,
-      version,
-      tokenExpiresAt,
-      // Opportunistic refresh bookkeeping (manual login path): null/undefined
-      // keeps the stored value, an explicit value updates it.
-      refreshToken: refreshToken ?? undefined,
-    };
-  },
-  saveSession: async (accountId, session) => {
-    const { saveAuthSession } = await import("../core/database.ts");
-    saveAuthSession(accountId, { ...session, capturedAt: Date.now() });
-  },
+  snapshotVisible: snapshotVisibleAuth,
+  saveSession: saveManualAuthSession,
   validateLive: async (accountId: string) => {
     // Authoritative check against the OPERATIONAL (headless) context: the
-    // same browser transport production will use. Status only, no bodies.
+    // same browser transport production will use. HTTP and logical auth must pass.
     const { getBasicHeaders } = await import("./playwright.ts");
     const {
       buildCapturedQwenHeaders,
@@ -396,7 +634,10 @@ const deps: {
       undefined,
       { referrer: qwenUrl("/settings/personalization") },
     );
-    return { status: res.status };
+    const state = classifyManualSettingsResponse(res.status, await res.text());
+    const { getPersistedBearerToken } = await import("../core/database.ts");
+    console.log(`[ManualAuth] settings account=${accountId.slice(0, 8)} status=${res.status} state=${state} persistedHash=${authHash(getPersistedBearerToken(accountId)?.token || "")} transportCookieHash=${authHash(getJarPair(basic.cookie, "token") || "")}`);
+    return { status: res.status, state };
   },
   probeSameContext: async (page: Page) => {
     // Diagnostic only: same visible page/context that just proved a real
@@ -643,16 +884,38 @@ function logEvent(
   }
 }
 
-function singletonLockPresent(profileDir: string): boolean {
-  for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
-    try {
-      fs.lstatSync(path.join(profileDir, name));
-      return true;
-    } catch {
-      continue;
-    }
+/**
+ * Chromium ProcessSingleton (Linux) semantics: the ownership marker is the
+ * `SingletonLock` symlink whose target is "<hostname>-<pid>". `SingletonSocket`
+ * and `SingletonCookie` are auxiliary IPC files; their mere existence does NOT
+ * mean the profile is in use (they routinely outlive a crashed/closed browser).
+ *
+ * A lock is treated as held only when it was created by THIS host and the
+ * target PID is alive (EPERM still means the process exists). A lock from
+ * another host or with a dead PID is stale and must not block the visible
+ * launch; Chromium itself takes such locks over.
+ */
+export function singletonLockPresent(profileDir: string): boolean {
+  const lockPath = path.join(profileDir, "SingletonLock");
+  let target: string;
+  try {
+    target = fs.readlinkSync(lockPath);
+  } catch {
+    return false;
   }
-  return false;
+  const sep = target.lastIndexOf("-");
+  if (sep <= 0) return false;
+  const host = target.slice(0, sep);
+  const pid = Number(target.slice(sep + 1));
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (host !== os.hostname()) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but belongs to another user -> still held.
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
 }
 
 async function closeVisible(
@@ -779,6 +1042,7 @@ async function runVerification(accountId: string): Promise<void> {
     // Login probing below is INFORMATIONAL ONLY: it never gates verification.
     const chat: { evidence: "none" | "streaming" | "done" } = { evidence: "none" };
     const evidence = (): "none" | "streaming" | "done" => chat.evidence;
+    let guestEpoch = 0;
     let pendingChatClassification = 0;
     let pendingSnapshot: {
       at: number;
@@ -848,11 +1112,15 @@ async function runVerification(accountId: string): Promise<void> {
       // used only for the boolean predicate — never stored or logged.
       pendingChatClassification += 1;
       const capturedStatus = status;
+      const capturedEpoch = guestEpoch;
       void (async () => {
         try {
+          const guestAtResponse = await deps.guestSignInVisible(page);
           const body = await res.text();
           if (
             !entry.finished &&
+            !guestAtResponse &&
+            capturedEpoch === guestEpoch &&
             isValidChatCompletion(capturedStatus, body)
           ) {
             chat.evidence = "done";
@@ -939,11 +1207,19 @@ async function runVerification(accountId: string): Promise<void> {
       setStatus(entry, "waiting", entry.detail);
     }
     const deadline = now() + VERIFY_TIMEOUT_MS;
+    // Give the visible SPA a short hydration window before touching the
+    // composer; then the composer/challenge guards (not the login probe,
+    // which has an auths-schema false negative) decide.
+    const autoSendArmAt = now() + (deps.autoSendArmMs ?? 5_000);
     let poll = 0;
     let lastLoginClass = "unknown";
     let loginHint = false;
     let lastLogAt = 0;
     let sawClose = false;
+    let autoSendAttempted = false;
+    let autoSendAt = 0;
+    let autoSendResult: AutoSendResult | null = null;
+    const autoPrompt = "¿Cuánto es 2 + 2?";
     const maybeLog = (): void => {
       if (now() - lastLogAt < 10000) return;
       lastLogAt = now();
@@ -969,6 +1245,19 @@ async function runVerification(accountId: string): Promise<void> {
         sawClose = true;
         break;
       }
+      // Qwen's guest home has a working composer. A completed guest chat is
+      // not evidence of login and must never cause a session snapshot.
+      if (await deps.guestSignInVisible(page)) {
+        guestEpoch += 1;
+        if (chat.evidence !== "none") {
+          chat.evidence = "none";
+          pendingSnapshot = null;
+        }
+        setStatus(entry, "waiting", "Sign in to Qwen before sending the test message");
+        maybeLog();
+        await deps.sleep(POLL_INTERVAL_MS);
+        continue;
+      }
       try {
         const probe = await deps.probeLogin(page, 5000);
         lastLoginClass = probe.reason;
@@ -980,8 +1269,76 @@ async function runVerification(accountId: string): Promise<void> {
             "Authenticated — send a test message in Qwen",
           );
         }
+        // Automatic test message: only once, only when the official page is
+        // authenticated and no completion is already in flight. CAPTCHA/OTP,
+        // active generations, missing composers and ambiguous preference UIs
+        // are left to the human; they are never automated.
+        if (
+          now() >= autoSendArmAt &&
+          evidence() === "none" &&
+          !autoSendAttempted &&
+          !isClosed(page, context)
+        ) {
+          autoSendAttempted = true;
+          autoSendAt = now();
+          try {
+            autoSendResult = await deps.sendWaitingMessage(
+              page,
+              accountId,
+              autoPrompt,
+              () => entry.cancelRequested === true,
+            );
+          } catch (err) {
+            autoSendResult = {
+              actionExecuted: false,
+              reason: "error",
+              detail: String((err as Error)?.message || err).slice(0, 160),
+            };
+          }
+          const autoId = `auto-${accountId.slice(0, 8)}-${autoSendAt}`;
+          logEvent(
+            entry,
+            accountId,
+            `auto-send id=${autoId} account=${accountId.slice(0, 8)} result=${autoSendResult.reason}${autoSendResult.detail ? ` | ${autoSendResult.detail}` : ""}`,
+          );
+          if (autoSendResult.actionExecuted) {
+            setStatus(
+              entry,
+              "waiting",
+              "Automatic send action executed — waiting for chat activity",
+            );
+          } else if (autoSendResult.reason === "challenge") {
+            setStatus(
+              entry,
+              "waiting",
+              "Verification challenge detected — solve it manually",
+            );
+          } else if (autoSendResult.reason === "preferred-choice-required") {
+            setStatus(
+              entry,
+              "waiting",
+              "Preferred response choice requires human intervention",
+            );
+          } else if (autoSendResult.reason === "birth-year-required") {
+            setStatus(
+              entry,
+              "waiting",
+              "Birth year confirmation required — human intervention",
+            );
+          }
+        }
       } catch {
         lastLoginClass = "evaluate-error";
+      }
+      if (
+        autoSendResult?.reason === "composer-missing" &&
+        autoSendAt > 0 &&
+        now() - autoSendAt > (deps.autoSendComposerGraceMs ?? 15_000) &&
+        evidence() !== "done"
+      ) {
+        detachListener();
+        finish("failed", "Composer not available for automatic test message");
+        return;
       }
       if (evidence() === "done") break;
       maybeLog();
@@ -1037,6 +1394,8 @@ async function runVerification(accountId: string): Promise<void> {
       await deps.clearBusy(accountId);
     } catch {
       // Never leave the caller hanging on cleanup failure.
+    } finally {
+      entry.finalizing = false;
     }
   }
 }
@@ -1166,17 +1525,20 @@ async function completeSuccess(
   }
   // 4. PRE-CAPTURE live validation on the operational context.
   let liveStatus = 0;
+  let liveState: AuthValidationState = "inconclusive";
   try {
-    liveStatus = (await deps.validateLive(accountId)).status;
+    const result = await deps.validateLive(accountId);
+    liveStatus = result.status;
+    liveState = result.state;
   } catch {
     liveStatus = 0;
   }
-  logEvent(entry, accountId, `pre-capture settings status=${liveStatus}`);
-  if (liveStatus !== 200) {
+  logEvent(entry, accountId, `pre-capture settings status=${liveStatus} auth=${liveState}`);
+  if (liveStatus !== 200 || liveState !== "valid") {
     finishOnEntry(
       entry,
       "failed",
-      `Pre-capture live validation failed (settings ${liveStatus})`,
+      `Pre-capture live validation failed (settings ${liveStatus}, ${liveState})`,
     );
     return false;
   }
@@ -1225,13 +1587,16 @@ async function completeSuccess(
   }
   // 6. POST-CAPTURE live validation on the exact post-capture context.
   let postStatus = 0;
+  let postState: AuthValidationState = "inconclusive";
   try {
-    postStatus = (await deps.validateLive(accountId)).status;
+    const result = await deps.validateLive(accountId);
+    postStatus = result.status;
+    postState = result.state;
   } catch {
     postStatus = 0;
   }
-  logEvent(entry, accountId, `post-capture settings status=${postStatus}`);
-  if (postStatus !== 200) {
+  logEvent(entry, accountId, `post-capture settings status=${postStatus} auth=${postState}`);
+  if (postStatus !== 200 || postState !== "valid") {
     try {
       await deps.closeHeadless(accountId);
     } catch {
@@ -1240,12 +1605,20 @@ async function completeSuccess(
     finishOnEntry(
       entry,
       "failed",
-      `Post-capture live validation failed (settings ${postStatus})`,
+      `Post-capture live validation failed (settings ${postStatus}, ${postState})`,
     );
     return false;
   }
   // 7. Cooldown cleared ONLY after validated fresh auth.
   await deps.clearCooldown(accountId);
+  // Re-admit the account only after every post-capture validation passed.
+  // A failed verification must never rehabilitate a rejected account.
+  try {
+    const { setAccountAuthState } = await import("../core/accounts.ts");
+    setAccountAuthState(accountId, "valid");
+  } catch {
+    // State bookkeeping must never downgrade a verified session.
+  }
   void traceLsCheckpoint(accountId, "manual-verify-success-end").catch(() => {});
   finishOnEntry(
     entry,

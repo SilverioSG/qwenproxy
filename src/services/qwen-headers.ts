@@ -31,6 +31,11 @@ export function getQwenWebVersion(): string {
   return dynamicWebVersion || config.qwen.webVersion;
 }
 
+/** @internal test seam: drop the browser-captured version. */
+export function _resetQwenWebVersionForTests(): void {
+  dynamicWebVersion = null;
+}
+
 export const QWEN_WEB_VERSION = config.qwen.webVersion;
 export const DEFAULT_QWEN_USER_AGENT = getDefaultQwenUserAgent(151);
 const QWEN_TIMEZONE_HEADER = new Date().toString().split(" (")[0];

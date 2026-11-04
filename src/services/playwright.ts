@@ -60,7 +60,7 @@ import { traceSessionEvent } from "./session-tracer.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
 // only depends on config/logger, so playwright -> account-concurrency stays
 // acyclic, while the reverse direction would drag the browser layer into core.
-import { hasActiveAccountLease } from "../core/account-concurrency.ts";
+import { hasActiveAccountLease, isAccountTemporarilyBusy, tryBeginAccountContextClose } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
 import { maskEmail, logger } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
@@ -98,9 +98,15 @@ import {
 } from "./capture-probe.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
+import {
+  classifyPostLoginValidation,
+  shouldUnmarkReadyAfterRecovery,
+  type AuthValidationState,
+} from "./auth-contract.ts";
 // Static import is cycle-free: qwen-token-refresh only touches playwright via
 // dynamic import (best-effort cache push after a no-browser refresh).
 import { getJarPair, ensureAccountFresh } from "./qwen-token-refresh.ts";
+import { recoverAccountSession } from "./auth-recovery.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
 const contextInitHooks: ContextInitHook[] = [];
@@ -1074,8 +1080,16 @@ async function clearVisibleChallenge(page: Page): Promise<void> {
   }
 
   // 2. Dismiss any overlay modals (Welcome to Qwen, Terms/Consent, Whats New, etc.)
-  // that can block the chat textarea or send button
+  // that can block the chat textarea or send button. Age/birth-year
+  // confirmation is deliberately excluded: it requires a human decision and
+  // must not be accepted with an invented value.
   try {
+    const ageModal = page
+      .locator(".age-confirmation-modal, [data-testid*='birth-year'], [data-testid*='birthYear']")
+      .first();
+    if (await ageModal.isVisible({ timeout: 150 }).catch(() => false)) {
+      return;
+    }
     const modalCloseSelectors = [
       ".ant-modal-close",
       ".ant-modal-close-x",
@@ -1554,19 +1568,11 @@ export function getStealthScript(profile: FingerprintProfile): string {
         }
       } catch(e) {}
 
-      // --- Auto-resolve birthday compliance & eliminate false logout markers ---
+      // --- Remove false logout markers only ---
+      // Birth-year / age confirmation is HUMAN-ONLY. Never invent or persist a
+      // biographical value here.
       try {
         localStorage.removeItem("qwen_token_logged_out_marker");
-        const b = localStorage.getItem("qwen_account_birthday");
-        if (b) {
-          try {
-            const parsed = JSON.parse(b);
-            if (!parsed.birthday) {
-              parsed.birthday = "1995-06-15";
-              localStorage.setItem("qwen_account_birthday", JSON.stringify(parsed));
-            }
-          } catch {}
-        }
       } catch(e) {}
     })();
   `;
@@ -2447,14 +2453,21 @@ export async function initPlaywrightForAccount(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          const loggedIn = await isPageLoggedIn(acctPage);
+          const loggedIn = await isPageLoggedIn(acctPage, 5000, {
+            nonMutating: true,
+          });
           if (!loggedIn) {
             if (account.email && account.password) {
               console.warn(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
               const ok = await loginToQwen(account.id, account.email, account.password, "startup-validation");
-              if (!ok || !(await isPageLoggedIn(acctPage))) {
+              if (
+                !ok ||
+                !(await isPageLoggedIn(acctPage, 5000, {
+                  nonMutating: true,
+                }))
+              ) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
                 );
@@ -2680,6 +2693,8 @@ export interface LoginAttemptResult {
   success: boolean;
   permanentFailure?: boolean;
   reason?: string;
+  /** Post-login classification when a token was installed. */
+  validation?: AuthValidationState;
 }
 
 export function classifyQwenAuthError(
@@ -2750,20 +2765,39 @@ export async function loginToQwen(
   // MODERN_AUTH_PRESENT: an account holding modern refresh material must never
   // run the password machinery — password flows cannot restore a modern
   // session, and their exhaustion parks the account 24h AuthFailed (proven
-  // live by the SessionKeeper proactive renewal). Silent refresh only; the
-  // boolean result flows to the caller with no cooldown side effects.
+  // live by the SessionKeeper proactive renewal). Token freshness is NOT
+  // authentication: require the independent non-mutating session verification.
   try {
     const { getRefreshMaterial } = await import("../core/database.ts");
     if (getRefreshMaterial(accountId)?.jar) {
       try {
-        const { ensureAccountFresh } = await import(
-          "./qwen-token-refresh.ts"
-        );
-        const fresh = await ensureAccountFresh(accountId).catch(() => false);
+        const recovery = await recoverAccountSession(
+          accountId,
+          "login-modern",
+        ).catch(() => null);
+        const verified = recovery?.outcome === "verified";
+        if (
+          recovery &&
+          shouldUnmarkReadyAfterRecovery(recovery.outcome)
+        ) {
+          unmarkAccountHeadersReady(accountId);
+        }
         try {
-          traceSessionEvent(accountId, "LOGIN_END", fresh ? "ok-modern" : "stale-modern");
+          traceSessionEvent(
+            accountId,
+            "LOGIN_END",
+            verified
+              ? "ok-modern"
+              : recovery?.outcome === "rejected"
+                ? "rejected-modern"
+                : recovery?.outcome === "page-required"
+                  ? "page-required-modern"
+                  : recovery?.outcome === "inconclusive"
+                    ? "unverified-modern"
+                    : "deferred-modern",
+          );
         } catch {}
-        return fresh;
+        return verified;
       } catch {
         return false;
       }
@@ -2825,8 +2859,15 @@ async function loginToQwenInner(
     }
 
     // Try API login first
-    const apiResult = await loginViaApi(page, email, password);
+    const apiResult = await loginViaApi(page, email, password, accountId);
+    if (apiResult.validation && apiResult.validation !== "valid") {
+      // Conclusive rejection or an inconclusive probe must not fall through to
+      // the UI login path or persist a confirmed session.
+      unmarkAccountHeadersReady(accountId);
+      return false;
+    }
     if (apiResult.success) {
+      let persisted = false;
       cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
       // The refresh_token cookie can land a tick after the access token;
@@ -2841,26 +2882,45 @@ async function loginToQwenInner(
           const cache = getHeaderCache(accountId);
           cache.headers.cookie = cookieStr;
           cache.lastRefresh = Date.now();
-          markAccountHeadersReady(accountId);
-          const { saveAuthSession } = await import("../core/database.ts");
+          let userAgent = cache.headers["user-agent"] || "";
+          if (!userAgent) {
+            userAgent = await page
+              .evaluate(() => navigator.userAgent)
+              .catch(() => "");
+          }
+          const { saveValidatedAuthSession } = await import("../core/database.ts");
           const exp = parseJwtExpiry(tokenCookie.value);
-          saveAuthSession(accountId, {
-            cookie: cookieStr,
-            userAgent: cache.headers["user-agent"] || "",
-            bxV: cache.headers["bx-v"] || "2.5.37",
-            bxUa: cache.headers["bx-ua"] || "",
-            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-            secChUa: cache.headers["sec-ch-ua"] || undefined,
-            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-            version: cache.headers["version"] || undefined,
-            tokenExpiresAt: exp || undefined,
-            capturedAt: Date.now(),
-            refreshToken: getJarPair(cookieStr, "refresh_token"),
-          });
+          const saved = saveValidatedAuthSession(
+            accountId,
+            {
+              cookie: cookieStr,
+              userAgent,
+              bxV: cache.headers["bx-v"] || "2.5.37",
+              bxUa: cache.headers["bx-ua"] || "",
+              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+              secChUa: cache.headers["sec-ch-ua"] || undefined,
+              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+              version: cache.headers["version"] || undefined,
+              tokenExpiresAt: exp || undefined,
+              capturedAt: Date.now(),
+              refreshToken: getJarPair(cookieStr, "refresh_token"),
+            },
+            "valid",
+          );
+          persisted = saved.saved;
+          if (saved.saved) {
+            markAccountHeadersReady(accountId);
+          } else {
+            unmarkAccountHeadersReady(accountId);
+            console.warn(
+              `⚠️  [Playwright] Session not persisted for ${maskEmail(email)}: ${saved.reason ?? "unknown"}`,
+            );
+          }
         }
       } catch {}
-      return true;
+      if (!persisted) unmarkAccountHeadersReady(accountId);
+      return persisted;
     }
 
     if (apiResult.permanentFailure) {
@@ -2878,6 +2938,7 @@ async function loginToQwenInner(
     // Fallback to UI login
     const uiResult = await loginViaUi(page, email, password);
     if (uiResult.success) {
+      let persisted = false;
       cookieCaches.delete(accountId);
       await saveStorageState(page.context(), accountId);
       // Same bounded refresh_token wait as the API-login path above.
@@ -2890,26 +2951,45 @@ async function loginToQwenInner(
           const cache = getHeaderCache(accountId);
           cache.headers.cookie = cookieStr;
           cache.lastRefresh = Date.now();
-          markAccountHeadersReady(accountId);
-          const { saveAuthSession } = await import("../core/database.ts");
+          let userAgent = cache.headers["user-agent"] || "";
+          if (!userAgent) {
+            userAgent = await page
+              .evaluate(() => navigator.userAgent)
+              .catch(() => "");
+          }
+          const { saveValidatedAuthSession } = await import("../core/database.ts");
           const exp = parseJwtExpiry(tokenCookie.value);
-          saveAuthSession(accountId, {
-            cookie: cookieStr,
-            userAgent: cache.headers["user-agent"] || "",
-            bxV: cache.headers["bx-v"] || "2.5.37",
-            bxUa: cache.headers["bx-ua"] || "",
-            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-            secChUa: cache.headers["sec-ch-ua"] || undefined,
-            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-            version: cache.headers["version"] || undefined,
-            tokenExpiresAt: exp || undefined,
-            capturedAt: Date.now(),
-            refreshToken: getJarPair(cookieStr, "refresh_token"),
-          });
+          const saved = saveValidatedAuthSession(
+            accountId,
+            {
+              cookie: cookieStr,
+              userAgent,
+              bxV: cache.headers["bx-v"] || "2.5.37",
+              bxUa: cache.headers["bx-ua"] || "",
+              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+              secChUa: cache.headers["sec-ch-ua"] || undefined,
+              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+              version: cache.headers["version"] || undefined,
+              tokenExpiresAt: exp || undefined,
+              capturedAt: Date.now(),
+              refreshToken: getJarPair(cookieStr, "refresh_token"),
+            },
+            "valid",
+          );
+          persisted = saved.saved;
+          if (saved.saved) {
+            markAccountHeadersReady(accountId);
+          } else {
+            unmarkAccountHeadersReady(accountId);
+            console.warn(
+              `⚠️  [Playwright] Session not persisted for ${maskEmail(email)}: ${saved.reason ?? "unknown"}`,
+            );
+          }
         }
       } catch {}
-      return true;
+      if (!persisted) unmarkAccountHeadersReady(accountId);
+      return persisted;
     }
 
     if (uiResult.permanentFailure) {
@@ -2980,6 +3060,8 @@ export interface LoginAttemptTrace {
   lsTokenPresentAfter: boolean;
   lsTokenChanged: boolean;
   validated: boolean | null;
+  /** Explicit post-login classification of the non-mutating probe. */
+  validation?: AuthValidationState;
   cookieInstallOk: boolean | null;
   lsWriteOk: boolean | null;
   reloadOk: boolean | null;
@@ -3799,6 +3881,11 @@ async function loginViaApi(
         } catch {
           // Best effort: the invariant is a tripwire, never a gate.
         }
+        trace.validation = classifyPostLoginValidation({
+          reason: trace.postValidationReason,
+          settingsStatus: trace.postValidation.settingsStatus,
+          settingsAppFail: trace.postValidation.settingsAppFail,
+        });
         try {
           const { snapshotSessionState, traceSessionEvent } = await import(
             "./session-tracer.ts"
@@ -3814,7 +3901,21 @@ async function loginViaApi(
           // Tracing must never break login.
         }
         storeTrace();
-        return { success: true };
+        if (trace.validation === "rejected") {
+          return {
+            success: false,
+            validation: "rejected",
+            reason: `post-login validation rejected: ${trace.postValidationReason || "unknown"}`,
+          };
+        }
+        if (trace.validation === "inconclusive") {
+          return {
+            success: false,
+            validation: "inconclusive",
+            reason: `post-login validation inconclusive: ${trace.postValidationReason || "unknown"}`,
+          };
+        }
+        return { success: true, validation: "valid" };
       }
     }
 
@@ -3826,6 +3927,7 @@ async function loginViaApi(
     storeTrace();
     return {
       success: false,
+      validation: "rejected",
       reason: "API signin não confirmou sessão autenticada",
     };
   } catch (err: any) {
@@ -3833,17 +3935,54 @@ async function loginViaApi(
     if (page && !page.isClosed()) {
       try {
         await sleep(1500);
-        if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
-          trace.validated = true;
+        if (!page.url().includes("/auth")) {
+          // Do not treat "the URL is not /auth" as authentication. Reuse the
+          // same non-mutating settings probe used by the normal post-login
+          // path; never the full probe (it rotates the session it verifies).
+          const pvRes = await probePageLoggedIn(page, 3000, {
+            nonMutating: true,
+          });
+          trace.validated = pvRes.ok;
+          trace.postValidationReason = pvRes.reason;
+          trace.postValidation.settingsStatus = pvRes.reason.startsWith("settings-")
+            ? pvRes.reason === "settings-401"
+              ? 401
+              : pvRes.reason === "settings-403"
+                ? 403
+                : 200
+            : pvRes.reason === "ok"
+              ? 200
+              : 0;
+          trace.postValidation.settingsAppFail = !pvRes.ok;
+          trace.validation = classifyPostLoginValidation({
+            reason: trace.postValidationReason,
+            settingsStatus: trace.postValidation.settingsStatus,
+            settingsAppFail: trace.postValidation.settingsAppFail,
+          });
           storeTrace();
-          return { success: true };
+          if (trace.validation === "rejected") {
+            return {
+              success: false,
+              validation: "rejected",
+              reason: `post-login fallback validation rejected: ${trace.postValidationReason || "unknown"}`,
+            };
+          }
+          if (trace.validation === "inconclusive") {
+            return {
+              success: false,
+              validation: "inconclusive",
+              reason: `post-login fallback validation inconclusive: ${trace.postValidationReason || "unknown"}`,
+            };
+          }
+          return { success: true, validation: "valid" };
         }
       } catch {}
     }
     console.warn(`⚠️  [Playwright] API login error: ${errMsg}`);
     trace.validated = false;
+    trace.validation = "inconclusive";
     storeTrace();
-    return { success: false, reason: errMsg };
+    return { success: false, validation: "inconclusive", reason: errMsg };
   }
 }
 
@@ -3900,7 +4039,11 @@ export async function autofillQwenLoginForm(
     return { submitted: false, alreadyLoggedIn: false, reason: "no-credentials" };
   }
   try {
-    if (await isPageLoggedIn(page, 5000)) {
+    // Non-mutating settings is the authority here. The full auths probe has a
+    // known auths-schema false negative, and a visible composer alone can be a
+    // guest/expired-session composer. Do not navigate or send based on the
+    // composer without this authenticated proof.
+    if (await isPageLoggedIn(page, 5000, { nonMutating: true })) {
       return { submitted: false, alreadyLoggedIn: true, reason: "already-logged-in" };
     }
   } catch {
@@ -4424,7 +4567,6 @@ export async function captureQwenHeaders(
       if (capturedHeaders["version"]) {
         updateQwenWebVersion(capturedHeaders["version"]);
       }
-      markAccountHeadersReady(accountId);
       cache.lastRefresh = Date.now();
       // Header interception can set challenge/session cookies, so do not reuse
       // a cookie snapshot taken before this browser request.
@@ -4436,28 +4578,43 @@ export async function captureQwenHeaders(
       // durable row; capture only refreshes runtime cache here).
       if (persistSession) {
       try {
-        const { saveAuthSession } = await import("../core/database.ts");
+        const { saveValidatedAuthSession } = await import("../core/database.ts");
         const { parseJwtExpiry } = await import("../utils/jwt.ts");
         const tokenExpiry = parseJwtExpiry(capturedHeaders.cookie);
-        saveAuthSession(accountId, {
-          cookie: capturedHeaders.cookie,
-          userAgent: capturedHeaders["user-agent"],
-          bxV: capturedHeaders["bx-v"],
-          bxUa: capturedHeaders["bx-ua"],
-          bxUmidtoken: capturedHeaders["bx-umidtoken"],
-          secChUa: capturedHeaders["sec-ch-ua"],
-          secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
-          secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
-          version: capturedHeaders["version"],
-          tokenExpiresAt: tokenExpiry || undefined,
-          capturedAt: Date.now(),
-          // Opportunistic: keep the refresh bookkeeping fresh when the
-          // captured jar carries it. Absence keeps the stored value
-          // (saveAuthSession preserves on undefined).
-          refreshToken:
-            getJarPair(capturedHeaders.cookie, "refresh_token") ?? undefined,
-        });
-      } catch {}
+        const saved = saveValidatedAuthSession(
+          accountId,
+          {
+            cookie: capturedHeaders.cookie,
+            userAgent: capturedHeaders["user-agent"],
+            bxV: capturedHeaders["bx-v"],
+            bxUa: capturedHeaders["bx-ua"],
+            bxUmidtoken: capturedHeaders["bx-umidtoken"],
+            secChUa: capturedHeaders["sec-ch-ua"],
+            secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
+            secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
+            version: capturedHeaders["version"],
+            tokenExpiresAt: tokenExpiry || undefined,
+            capturedAt: Date.now(),
+            // Opportunistic: keep the refresh bookkeeping fresh when the
+            // captured jar carries it. Absence keeps the stored value
+            // (saveAuthSession preserves on undefined).
+            refreshToken:
+              getJarPair(capturedHeaders.cookie, "refresh_token") ?? undefined,
+          },
+          "valid",
+        );
+        if (saved.saved) {
+          markAccountHeadersReady(accountId);
+        } else {
+          unmarkAccountHeadersReady(accountId);
+        }
+      } catch {
+        unmarkAccountHeadersReady(accountId);
+      }
+      } else {
+        // Manual verification owns the durable row; capture only refreshes the
+        // runtime cache and is allowed to mark READY without a DB write.
+        markAccountHeadersReady(accountId);
       }
 
       await route.abort("aborted").catch(() => {});
@@ -5080,26 +5237,36 @@ async function refreshHeadersInternal(
           const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
           cache.headers.cookie = cookieStr;
           cache.lastRefresh = Date.now();
-          markAccountHeadersReady(accountId);
           try {
-            const { saveAuthSession } = await import("../core/database.ts");
+            const { saveValidatedAuthSession } = await import("../core/database.ts");
             const tokenCookie = liveCookies.find((c) => c.name === "token");
             const exp = tokenCookie ? parseJwtExpiry(tokenCookie.value) : undefined;
-            saveAuthSession(accountId, {
-              cookie: cookieStr,
-              userAgent: cache.headers["user-agent"] || "",
-              bxV: cache.headers["bx-v"] || "2.5.37",
-              bxUa: cache.headers["bx-ua"] || "",
-              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-              secChUa: cache.headers["sec-ch-ua"] || undefined,
-              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-              version: cache.headers["version"] || undefined,
-              tokenExpiresAt: exp || undefined,
-              capturedAt: Date.now(),
-              refreshToken: getJarPair(cookieStr, "refresh_token") ?? undefined,
-            });
-          } catch {}
+            const saved = saveValidatedAuthSession(
+              accountId,
+              {
+                cookie: cookieStr,
+                userAgent: cache.headers["user-agent"] || "",
+                bxV: cache.headers["bx-v"] || "2.5.37",
+                bxUa: cache.headers["bx-ua"] || "",
+                bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+                secChUa: cache.headers["sec-ch-ua"] || undefined,
+                secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+                secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+                version: cache.headers["version"] || undefined,
+                tokenExpiresAt: exp || undefined,
+                capturedAt: Date.now(),
+                refreshToken: getJarPair(cookieStr, "refresh_token") ?? undefined,
+              },
+              "valid",
+            );
+            if (saved.saved) {
+              markAccountHeadersReady(accountId);
+            } else {
+              unmarkAccountHeadersReady(accountId);
+            }
+          } catch {
+            unmarkAccountHeadersReady(accountId);
+          }
           return;
         }
       }
@@ -5518,7 +5685,7 @@ export function getActivePlaywrightAccountIds(): string[] {
 export function getIdlePlaywrightAccountIds(idleMs: number): string[] {
   const now = Date.now();
   return Array.from(accountPages.keys()).filter((accountId) => {
-    if (isAccountServingStream(accountId)) return false;
+    if (isAccountServingStream(accountId) || isAccountTemporarilyBusy(accountId)) return false;
     const mutex = accountMutexes.get(accountId);
     if (!mutex?.isIdle()) return false;
     const lastActivity = lastAccountActivity.get(accountId) ?? 0;
@@ -5561,6 +5728,25 @@ function priorityOrderForEviction(accountIds: string[]): string[] {
   );
 }
 
+/** Recheck account activity after acquiring the same mutex used for closing. */
+async function closeIdleAccountIfStillUnclaimed(accountId: string): Promise<boolean> {
+  const release = await acquireAccountMutex(accountId, `close:${accountId.substring(0, 12)}`);
+  try {
+    if (isAccountServingStream(accountId) || isAccountTemporarilyBusy(accountId)) return false;
+    if (!accountContexts.has(accountId) && !accountPages.has(accountId)) return false;
+    const finishClose = tryBeginAccountContextClose(accountId);
+    if (!finishClose) return false;
+    try {
+      await closePlaywrightForAccountLocked(accountId);
+      return true;
+    } finally {
+      finishClose();
+    }
+  } finally {
+    release();
+  }
+}
+
 export async function closeIdlePlaywrightAccounts(
   idleMs: number,
 ): Promise<number> {
@@ -5589,7 +5775,7 @@ export async function closeIdlePlaywrightAccounts(
 
     // Re-checked per account: closing the previous one is awaited, and a
     // request can have claimed this account in the meantime.
-    if (isAccountServingStream(candidate.accountId)) continue;
+    if (isAccountServingStream(candidate.accountId) || isAccountTemporarilyBusy(candidate.accountId)) continue;
 
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
@@ -5600,12 +5786,13 @@ export async function closeIdlePlaywrightAccounts(
     void import("./session-tracer.ts").then((m) =>
       m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
     ).catch(() => {});
-    await closePlaywrightForAccount(candidate.accountId).catch((error) => {
+    const didClose = await closeIdleAccountIfStillUnclaimed(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
       );
+      return false;
     });
-    closed++;
+    if (didClose) closed++;
   }
   return closed;
 }
@@ -5623,7 +5810,7 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   const candidates = priorityOrderForEviction(
     Array.from(accountPages.keys()).filter((accountId) => {
       const mutex = accountMutexes.get(accountId);
-      return mutex?.isIdle() && !isAccountServingStream(accountId);
+      return mutex?.isIdle() && !isAccountServingStream(accountId) && !isAccountTemporarilyBusy(accountId);
     }),
   ).map((accountId) => ({
     accountId,
@@ -5634,7 +5821,7 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   let closed = 0;
   for (const candidate of candidates) {
     if (accountPages.size <= max) break;
-    if (isAccountServingStream(candidate.accountId)) continue;
+    if (isAccountServingStream(candidate.accountId) || isAccountTemporarilyBusy(candidate.accountId)) continue;
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
@@ -5644,12 +5831,13 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
     void import("./session-tracer.ts").then((m) =>
       m.traceLsCheckpoint(candidate.accountId, "sessionkeeper-close").catch(() => {}),
     ).catch(() => {});
-    await closePlaywrightForAccount(candidate.accountId).catch((error) => {
+    const didClose = await closeIdleAccountIfStillUnclaimed(candidate.accountId).catch((error) => {
       console.warn(
         `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
       );
+      return false;
     });
-    closed++;
+    if (didClose) closed++;
   }
 
   return closed;
@@ -5974,9 +6162,11 @@ export function registerPlaywrightAccountForTests(
   accountId: string,
   page: Page,
   lastActivityAt: number,
+  context?: BrowserContext,
 ): void {
   getAccountMutex(accountId);
   accountPages.set(accountId, page);
+  if (context) accountContexts.set(accountId, context);
   lastAccountActivity.set(accountId, lastActivityAt);
 }
 

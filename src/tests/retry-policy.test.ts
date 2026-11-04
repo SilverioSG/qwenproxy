@@ -78,7 +78,7 @@ test("classifyRetryAction: failed account initialization cools and rotates", () 
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
   assert.equal(action.forceNewChat, false);
-  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.accountCooldownReason, "InitFailed");
   assert.ok(action.accountCooldownMs! >= 30_000);
   assert.equal(action.reason, "account_initialization_failed");
 });
@@ -105,7 +105,7 @@ test("classifyRetryAction: stuck Playwright page is account initialization failu
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
   assert.equal(action.forceNewChat, false);
-  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.accountCooldownReason, "InitFailed");
   assert.equal(action.reason, "account_initialization_failed");
 });
 
@@ -117,7 +117,7 @@ test("classifyRetryAction: acquire deadline exceeded quarantines account and rot
   const action = classifyRetryAction(err);
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
-  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.accountCooldownReason, "InitFailed");
   assert.equal(action.accountCooldownMs, config.concurrency.initFailureCooldownMs);
   assert.equal(action.reason, "account_initialization_failed");
 });
@@ -127,7 +127,7 @@ test("classifyRetryAction: header capture timeout classifies as account initiali
   const action = classifyRetryAction(err);
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
-  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.accountCooldownReason, "InitFailed");
   assert.equal(action.accountCooldownMs, config.concurrency.initFailureCooldownMs);
   assert.equal(action.reason, "account_initialization_failed");
 });

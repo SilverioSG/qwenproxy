@@ -81,6 +81,13 @@ function statusOf(err: unknown): number | undefined {
 export function isTerminalLocalError(err: unknown): boolean {
   if (!err) return false;
 
+  // Typed, narrow exception: an upstream Qwen session rejection is eligible
+  // for account failover. Local proxy AuthError instances do NOT carry this
+  // marker and stay terminal below.
+  if ((err as { accountFailover?: boolean }).accountFailover === true) {
+    return false;
+  }
+
   if (
     err instanceof ValidationError ||
     err instanceof AuthError ||
@@ -217,6 +224,22 @@ export function shouldRetryChatInProgressOnSameAccount(
   // huge turns, and the escalation alternative (full-context replay on a cold
   // account) is far more expensive than one more bounded wait.
   return reason === "chat_in_progress" && alreadyRetriedCount < 3;
+}
+
+/**
+ * Confirmed credential/session failure (NOT infrastructure). Only these mark
+ * the account auth_state=rejected; page crashes/navigation/init timeouts do not.
+ */
+export function isConfirmedAuthError(err: unknown): boolean {
+  const message = errMessage(err).toLowerCase();
+  const code = errCode(err).toLowerCase();
+  return (
+    (message.includes("session expired") &&
+      message.includes("re-authentication failed")) ||
+    message.includes("authpermanentfailure") ||
+    code === "authpermanentfailure" ||
+    code === "unauthorized"
+  );
 }
 
 export function isAccountInitializationError(err: unknown): boolean {
@@ -499,12 +522,26 @@ export function classifyRetryAction(
 
   const message = errMessage(err).toLowerCase();
   const code = errCode(err).toLowerCase();
+  // Confirmed credential/session failure: switch accounts and mark the
+  // account rejected. This must win over the generic init branch below.
+  if (isConfirmedAuthError(err)) {
+    return makeRetryAction("account_initialization_failed", {
+      switchAccount: true,
+      forceNewChat: true,
+      retryWithFullPrompt: true,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "AuthInitFailed",
+    });
+  }
   if (isAccountInitializationError(err)) {
     return makeRetryAction("account_initialization_failed", {
       switchAccount: true,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
       accountCooldownMs: config.concurrency.initFailureCooldownMs,
-      accountCooldownReason: "AuthInitFailed",
+      // Infrastructure/init failure: cool down but do NOT mark credentials
+      // invalid (page unavailable/timeout/navigation are not auth failures).
+      accountCooldownReason: "InitFailed",
     });
   }
 
@@ -525,12 +562,22 @@ export function classifyRetryAction(
   // Park the failing account with PersonalizationFailed cooldown so it does
   // not enter an infinite ping-pong loop when multiple accounts fail.
   if (err instanceof PersonalizationSyncError) {
+    // Personalization failures are heterogeneous: an expired session/401 is a
+    // confirmed auth failure (mark rejected), while a page crash or a
+    // navigation failure is infrastructure and must NOT reject the account.
+    const message = String((err as Error).message || "").toLowerCase();
+    const authFailure =
+      /session expired|re-authentication failed|unauthorized|\b401\b/.test(
+        message,
+      );
     return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryAfterMs: baseDelayMs,
       accountCooldownMs: config.concurrency.initFailureCooldownMs,
-      accountCooldownReason: "PersonalizationFailed",
+      accountCooldownReason: authFailure
+        ? "AuthInitFailed"
+        : "PersonalizationFailed",
     });
   }
 

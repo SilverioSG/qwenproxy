@@ -61,6 +61,7 @@ interface QueueEntry {
 interface AccountSlot {
   activeLeases: ActiveLeaseInfo[];
   queue: QueueEntry[];
+  contextClosing: boolean;
 }
 
 const slots = new Map<string, AccountSlot>();
@@ -73,7 +74,7 @@ function generateLeaseId(): string {
 function getSlot(accountId: string): AccountSlot {
   let slot = slots.get(accountId);
   if (!slot) {
-    slot = { activeLeases: [], queue: [] };
+    slot = { activeLeases: [], queue: [], contextClosing: false };
     slots.set(accountId, slot);
   }
   return slot;
@@ -165,6 +166,7 @@ function createLease(
 function releaseSlot(accountId: string): void {
   const slot = slots.get(accountId);
   if (!slot) return;
+  if (slot.contextClosing) return;
 
   // Deliver to the next waiter in FIFO order
   while (slot.queue.length > 0 && slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
@@ -250,7 +252,7 @@ export function tryAcquireAccountLease(
 ): AccountLease | null {
   const slot = getSlot(accountId);
   sweepStaleLeases(accountId);
-  if (slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
+  if (!slot.contextClosing && slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
     return createLease(
       accountId,
       label ?? "try-acquire",
@@ -305,7 +307,7 @@ export function acquireAccountLease(
   }
 
   // Fast path: capacity available
-  if (slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
+  if (!slot.contextClosing && slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
     return Promise.resolve(createLease(accountId, label, options?.leaseAbortController));
   }
 
@@ -332,7 +334,7 @@ export function acquireAccountLease(
       const idx = slot.queue.indexOf(entry);
       if (idx !== -1) slot.queue.splice(idx, 1);
       cleanupEntry(entry);
-      if (slot.activeLeases.length === 0 && slot.queue.length === 0) {
+      if (!slot.contextClosing && slot.activeLeases.length === 0 && slot.queue.length === 0) {
         slots.delete(accountId);
       }
     };
@@ -526,7 +528,23 @@ export function markLeaseCompletion(
 export function isAccountBusy(accountId: string): boolean {
   const slot = slots.get(accountId);
   if (!slot) return false;
-  return slot.activeLeases.length >= config.concurrency.maxStreamsPerAccount;
+  return slot.contextClosing || slot.activeLeases.length >= config.concurrency.maxStreamsPerAccount;
+}
+
+/** Reserve an unclaimed account while its idle browser context is closing. */
+export function tryBeginAccountContextClose(accountId: string): (() => void) | null {
+  const slot = getSlot(accountId);
+  if (slot.contextClosing || slot.activeLeases.length > 0 || slot.queue.length > 0) return null;
+  slot.contextClosing = true;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    slot.contextClosing = false;
+    do {
+      releaseSlot(accountId);
+    } while (slot.queue.length > 0 && slot.activeLeases.length < config.concurrency.maxStreamsPerAccount);
+  };
 }
 
 /**
@@ -539,6 +557,42 @@ export function hasActiveAccountLease(accountId: string): boolean {
   const slot = slots.get(accountId);
   if (!slot) return false;
   return slot.activeLeases.length > 0;
+}
+
+/**
+ * True when the account has an active lease whose label is not `ownerLabel`.
+ * A null/undefined ownerLabel preserves the legacy "any active lease" check.
+ * Read-only: used by auth recovery to avoid blocking on the request's own
+ * lease while still protecting streams owned by other requests.
+ */
+export function hasOtherActiveAccountLease(
+  accountId: string,
+  ownerLabel?: string | null,
+): boolean {
+  const slot = slots.get(accountId);
+  if (!slot || slot.activeLeases.length === 0) return false;
+  if (!ownerLabel) return true;
+  return slot.activeLeases.some((lease) => lease.label !== ownerLabel);
+}
+
+/**
+ * True when the account has an active lease whose unique leaseId is not
+ * `ownerLeaseId`. This is the authentication-recovery ownership check:
+ * session/email labels are shared by design and cannot identify a request.
+ *
+ * Stale leases are swept first; released/aborted leases are already removed
+ * from activeLeases. A null/undefined ownerLeaseId keeps the background
+ * contract: any active lease blocks recovery.
+ */
+export function hasOtherActiveAccountLeaseByLeaseId(
+  accountId: string,
+  ownerLeaseId?: string | null,
+): boolean {
+  sweepStaleLeases(accountId);
+  const slot = slots.get(accountId);
+  if (!slot || slot.activeLeases.length === 0) return false;
+  if (!ownerLeaseId) return true;
+  return slot.activeLeases.some((lease) => lease.leaseId !== ownerLeaseId);
 }
 
 /**

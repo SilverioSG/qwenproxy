@@ -203,19 +203,19 @@ test("qwen-auth-diag: cookie-only routes strip Authorization (both cases)", () =
   assert.equal(stripped["Cookie"], "a=b");
   assert.equal(withAuth["Authorization"], "Bearer x");
   assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/chats/new"), true);
-  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings"), true);
-  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings/update"), true);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings"), false);
+  assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/users/user/settings/update"), false);
   assert.equal(isCookieOnlyRoute("https://chat.qwen.ai/api/v2/files/getstsToken"), false);
   assert.equal(isCookieOnlyRoute("https://auth.qwen.ai/api/v2/auths/refresh"), false);
 });
 
 test("qwen-auth-diag: in-page transport mirrors cookie-only routing", () => {
   const src = fs.readFileSync("src/services/qwen.ts", "utf-8");
-  const start = src.indexOf("Cookie-only routes (chat + chat personalization)");
+  const start = src.indexOf("Only legacy create-chat may fall back to cookie-only.");
   assert.ok(start >= 0);
-  const block = src.slice(start, start + 1500);
+  const block = src.slice(start, start + 2200);
   assert.ok(block.includes("/api/v2/chats/new"));
-  assert.ok(block.includes("/api/v2/users/user/settings"));
+  assert.ok(!block.slice(0, block.indexOf("diag.cookieOnlyRoute")).includes("/api/v2/users/user/settings"));
   assert.ok(block.includes('delete effHeaders["authorization"]'));
   assert.ok(block.includes('delete effHeaders["Authorization"]'));
   assert.ok(block.includes("credentials:"));
@@ -735,4 +735,90 @@ test("qwen-auth-diag: accountIdForPage is a reverse lookup with no side effects"
   assert.ok(block.includes("if (p === page) return id;"));
   assert.ok(block.includes("return null;"));
   assert.ok(!/accountPages\.(delete|clear|set)/.test(block));
+});
+
+// Execute the actual browser closure, rather than duplicating its routing rule.
+// The same synthetic session must authenticate in visible and restored contexts.
+async function settingsTransportCase(liveToken: string | null, expected: "valid" | "rejected", persisted?: { token: string; expired?: boolean }, heal = false) {
+  const { saveAuthSession, deleteAuthSession } = await import("../core/database.ts");
+  const { registerPlaywrightAccountForTests, unregisterPlaywrightAccountForTests } = await import("../services/playwright.ts");
+  const { requestQwenTextInBrowser, buildCapturedQwenHeaders } = await import("../services/qwen.ts");
+  const { classifyManualSettingsResponse } = await import("../services/manual-verification.ts");
+  const id = "settings-auth-regression";
+  deleteAuthSession(id);
+  if (persisted) saveAuthSession(id, { cookie: `token=${persisted.token}`, userAgent: "synthetic-UA", bxV: "2.5.37", capturedAt: Date.now(), tokenExpiresAt: Math.floor(Date.now() / 1000) + (persisted.expired ? -60 : 3600) });
+  const validToken = persisted && !persisted.expired ? persisted.token : "synthetic-live-access";
+  const sentToken = persisted && !persisted.expired ? persisted.token : liveToken;
+  const seen: Array<{ authorization?: string; credentials?: string }> = [];
+  let currentLiveToken = liveToken;
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    context: () => ({ cookies: async () => [] }),
+    evaluate: async (fn: (arg: unknown) => Promise<unknown>, arg: unknown) => {
+      const g = globalThis as unknown as Record<string, unknown>;
+      const previous = { fetch: g.fetch, localStorage: g.localStorage, document: g.document };
+      g.localStorage = { getItem: (key: string) => key === "token" ? currentLiveToken : null, setItem: (key: string, value: string) => { if (key === "token") currentLiveToken = value; } };
+      g.document = { cookie: "token=synthetic-session" };
+      g.fetch = async (url: string, init: RequestInit) => {
+        const headers = init.headers as Record<string, string>;
+        const authorization = new Headers(headers).get("authorization") || undefined;
+        if (!url.includes("/auths/refresh")) seen.push({ authorization, credentials: init.credentials });
+        if (heal && url.includes("/auths/refresh")) return new Response(JSON.stringify({ success: true, data: { access_token: validToken } }), { status: 200 });
+        const valid = !url.includes("/auths/refresh") && authorization === `Bearer ${validToken}`;
+        return new Response(JSON.stringify(valid ? { success: true, data: {} } : { success: false, data: { code: "Unauthorized" } }), { status: 200 });
+      };
+      try { return await fn(arg); } finally { Object.assign(g, previous); }
+    },
+  };
+  const mock = process.env.TEST_MOCK_QWEN_AUTH;
+  process.env.TEST_MOCK_QWEN_AUTH = "false";
+  registerPlaywrightAccountForTests(id, page as never, Date.now());
+  try {
+    const headers = buildCapturedQwenHeaders({ cookie: "token=synthetic-session", "user-agent": "synthetic-UA", "bx-v": "2.5.37" });
+    const response = await requestQwenTextInBrowser(id, "GET", "/api/v2/users/user/settings", headers);
+    assert.equal(classifyManualSettingsResponse(response.status, await response.text()), expected);
+    assert.equal(seen[0].authorization, sentToken ? `Bearer ${sentToken}` : undefined);
+    assert.equal(seen[0].credentials, "include");
+    if (heal) {
+      assert.equal(seen.length, 2);
+      assert.equal(seen[1].authorization, `Bearer ${validToken}`);
+    }
+  } finally {
+    unregisterPlaywrightAccountForTests(id);
+    deleteAuthSession(id);
+    if (mock === undefined) delete process.env.TEST_MOCK_QWEN_AUTH;
+    else process.env.TEST_MOCK_QWEN_AUTH = mock;
+  }
+}
+
+test("settings transports the live Bearer for equivalent visible and restored sessions", async () => {
+  await settingsTransportCase("synthetic-live-access", "valid");
+  await settingsTransportCase("synthetic-live-access", "valid");
+});
+
+test("settings without a live Bearer rejects logical HTTP-200 Unauthorized", async () => {
+  await settingsTransportCase(null, "rejected");
+});
+
+test("settings with an invalid Bearer cannot pass authoritative validation", async () => {
+  await settingsTransportCase("synthetic-invalid-access", "rejected");
+});
+
+
+test("restored settings retains the current persisted Bearer before SPA localStorage hydration", async () => {
+  await settingsTransportCase(null, "valid", { token: "synthetic-restored-access" });
+});
+
+test("restored settings uses persisted credential rather than transient stale localStorage", async () => {
+  await settingsTransportCase("synthetic-stale-access", "valid", { token: "synthetic-restored-access" });
+});
+
+test("expired persisted settings credential falls back to the current live token", async () => {
+  await settingsTransportCase("synthetic-live-access", "valid", { token: "synthetic-expired-access", expired: true });
+});
+
+
+test("settings refresh retry transmits a single canonical Bearer header", async () => {
+  await settingsTransportCase("synthetic-invalid-access", "valid", undefined, true);
 });

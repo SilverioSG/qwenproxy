@@ -11,7 +11,7 @@ import {
   UpstreamRateLimit,
   ClientAbortedError,
 } from "../core/errors.ts";
-import { buildQwenRequestHeaders } from "./qwen-headers.ts";
+import { buildQwenRequestHeaders, getQwenWebVersion } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
 import { setCookiePairInJar } from "./qwen-token-refresh.ts";
@@ -1919,7 +1919,7 @@ export interface BrowserAuthDiag {
   /** Outgoing bearer vs live token: true/false, or null when incomparable. */
   authMatchesLive: boolean | null;
   /** Which credential won: live token, cookies only, post-heal, or none. */
-  authSource: "live" | "cookie-only" | "healed" | "none";
+  authSource: "live" | "cookie-only" | "persisted" | "healed" | "none";
   /** True when this request matched a cookie-only chat route. */
   cookieOnlyRoute: boolean;
   /** Explicit Authorization actually sent on the effective request. */
@@ -1962,16 +1962,13 @@ export function bearerMatchesLiveToken(
 }
 
 /**
- * Chat routes that must use cookie/session-centric browser auth: NO explicit
+ * Legacy create-chat routes eligible for cookie/session-centric browser auth: NO explicit
  * Authorization header (mirrors the reference client). Pure and unit-tested;
  * the in-page transport mirrors this predicate inline (bundler __name
  * constraints forbid importing it there) with a consistency test below.
  */
 export function isCookieOnlyRoute(url: string): boolean {
-  return (
-    url.includes("/api/v2/chats/new") ||
-    url.includes("/api/v2/users/user/settings")
-  );
+  return url.includes("/api/v2/chats/new");
 }
 
 /** Return headers without any Authorization variant (new object). */
@@ -2078,6 +2075,19 @@ export async function requestQwenTextInBrowser(
   }
 
   const browserHeaders = getBrowserFetchHeaders(headers);
+  // A restored context can reach settings before the SPA hydrates localStorage.
+  // Reuse the current persisted Bearer (expiry checked by the existing getter)
+  // for that read, just as create-chat already does. Empty/transient page state
+  // must not discard the fresh credential captured from the authenticated SPA.
+  let persistedBearer: string | null = null;
+  if (path.includes("/api/v2/chats/new") ||
+      (method === "GET" && path.split("?")[0] === "/api/v2/users/user/settings")) {
+    try {
+      persistedBearer = getPersistedBearerToken(accountId)?.token ?? null;
+    } catch {
+      persistedBearer = null;
+    }
+  }
   if (
     body !== undefined &&
     !Object.keys(browserHeaders).some(
@@ -2089,13 +2099,14 @@ export async function requestQwenTextInBrowser(
 
   const evaluateRequest = (page: Page) =>
     page.evaluate(
-      async ({ url, method, headers, body, referrer, timeoutMs }: {
+      async ({ url, method, headers, body, referrer, timeoutMs, authBearer }: {
         url: string;
         method: "GET" | "POST" | "DELETE";
         headers: Record<string, string>;
         body?: string;
         referrer?: string;
         timeoutMs: number;
+        authBearer: string | null;
       }): Promise<BrowserTextResponse & { diag: BrowserAuthDiag }> => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -2129,13 +2140,11 @@ export async function requestQwenTextInBrowser(
             liveToken = null;
           }
           diag.liveTokenPresent = liveToken !== null;
-          // Cookie-only routes (chat + chat personalization): reproduce the
-          // cookie/session-centric behavior of the reference client — NO
-          // explicit Authorization; credentials:include + live browser
-          // cookies govern. All other routes keep current behavior.
+          // Only legacy create-chat may fall back to cookie-only. Settings
+          // uses the live Bearer, as the SPA does: an equivalent cookie jar
+          // alone can return HTTP 200 with logical Unauthorized.
           const cookieOnlyRoute =
-            url.includes("/api/v2/chats/new") ||
-            url.includes("/api/v2/users/user/settings");
+            url.includes("/api/v2/chats/new") && !authBearer;
           diag.cookieOnlyRoute = cookieOnlyRoute;
           const effHeaders: Record<string, string> = { ...headers };
           const hadCachedAuth = Boolean(
@@ -2145,8 +2154,12 @@ export async function requestQwenTextInBrowser(
             delete effHeaders["authorization"];
             delete effHeaders["Authorization"];
             diag.authSource = hadCachedAuth ? "cookie-only" : "none";
+          } else if (authBearer) {
+            delete effHeaders["authorization"];
+            effHeaders["Authorization"] = `Bearer ${authBearer}`;
+            diag.authSource = "persisted";
           } else if (liveToken) {
-            effHeaders["authorization"] = `Bearer ${liveToken}`;
+            delete effHeaders["authorization"];
             effHeaders["Authorization"] = `Bearer ${liveToken}`;
             diag.authSource = "live";
           } else {
@@ -2210,7 +2223,7 @@ export async function requestQwenTextInBrowser(
               const refreshVersion =
                 headers["version"] && headers["version"].length > 0
                   ? headers["version"]
-                  : "0.3.11";
+                  : "0.3.26";
               let rid = "";
               try {
                 rid =
@@ -2258,7 +2271,7 @@ export async function requestQwenTextInBrowser(
                   document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
                   diag.refreshUpdatedCookie = true;
                   if (!cookieOnlyRoute) {
-                    effHeaders["authorization"] = `Bearer ${freshTok}`;
+                    delete effHeaders["authorization"];
                     effHeaders["Authorization"] = `Bearer ${freshTok}`;
                     diag.refreshUpdatedAuth = true;
                     diag.authSource = "healed";
@@ -2322,6 +2335,7 @@ export async function requestQwenTextInBrowser(
         body,
         referrer: options.referrer,
         timeoutMs: options.timeoutMs ?? Math.min(config.timeouts.page, 20_000),
+        authBearer: persistedBearer,
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
@@ -3839,7 +3853,7 @@ export async function deleteSingleQwenChat(
 
   const requestHeaders: Record<string, string> = {
     source: "web",
-    version: "0.2.89",
+    version: getQwenWebVersion() || "0.3.26",
     timezone: new Date().toString().split(" (")[0],
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
@@ -3892,7 +3906,7 @@ export async function fetchRemoteQwenChats(
   }
 
   const requestHeaders: Record<string, string> = {
-    version: "0.2.89",
+    version: getQwenWebVersion() || "0.3.26",
     timezone: new Date().toString().split(" (")[0],
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl("/settings/chats"),
@@ -4310,7 +4324,8 @@ export function buildCompletionHeaders(
  * DirectTransport proves the working pair every round: persisted Bearer +
  * configured bundle version. Apply exactly that pair here:
  *
- * - `version` is always the configured chat-completions version;
+ * - `version` is always the AUTO-effective chat-completions version
+ *   (`getQwenWebVersion()`: browser/curl-discovered value, static fallback);
  * - when a usable persisted Bearer exists, both `Authorization` and the
  *   jar's `token` pair carry it (pair coherence: a mismatched Bearer/cookie
  *   pair is rejected even when each is individually valid);
@@ -4323,7 +4338,7 @@ function alignLegacyCompletionAuth(
   base: Record<string, string>,
   accountId?: string,
 ): void {
-  base["version"] = config.qwen.webVersion;
+  base["version"] = getQwenWebVersion();
   if (!accountId) return;
   let bearer = "";
   try {

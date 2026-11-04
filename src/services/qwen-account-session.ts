@@ -27,6 +27,7 @@
 import { createHash } from "node:crypto";
 import type { Page } from "patchright";
 import { config } from "../core/config.ts";
+import type { AuthRecoveryResult } from "./auth-recovery.ts";
 
 /** Name of the Aliyun WAF clearance cookie produced by a successful solve. */
 export const X5SEC_COOKIE_NAME = "x5sec";
@@ -441,6 +442,59 @@ export async function revalidateModernAccountSession(
     return await ensureAccountFresh(accountId).catch(() => false);
   } catch {
     return false;
+  }
+}
+
+export type ModernSessionDecision =
+  | {
+      kind: "legacy";
+    }
+  | {
+      kind:
+        | "verified"
+        | "rejected"
+        | "inconclusive"
+        | "deferred"
+        | "page-required";
+      result: AuthRecoveryResult;
+    }
+  | {
+      kind: "inconclusive";
+      result?: undefined;
+      reason: string;
+    };
+
+/**
+ * Session-aware modern revalidation for the real 401 path. Freshness alone is
+ * not enough: the coordinator must classify valid/rejected/inconclusive/
+ * deferred and may distinguish a missing live page from a transient probe.
+ *
+ * `ownerLeaseId` is the current request's unique lease id, so the coordinator
+ * does not block on the request's own lease. Other streams still block, even
+ * when they share the same session/email label.
+ */
+export async function revalidateModernAccountSessionDecision(
+  accountId: string,
+  opts: { ownerLeaseId?: string } = {},
+): Promise<ModernSessionDecision> {
+  try {
+    const { getRefreshMaterial } = await import("../core/database.ts");
+    const material = getRefreshMaterial(accountId);
+    if (!material || !material.jar) return { kind: "legacy" };
+  } catch {
+    return { kind: "legacy" };
+  }
+  try {
+    const { recoverAccountSession } = await import("./auth-recovery.ts");
+    const result = await recoverAccountSession(accountId, "request-401", {
+      ownerLeaseId: opts.ownerLeaseId,
+    });
+    return { kind: result.outcome, result };
+  } catch (err) {
+    return {
+      kind: "inconclusive",
+      reason: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 

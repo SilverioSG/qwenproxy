@@ -39,6 +39,7 @@ import {
 import { getAccountsByPriority } from "../core/account-priority.js";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.js";
 import { getActivePlaywrightAccountIds } from "../services/playwright.ts";
+import { getManualVerificationStatus, type ManualVerificationState } from "../services/manual-verification.ts";
 import { config } from "../core/config.js";
 import { getRecentDashboardLogs } from "../core/logger.js";
 import {
@@ -141,7 +142,16 @@ dashboardApp.get("/", (c) => c.redirect("/dashboard", 302));
 export interface DashboardAccount {
   id: string;
   email: string;
+  /** Auth eligibility persisted in the accounts table (no secrets). */
+  authState: "valid" | "rejected" | "inconclusive" | null;
+  manualVerificationState: ManualVerificationState | null;
   ready: boolean;
+  /** Operational readiness (headers captured, no cooldown), even if rejected. */
+  operationalReady: boolean;
+  /** Real picker eligibility: not rejected and not on cooldown. */
+  eligible: boolean;
+  /** Not on cooldown, regardless of auth_state. */
+  operationalAvailable: boolean;
   available: boolean;
   headersReady: boolean;
   hasActiveContext: boolean;
@@ -187,11 +197,23 @@ export function buildAccountsList(): DashboardAccount[] {
     }
     const snap = snapshotById.get(a.id);
     const headersReady = isAccountHeadersReady(a.id);
+    const authState = (a.auth_state ?? null) as DashboardAccount["authState"];
+    const operationalAvailable = !onCooldown;
+    const operationalReady = headersReady && !onCooldown;
+    // A rejected account is NOT available to the picker even without a
+    // cooldown. Keep the operational flag separate so the UI can distinguish
+    // "healthy but rejected" from "cooling down".
+    const eligible = operationalAvailable && authState !== "rejected";
     return {
       id: a.id,
       email: a.email,
-      ready: headersReady && !onCooldown,
-      available: !onCooldown,
+      authState,
+      manualVerificationState: getManualVerificationStatus(a.id)?.state ?? null,
+      ready: operationalReady && authState !== "rejected",
+      operationalReady,
+      eligible,
+      operationalAvailable,
+      available: eligible,
       headersReady,
       hasActiveContext: activeContextIds.has(a.id),
       cooldown: onCooldown,

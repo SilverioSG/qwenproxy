@@ -1,9 +1,17 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert";
 import { LogsView } from "../tui/views/logs-view.ts";
 import { ServerManager } from "../tui/server-manager.ts";
 import { getServerLogFilePath } from "../core/paths.ts";
 import { getClipboardText } from "../tui/theme.ts";
+
+// The singleton owns timers/log hooks; without an explicit stop this file
+// keeps the node:test process alive forever when run in isolation.
+after(async () => {
+  try {
+    await ServerManager.getInstance().stop();
+  } catch {}
+});
 
 test("TUI LogsView: copyLogs(false) copies all logs even when a line is selected", async () => {
   const sm = ServerManager.getInstance();

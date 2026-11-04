@@ -376,6 +376,15 @@ export async function chatCompletions(c: Context) {
     c.header("X-QwenProxy-Timing", formatTimingHeader(timings));
 
     if ("error" in streamResult) {
+      // Pre-stream failures still attempted an account: attribute them so
+      // Monitor does not report the request as Unassigned.
+      if (dashTrace) {
+        for (const id of streamResult.attemptedAccountIds ?? []) {
+          dashTrace.accountIds.add(id);
+        }
+        const lastAttempted = streamResult.attemptedAccountIds?.at(-1);
+        if (lastAttempted) dashTrace.lastAccountId = lastAttempted;
+      }
       if (streamResult.allOnCooldown) {
         const err: any = new Error(
           `All configured accounts are on cooldown. Retry in about ${Math.max(
@@ -388,9 +397,14 @@ export async function chatCompletions(c: Context) {
       }
       throw streamResult.error || new Error("All accounts failed");
     }
-    // Passive dashboard trace: first upstream account for this request.
+    // Passive dashboard trace: every account actually attempted (outer
+    // rotation + inner switches), while lastAccountId stays the serving one.
     if (dashTrace) {
-      dashTrace.accountIds.add(streamResult.activeAccountId);
+      for (const id of streamResult.attemptedAccountIds ?? [
+        streamResult.activeAccountId,
+      ]) {
+        dashTrace.accountIds.add(id);
+      }
       dashTrace.lastAccountId = streamResult.activeAccountId;
     }
 

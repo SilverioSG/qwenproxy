@@ -64,16 +64,25 @@ async function refreshHealth() {
     }
     if (haveReqs) setText('kpiTotalRequests', totalReqs);
   }
-  var mon = await apiFetch('/metrics/monitor');
-  if (mon && mon.totals && typeof mon.totals.totalRequests === 'number') {
-    setText('kpiTotalRequests', mon.totals.totalRequests);
-    // Primary failure metric: failed backend/protection requests (aborts out).
-    var failed = mon.totals.failedRequests != null ? mon.totals.failedRequests : mon.totals.totalErrors || 0;
-    var aborts = mon.totals.clientAborts || 0;
-    var prot = mon.totals.protectionEvents || 0;
-    var sub = failed + ' failed';
-    if (aborts > 0) sub += ' · ' + aborts + ' aborted';
-    if (prot > 0) sub += ' · ' + prot + ' protection';
+  var usage = await apiFetch('/api/usage');
+  if (usage && usage.totals && typeof usage.totals.totalRequests === 'number') {
+    // Overview Total Requests is the process-lifetime accumulator, never the
+    // Monitor ring (last 1000). Ring detail stays on the Monitor page; every
+    // figure rendered here is lifetime and labelled as such.
+    setText('kpiTotalRequests', usage.totals.totalRequests);
+    var uErr = usage.totals.errorCount || 0;
+    var sub = uErr + ' errors · since process start';
+    var mon = await apiFetch('/metrics/monitor');
+    if (mon && mon.totals && typeof mon.totals.totalRequests === 'number') {
+      // Ring failure detail is kept for abort visibility, but always with
+      // its own window label — never mixed unlabeled with lifetime figures.
+      var failed = mon.totals.failedRequests != null ? mon.totals.failedRequests : mon.totals.totalErrors || 0;
+      var aborts = mon.totals.clientAborts || 0;
+      var prot = mon.totals.protectionEvents || 0;
+      sub += ' · last 1000: ' + failed + ' failed';
+      if (aborts > 0) sub += ' · ' + aborts + ' aborted';
+      if (prot > 0) sub += ' · ' + prot + ' protection';
+    }
     setText('kpiTotalRequestsSub', sub);
   }
 }

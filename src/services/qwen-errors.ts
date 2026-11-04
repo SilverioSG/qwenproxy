@@ -68,6 +68,12 @@ export class QwenUpstreamError extends UpstreamError {
 
 export class QwenSessionExpiredError extends AuthError {
   readonly accountId: string;
+  /**
+   * Typed marker: this 401 came from the upstream Qwen session, not from the
+   * local proxy authorization layer. The account-rotation loop may fail over
+   * to another account; local AuthError instances remain terminal.
+   */
+  readonly accountFailover = true;
 
   constructor(message: string, accountId: string) {
     super(message);
