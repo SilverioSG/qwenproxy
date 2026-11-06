@@ -68,6 +68,7 @@ import {
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
   markAccountRateLimited,
+  getAccountCooldownInfo,
 } from "../core/account-manager.ts";
 import { getAccountsByPriority } from "../core/account-priority.ts";
 import {
@@ -1997,18 +1998,17 @@ export async function getBasicHeaders(accountId: string): Promise<{
     } else if (
       hadUsableHeaders &&
       headersAge > HEADER_CACHE_TTL * HEADER_REFRESH_THRESHOLD &&
-      !cache.refreshInProgress
+      !cache.refreshInProgress &&
+      !isAccountServingStream(accountId)
     ) {
-      // Background refresh at 70% TTL: keep headers fresh without blocking
-      cache.refreshInProgress = true;
-      refreshHeadersInternal(accountId)
+      // Queue behind this call's page mutex. The refresh owns its in-progress
+      // flag and rechecks the lease after acquiring the lock: a background
+      // probe must never type into a conversation claimed by a new request.
+      void refreshHeaders(accountId, config.timeouts.headers, false, { background: true })
         .catch((error) => {
           console.warn(
             `⚠️  [Playwright] Background header refresh failed for ${accountId}: ${getErrorMessage(error)}`,
           );
-        })
-        .finally(() => {
-          cache.refreshInProgress = false;
         });
     }
 
@@ -2156,8 +2156,11 @@ export async function initPlaywrightForAccount(
       return;
     }
 
-    // If a context limit is configured, make room by closing idle contexts.
-    await evictIdlePlaywrightContextsToLimit().catch(() => {});
+    // Reserve room before opening the next context. Busy accounts remain
+    // protected; the limit is reconciled again after this initialization.
+    if (config.playwright.maxActiveContexts > 0) {
+      await evictIdlePlaywrightContextsToLimit(config.playwright.maxActiveContexts - 1).catch(() => {});
+    }
 
     // Modern auth: renew the persisted session WITHOUT a browser before the
     // context opens, so the fast-boot DB restore below sees a fresh jar and
@@ -2528,6 +2531,7 @@ export async function initPlaywrightForAccount(
     }
     } finally {
       release();
+      await evictIdlePlaywrightContextsToLimit().catch(() => {});
     }
   })();
 
@@ -5299,6 +5303,7 @@ export async function refreshHeaders(
   accountId: string,
   timeoutMs = config.timeouts.headers,
   forceReauth = false,
+  options: { background?: boolean } = {},
 ): Promise<void> {
   const boundedTimeoutMs = Math.max(1_000, timeoutMs);
   captureStageEnter("mutex_acquire");
@@ -5308,6 +5313,7 @@ export async function refreshHeaders(
       accountId,
       `refresh:${accountId.substring(0, 12)}`,
       boundedTimeoutMs,
+      !options.background,
     );
   } catch (error) {
     captureStageError(
@@ -5318,6 +5324,14 @@ export async function refreshHeaders(
   }
   captureStageExit("mutex_acquire");
   try {
+    if (options.background) {
+      const cache = getHeaderCache(accountId);
+      if (
+        isAccountServingStream(accountId) ||
+        !accountPages.has(accountId) ||
+        Date.now() - cache.lastRefresh <= HEADER_CACHE_TTL * HEADER_REFRESH_THRESHOLD
+      ) return;
+    }
     await refreshHeadersInternal(accountId, timeoutMs, forceReauth);
   } finally {
     release();
@@ -5719,7 +5733,7 @@ function priorityOrderForEviction(accountIds: string[]): string[] {
   const ranked = getAccountsByPriority(accountIds.map((id) => ({ id })));
   const rank = new Map<string, number>();
   for (const [index, account] of ranked.entries()) {
-    rank.set(account.id, index);
+    rank.set(account.id, getAccountCooldownInfo(account.id) ? Number.MAX_SAFE_INTEGER : index);
   }
   return orderContextsForEviction(
     accountIds,
@@ -5802,9 +5816,10 @@ export async function closeIdlePlaywrightAccounts(
  * PLAYWRIGHT_MAX_ACTIVE_CONTEXTS. Never closes a context whose account mutex
  * is busy, so active streams are preserved.
  */
-export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
-  const max = config.playwright.maxActiveContexts;
-  if (max <= 0) return 0;
+export async function evictIdlePlaywrightContextsToLimit(targetLimit?: number): Promise<number> {
+  const configuredMax = config.playwright.maxActiveContexts;
+  if (configuredMax <= 0) return 0;
+  const max = targetLimit === undefined ? configuredMax : Math.max(0, targetLimit);
   if (accountPages.size <= max) return 0;
 
   const candidates = priorityOrderForEviction(
@@ -6163,17 +6178,22 @@ export function registerPlaywrightAccountForTests(
   page: Page,
   lastActivityAt: number,
   context?: BrowserContext,
+  headerCache?: { headers: Record<string, string>; lastRefresh: number },
 ): void {
   getAccountMutex(accountId);
   accountPages.set(accountId, page);
   if (context) accountContexts.set(accountId, context);
   lastAccountActivity.set(accountId, lastActivityAt);
+  if (headerCache) headerCaches.set(accountId, { ...headerCache, refreshInProgress: false });
 }
 
 export function unregisterPlaywrightAccountForTests(accountId: string): void {
   accountPages.delete(accountId);
   accountContexts.delete(accountId);
   lastAccountActivity.delete(accountId);
+  headerCaches.delete(accountId);
+  cookieCaches.delete(accountId);
+  cachedUserAgents.delete(accountId);
 }
 
 // ─── Token TTL Diagnostics ───────────────────────────────────────────────────
