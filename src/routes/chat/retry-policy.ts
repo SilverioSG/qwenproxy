@@ -247,6 +247,8 @@ export function isAccountInitializationError(err: unknown): boolean {
   const code = errCode(err).toLowerCase();
   return (
     code === "acquire_deadline" ||
+    code === "session_validation_inconclusive" ||
+    message.includes("playwright session validation inconclusive") ||
     message.includes("acquire deadline") ||
     message.includes("header capture timed out") ||
     message.includes("header capture returned incomplete anti-fraud headers") ||

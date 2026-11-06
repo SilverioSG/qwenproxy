@@ -84,7 +84,10 @@ const envSchema = z
     PLAYWRIGHT_INIT_BATCH_SIZE: z.string().default("1"),
     PLAYWRIGHT_CONTEXT_CLOSE_TIMEOUT_MS: z.string().default("10000"),
     PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("60000"),
-    PLAYWRIGHT_JS_HEAP_MB: z.string().default("256"),
+    // Qwen's current frontend exceeds 256 MiB: renderer cores from production
+    // terminate in Blink's V8 OOM handler ("Reached heap limit"). Context count
+    // is bounded separately; keep a per-renderer budget with enough headroom.
+    PLAYWRIGHT_JS_HEAP_MB: z.string().default("1024"),
     PLAYWRIGHT_LOW_MEMORY_FLAGS: z.string().default("true"),
     // Keep 2 warm contexts by default ({main + reserve} covers the common
     // failover hop without opening one browser per account): after warmup two

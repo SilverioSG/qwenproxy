@@ -11,12 +11,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
-import { probePageLoggedIn } from "../services/playwright.ts";
+import { probePageLoggedIn, validateAccountSessionForInit } from "../services/playwright.ts";
 import { classifyPostLoginValidation } from "../services/auth-contract.ts";
 
 interface Call {
   url: string;
   method: string;
+  authorization?: string;
 }
 
 interface FakePage {
@@ -59,8 +60,8 @@ function makePage(opts: {
       cookies: async () => opts.cookies ?? [{ name: "token", value: "cookie-token" }],
     }),
     evaluate: async (fn: unknown, arg?: unknown) => {
-      const sandboxFetch = async (input: string, init?: { method?: string }) => {
-        page.calls.push({ url: String(input), method: init?.method ?? "GET" });
+      const sandboxFetch = async (input: string, init?: { method?: string; headers?: Record<string, string> }) => {
+        page.calls.push({ url: String(input), method: init?.method ?? "GET", authorization: init?.headers?.Authorization });
         const key = Object.keys(responses).find((k) => String(input).includes(k));
         const r = key ? responses[key] : { status: 404, body: null };
         return {
@@ -128,6 +129,43 @@ test("C. settings 200 + success -> ok", async () => {
   assert.equal(r.ok, true);
   assert.equal(r.reason, "ok");
   assert.equal(page.calls.filter((c) => c.url.includes(SETTINGS)).length, 1);
+});
+
+test("settings probe sends the live jar Bearer before localStorage hydration", async () => {
+  for (const ls of [{}, { token: "stale-storage-token" }]) {
+    const page = makePage({ ls, cookies: [{ name: "token", value: "current-jar-token" }] });
+    await probePageLoggedIn(page as never, 3000, { nonMutating: true });
+    assert.equal(page.calls[0].authorization, "Bearer current-jar-token");
+  }
+  const page = makePage({ ls: { token: "current-storage-token" }, cookies: [] });
+  await probePageLoggedIn(page as never, 3000, { nonMutating: true });
+  assert.equal(page.calls[0].authorization, "Bearer current-storage-token");
+});
+
+test("settings errors and malformed success bodies are inconclusive, never valid or rejected", async () => {
+  for (const response of [
+    { status: 405, body: null },
+    { status: 429, body: { success: false } },
+    { status: 503, body: { success: false } },
+    { status: 200, body: null },
+    { status: 200, body: {} },
+    { status: 200, body: { code: 0 } },
+    { status: 200, body: [] },
+    { status: 200, body: { success: false, code: "ServiceUnavailable" } },
+  ]) {
+    const page = makePage({ responses: { [SETTINGS]: response } });
+    const result = await probePageLoggedIn(page as never, 3000, { nonMutating: true });
+    assert.equal(result.ok, false, JSON.stringify(response));
+    assert.equal(classifyPostLoginValidation({ reason: result.reason }), "inconclusive");
+  }
+});
+
+test("a failed settings fetch cannot become a successful session probe", async () => {
+  const page = makePage();
+  Object.defineProperty(page.responses[SETTINGS], "status", { get: () => { throw new Error("network unavailable"); } });
+  const result = await probePageLoggedIn(page as never, 3000, { nonMutating: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "settings-unavailable");
 });
 
 /** D. settings 200 with appUnauthorized -> validation=false. */
@@ -255,17 +293,14 @@ test("K. expired session (settings 401) is rejected", async () => {
 });
 
 /** Startup/background post-login confirmations must not use the mutating probe. */
-test("L. startup/background post-login checks are non-mutating", () => {
-  const src = fs.readFileSync("src/services/playwright.ts", "utf-8");
-  const matches = [
-    ...src.matchAll(
-      /isPageLoggedIn\(acctPage,\s*[\d_]+,\s*\{\s*nonMutating:\s*true,?\s*\}\)/g,
-    ),
-  ];
-  assert.ok(
-    matches.length >= 2,
-    `expected >=2 non-mutating acctPage checks, got ${matches.length}`,
-  );
+test("L. init validation before and after recovery uses only settings reads", async () => {
+  const page = makePage({ responses: { [SETTINGS]: { status: 401, body: null } } });
+  await validateAccountSessionForInit(page as never, "init-probe", async () => {
+    page.responses[SETTINGS] = { status: 200, body: { success: true, data: { id: "u1" } } };
+    return true;
+  });
+  assert.equal(page.calls.length, 2);
+  assert.ok(page.calls.every((c) => c.url.includes(SETTINGS) && c.method === "GET"));
 });
 
 /** The login trace must be attributable to the account, never "undefined". */

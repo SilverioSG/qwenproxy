@@ -659,7 +659,7 @@ async function warmConfiguredChatPools(
   );
 }
 
-async function prepareQwenRuntime(params: {
+export async function prepareQwenRuntime(params: {
   accountId?: string;
   successMessage: string;
   failureMessage: string;
@@ -715,10 +715,12 @@ async function prepareQwenRuntime(params: {
     if (params.accountId) {
       const { markAccountRateLimited } =
         await import("../core/account-manager.ts");
+      const { isConfirmedAuthError } =
+        await import("../routes/chat/retry-policy.ts");
       markAccountRateLimited(
         params.accountId,
         config.concurrency.initFailureCooldownMs,
-        "AuthInitFailed",
+        isConfirmedAuthError(error) ? "AuthInitFailed" : "InitFailed",
       );
     }
     return false;

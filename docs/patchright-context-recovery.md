@@ -98,3 +98,62 @@ verification, non-mutating validation, refresh transport, and account context
 ownership safeguards. No CAPTCHA, OTP, or account recovery is exercised by
 these tests. The original Chromium crash remains outside the demonstrated
 Node retention and listener defects.
+
+## Renderer heap exhaustion and session validation, November 6, 2026
+
+The later pool degradation was not another Node restart. Node stayed alive,
+while the retained journal contained 436 Chromium renderer cores between
+18:42 and 21:07 CET, all with the same first four native stack offsets.
+Offline analysis of renderer PID 1214452 identified Blink's V8 OOM handler
+(`v8_initializer.cc`) and its crash key `Reached heap limit`. Its command
+line imposed `--max-old-space-size=256`. The original core remains intact;
+no debugger attached to a live process.
+
+A network-free browser reproduction with the installed Patchright/Chromium
+crashes while allocating a retained 320 MiB JavaScript workload under the
+256 MiB cap; the identical workload completes with 1024 MiB. The default
+`PLAYWRIGHT_JS_HEAP_MB` is therefore 1024. Explicit operator overrides remain
+supported, as do the context-count and active-lease protections. This raises
+only Chromium's renderer budget, not Node's heap. It does not prove the
+absence of every frontend leak or establish the cause of older renderer
+crashes for which no equivalent core was examined.
+
+The same incident exposed separate validation defects:
+
+- The init path collapsed an inconclusive settings probe and a false/deferred
+  recovery result into `Session expired ... re-authentication failed`. Retry
+  policy treated that invented confirmation as `AuthInitFailed`, persisting
+  `rejected` after the temporary cooldown expired. Init now preserves the
+  three-way result, and its final settings proof decides the outcome.
+- Startup's generic error handler also marked every init failure as an auth
+  rejection. Renderer/navigation failures now use `InitFailed` instead.
+- `probePageLoggedIn` omitted the Bearer required by settings, although the
+  ordinary browser transport already supplied it. The probe now uses the
+  existing live jar token, falling back to localStorage during hydration.
+  It makes no refresh request and never logs the token.
+- Missing JSON, service errors and a failed settings fetch previously fell
+  through to `ok`. Only HTTP 200 with explicit application success can now
+  validate. HTTP/logical auth rejection stays rejected; unavailable or
+  malformed replies stay inconclusive. Recovery no longer fabricates HTTP
+  200 merely because an inconclusive reason starts with `settings-`.
+
+Regression tests execute the real in-page closure and cover Bearer transport,
+network/HTTP/schema errors, final conclusive rejection, deferred recovery,
+personalization wrappers and startup cooldown persistence. Against the old
+probe, the three transport/error tests fail; they pass with the corrected
+probe. Header-only fixtures now provide explicit synthetic auth proof instead
+of relying on the old shortcut that accepted a page without `evaluate`.
+
+At diagnosis, 22 of 24 accounts were rejected. Six had no explicit revoked
+refresh response in the retained application log; sixteen had a server
+`Token is revoked` response. This distinction does not establish that the six
+are currently authenticated. Existing account states, sessions and profiles
+must not be rewritten to fabricate recovery. Each account still requires the
+normal authoritative verification before re-admission. Health/liveness and a
+passing mock suite alone do not demonstrate pool recovery or live completion
+success for every account.
+
+Validation for this change: typecheck PASS; 55 focused tests PASS; canonical
+mock suite 1357 PASS / 0 FAIL / 1 SKIP (1358 total). All ran with test data
+isolated from production. The browser heap reproduction used no network or
+account material.

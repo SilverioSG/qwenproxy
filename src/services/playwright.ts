@@ -405,6 +405,8 @@ export type PageLoginProbeReason =
   | "settings-401"
   | "settings-403"
   | "settings-revoked"
+  | "settings-unavailable"
+  | "settings-inconclusive"
   | "refresh-401"
   | "refresh-403"
   | "refresh-revoked"
@@ -547,7 +549,15 @@ export async function probePageLoggedIn(
     if (url.includes("/auth") || url.includes("/login")) {
       return { ok: false, reason: "auth-url" };
     }
-    if (typeof page.evaluate !== "function") return { ok: true, reason: "ok" };
+    if (typeof page.evaluate !== "function") return { ok: false, reason: "no-evaluate" };
+
+    // Settings requires Bearer as well as cookies. The live jar also works
+    // before the SPA has hydrated localStorage; never refresh/mutate it here.
+    let cookieToken = "";
+    try {
+      const cookies = await withTimeout(page.context().cookies(qwenUrl("/")), Math.max(1_000, timeoutMs), "session cookie read timed out");
+      cookieToken = cookies.find((c) => c.name === "token")?.value || "";
+    } catch {}
 
     // Observational instrumentation for the trace-target account only: samples
     // the live page before/after each of the three subrequests (plus deferred
@@ -561,6 +571,7 @@ export async function probePageLoggedIn(
         async (args: {
           trace: boolean;
           nonMutating: boolean;
+          cookieToken: string;
         }): Promise<PageLoginProbeOutcome> => {
           const OBS: InPageObservation[] = [];
           const RES: InPageSubResult[] = [];
@@ -727,9 +738,11 @@ export async function probePageLoggedIn(
             // Check if Alibaba revoked the session upstream via same-origin settings
             try {
               SNAP[0]("settings-pre");
+              const settingsToken = args.cookieToken || localStorage.getItem("token") || "";
               const settingsRes = await fetch("/api/v2/users/user/settings", {
                 method: "GET",
                 credentials: "include",
+                headers: settingsToken ? { Authorization: `Bearer ${settingsToken}` } : {},
                 signal: AbortSignal.timeout(3000),
               });
               if (TRACE) {
@@ -755,6 +768,9 @@ export async function probePageLoggedIn(
               if (settingsRes.status === 403) {
                 return { reason: "settings-403", obs: OBS, res: RES };
               }
+              if (settingsRes.status !== 200) {
+                return { reason: "settings-unavailable", obs: OBS, res: RES };
+              }
               const settingsJson: any = await settingsRes.json().catch(() => null);
               if (TRACE) {
                 const last = RES[RES.length - 1];
@@ -769,19 +785,24 @@ export async function probePageLoggedIn(
                       : null;
                 }
               }
-              if (settingsJson && settingsJson.success === false) {
+              if (settingsJson && typeof settingsJson === "object") {
                 const code = String(settingsJson.data?.code || settingsJson.code || "").toLowerCase();
-                const details = String(settingsJson.data?.details || settingsJson.details || "").toLowerCase();
+                const details = String(settingsJson.data?.details || settingsJson.details || settingsJson.message || "").toLowerCase();
                 if (
-                  code.includes("unauthorized") ||
-                  details.includes("401") ||
-                  details.includes("revogado") ||
-                  details.includes("revoked")
+                  /unauthorized|forbidden|revoked|revogado|\b401\b|\b403\b/.test(`${code} ${details}`)
                 ) {
                   return { reason: "settings-revoked", obs: OBS, res: RES };
                 }
               }
-            } catch {}
+              if (
+                !settingsJson || typeof settingsJson !== "object" || Array.isArray(settingsJson) ||
+                settingsJson.success !== true
+              ) {
+                return { reason: "settings-inconclusive", obs: OBS, res: RES };
+              }
+            } catch {
+              return { reason: "settings-unavailable", obs: OBS, res: RES };
+            }
 
             // Fallback cross-origin refresh probe (skipped in non-mutating
             // mode: this endpoint mints a new session token).
@@ -871,7 +892,7 @@ export async function probePageLoggedIn(
             return { reason: "evaluate-error", obs: OBS, res: RES };
           }
         },
-        { trace: isTraced, nonMutating },
+        { trace: isTraced, nonMutating, cookieToken },
       )
       .catch(
         (): PageLoginProbeOutcome => ({ reason: "evaluate-error", obs: [], res: [] }),
@@ -928,6 +949,38 @@ export async function isPageLoggedIn(
   options: PageLoginProbeOptions = {},
 ): Promise<boolean> {
   return (await probePageLoggedIn(page, timeoutMs, options)).ok;
+}
+
+/**
+ * Startup must preserve the probe's three-way result. A failed/deferred login
+ * or a destroyed renderer is not proof that Qwen rejected the session.
+ * Only a settings rejection may trigger reauthentication; the final settings
+ * probe, rather than the login boolean, decides whether init may proceed.
+ */
+export async function validateAccountSessionForInit(
+  page: Page,
+  accountId: string,
+  reauthenticate?: () => Promise<boolean>,
+): Promise<void> {
+  let probe = await probePageLoggedIn(page, 5000, { nonMutating: true });
+  if (probe.ok) return;
+
+  if (
+    reauthenticate &&
+    classifyPostLoginValidation({ reason: probe.reason }) === "rejected"
+  ) {
+    await reauthenticate();
+    probe = await probePageLoggedIn(page, 5000, { nonMutating: true });
+    if (probe.ok) return;
+  }
+
+  const rejected = classifyPostLoginValidation({ reason: probe.reason }) === "rejected";
+  throw Object.assign(
+    new Error(
+      `${rejected ? "Unauthorized session validation" : "Playwright session validation inconclusive"} | account=${accountId.slice(0, 8)} | reason=${probe.reason}`,
+    ),
+    { code: rejected ? "unauthorized" : "session_validation_inconclusive" },
+  );
 }
 
 export async function getOrLaunchSharedBrowser(
@@ -2456,33 +2509,13 @@ export async function initPlaywrightForAccount(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          const loggedIn = await isPageLoggedIn(acctPage, 5000, {
-            nonMutating: true,
-          });
-          if (!loggedIn) {
-            if (account.email && account.password) {
-              console.warn(
-                `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
-              );
-              const ok = await loginToQwen(account.id, account.email, account.password, "startup-validation");
-              if (
-                !ok ||
-                !(await isPageLoggedIn(acctPage, 5000, {
-                  nonMutating: true,
-                }))
-              ) {
-                validationError = new Error(
-                  `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
-                );
-                continue;
-              }
-            } else {
-              validationError = new Error(
-                `Session expired for account ${account.id} but no credentials available for re-login (run 'qpx login')`,
-              );
-              break;
-            }
-          }
+          await validateAccountSessionForInit(
+            acctPage,
+            account.id,
+            account.email && account.password
+              ? () => loginToQwen(account.id, account.email, account.password, "startup-validation")
+              : undefined,
+          );
           validationError = null;
           break;
         } catch (err: any) {
