@@ -14,6 +14,8 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # Install dependencies first for better Docker layer caching
 COPY package*.json ./
+# The install lifecycle applies the pinned Patchright crash recovery guard.
+COPY bin/patch-patchright.mjs ./bin/patch-patchright.mjs
 RUN npm ci --omit=dev && npm cache clean --force
 
 # Install Patchright's patched stealth Chromium for the container's architecture (AMD64 / ARM64)
