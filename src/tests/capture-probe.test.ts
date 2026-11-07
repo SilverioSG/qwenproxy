@@ -84,6 +84,7 @@ function makeSuccessPage(
 
   const page = {
     isClosed: () => false,
+    evaluate: async () => "ok", // Explicit auth proof for this header-only fixture.
     url: () => "https://chat.qwen.ai/",
     route: async (
       _pattern: string,

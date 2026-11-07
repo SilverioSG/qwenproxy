@@ -41,6 +41,10 @@ const INCONCLUSIVE_REASONS = new Set([
   "no-page",
   "auth-url",
   "logged-out-marker",
+  "context-destroyed",
+  "no-evaluate",
+  "settings-unavailable",
+  "settings-inconclusive",
 ]);
 
 export function classifyPostLoginValidation(

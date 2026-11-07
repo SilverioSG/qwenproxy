@@ -238,7 +238,9 @@ export function isConfirmedAuthError(err: unknown): boolean {
       message.includes("re-authentication failed")) ||
     message.includes("authpermanentfailure") ||
     code === "authpermanentfailure" ||
-    code === "unauthorized"
+    code === "unauthorized" ||
+    ((code === "createchatfailed" || code === "createchatinvalidresponse") &&
+      statusOf(err) === 401)
   );
 }
 
@@ -247,6 +249,8 @@ export function isAccountInitializationError(err: unknown): boolean {
   const code = errCode(err).toLowerCase();
   return (
     code === "acquire_deadline" ||
+    code === "session_validation_inconclusive" ||
+    message.includes("playwright session validation inconclusive") ||
     message.includes("acquire deadline") ||
     message.includes("header capture timed out") ||
     message.includes("header capture returned incomplete anti-fraud headers") ||
@@ -581,12 +585,9 @@ export function classifyRetryAction(
     });
   }
 
-  // Upstream 401 / Unauthorized on chat creation or API requests:
-  // Account session is invalid or expired. Cool down account with AuthInitFailed so the
-  // proxy rotates to a valid account instead of looping endlessly on 503s.
+  // Explicit upstream auth evidence in legacy error messages. Generic
+  // create-chat failures below do not establish a credential rejection.
   if (
-    code === "createchatinvalidresponse" ||
-    code === "createchatfailed" ||
     code === "unauthorized" ||
     message.includes("401 não autorizado") ||
     message.includes("não tem permissão para acessar") ||
@@ -601,6 +602,19 @@ export function classifyRetryAction(
       retryAfterMs: Math.min(baseDelayMs, 1_000),
       accountCooldownMs: config.concurrency.initFailureCooldownMs,
       accountCooldownReason: "AuthInitFailed",
+    });
+  }
+  if (code === "createchatinvalidresponse" || code === "createchatfailed") {
+    // An empty/malformed reply or service failure must still rotate and
+    // rebuild the chat, without permanently excluding the account from
+    // the pool after its temporary cooldown expires.
+    return makeRetryAction("account_initialization_failed", {
+      switchAccount: true,
+      forceNewChat: true,
+      retryWithFullPrompt: true,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "InitFailed",
     });
   }
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)

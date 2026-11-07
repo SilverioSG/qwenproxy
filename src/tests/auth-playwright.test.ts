@@ -163,6 +163,7 @@ test("playwright header capture gives up shortly after a send that fires no requ
   };
   const silentPage = {
     isClosed: () => false,
+    evaluate: async () => "ok", // Explicit authenticated-probe result.
     url: () => "https://chat.qwen.ai/",
     route: async () => {},
     unroute: async () => {},
@@ -207,6 +208,7 @@ test("playwright header capture reloads instead of hanging when the chat input n
   };
   const blockedPage = {
     isClosed: () => false,
+    evaluate: async () => "ok", // This fixture tests missing input, not auth.
     url: () => "https://chat.qwen.ai/",
     route: async () => {},
     unroute: async () => {},
@@ -302,6 +304,7 @@ function makeRetriggerPage(headerSets: Record<string, string>[]) {
 
   const page = {
     isClosed: () => false,
+    evaluate: async () => "ok", // Header completeness is independent of auth.
     url: () => "https://chat.qwen.ai/",
     route: async (_pattern: string, routeHandler: any) => {
       handler = routeHandler;

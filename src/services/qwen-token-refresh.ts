@@ -777,7 +777,7 @@ async function defaultSessionVerifier(accountId: string): Promise<{
         ? 401
         : probe.reason === "settings-403"
           ? 403
-          : probe.reason === "ok" || probe.reason.startsWith("settings-")
+          : probe.reason === "ok" || probe.reason === "settings-revoked"
             ? 200
             : 0;
     return {

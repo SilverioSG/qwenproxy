@@ -5,6 +5,9 @@ import { buildChromiumLaunchArgs } from "../services/playwright.ts";
 
 test("buildChromiumLaunchArgs includes low-memory heap cap by default", () => {
   assert.equal(config.playwright.lowMemoryFlags, true);
+  if (!process.env.PLAYWRIGHT_JS_HEAP_MB) {
+    assert.equal(config.playwright.jsHeapMb, 1024, "Qwen must not inherit the renderer-crashing 256 MiB default");
+  }
   const args = buildChromiumLaunchArgs({ width: 1280, height: 720 });
 
   assert.ok(args.includes("--disable-dev-shm-usage"));
