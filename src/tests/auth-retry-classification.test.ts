@@ -23,7 +23,7 @@ import {
   isConfirmedAuthError,
 } from "../routes/chat/retry-policy.ts";
 import { validateAccountSessionForInit, registerPlaywrightAccountForTests, unregisterPlaywrightAccountForTests } from "../services/playwright.ts";
-import { PersonalizationSyncError } from "../services/qwen.ts";
+import { PersonalizationSyncError, QwenUpstreamError } from "../services/qwen.ts";
 import { prepareQwenRuntime } from "../api/server.ts";
 import { saveAuthSession, deleteAuthSession } from "../core/database.ts";
 import { ensureAccountSession } from "../services/qwen-token-refresh.ts";
@@ -76,6 +76,41 @@ test("infrastructure init failure cools down but does not reject", () => {
   const policy = classifyRetryAction(err, { requestAborted: false });
   assert.equal(policy.reason, "account_initialization_failed");
   assert.equal(policy.accountCooldownReason, "InitFailed");
+});
+
+test("unconfirmed create-chat failures preserve persisted authentication", () => {
+  for (const [code, message, status] of [
+    ["CreateChatInvalidResponse", "Qwen create chat returned unexpected payload: ", 502],
+    ["CreateChatInvalidResponse", 'Qwen create chat returned unexpected payload: {"success":true,"data":{}}', 502],
+    ["CreateChatFailed", "Qwen create chat failed: 503 Service Unavailable", 502],
+  ] as const) {
+    const a = mk(`create-${code}`);
+    setAccountAuthState(a.id, "valid");
+    const error = new QwenUpstreamError(message, code, status);
+    const policy = classifyRetryAction(error);
+    assert.equal(isConfirmedAuthError(error), false);
+    assert.equal(policy.accountCooldownReason, "InitFailed");
+    assert.equal(policy.switchAccount, true);
+    assert.equal(policy.forceNewChat, true);
+    assert.equal(policy.retryWithFullPrompt, true);
+    markAccountRateLimited(a.id, 1000, policy.accountCooldownReason);
+    assert.equal(getAccountAuthState(a.id), "valid");
+  }
+});
+
+test("create-chat auth evidence still persists rejection", () => {
+  for (const [code, message, status] of [
+    ["Unauthorized", "Qwen create chat unauthorized", 401],
+    ["CreateChatFailed", "Qwen create chat failed: 401 Unknown", 401],
+    ["CreateChatInvalidResponse", 'Qwen create chat returned unexpected payload: {"success":false,"data":{"code":"Unauthorized"}}', 502],
+  ] as const) {
+    const a = mk(`create-auth-${code}`);
+    setAccountAuthState(a.id, "valid");
+    const policy = classifyRetryAction(new QwenUpstreamError(message, code, status));
+    assert.equal(policy.accountCooldownReason, "AuthInitFailed");
+    markAccountRateLimited(a.id, 1000, policy.accountCooldownReason);
+    assert.equal(getAccountAuthState(a.id), "rejected");
+  }
 });
 
 test("prefixed AuthPermanentFailure reason persists auth_state=rejected", () => {

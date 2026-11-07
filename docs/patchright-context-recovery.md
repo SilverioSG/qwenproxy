@@ -157,3 +157,40 @@ Validation for this change: typecheck PASS; 55 focused tests PASS; canonical
 mock suite 1357 PASS / 0 FAIL / 1 SKIP (1358 total). All ran with test data
 isolated from production. The browser heap reproduction used no network or
 account material.
+
+## Create-chat classification and upstream review, November 7, 2026
+
+Three accounts verified during the November 6/7 recovery were excluded again
+64, 82 and 111 minutes later. Their last request first renewed the access token
+successfully, then failed with `CreateChatInvalidResponse` and an empty response
+preview. Retry policy treated that generic error code as `AuthInitFailed` and
+persisted `rejected`. The response did not establish an authentication failure.
+
+Generic `CreateChatInvalidResponse` and `CreateChatFailed` now retain account
+rotation, a fresh chat, full prompt replay and the temporary init cooldown, but
+use `InitFailed`. Explicit upstream HTTP 401 or logical Unauthorized still uses
+`AuthInitFailed`. Regression tests apply the resulting cooldown to isolated
+accounts and verify persisted auth state, including the conclusive auth cases.
+This prevents future false exclusions; it does not re-admit existing rejected
+accounts or solve the upstream response failure. Those require authoritative
+validation, without rewriting auth state by hand.
+
+The November 7 review found no commits since the previous review in either
+QwenProxy upstream. `johngbl` at `18effdd82c` still groups generic create-chat
+failures with auth errors, using `AuthExpired`; importing that branch would
+not correct the distinction required by this fork's persistent auth state.
+Original QwenProxy PRs #44, #59 and #61 are closed without
+merging; none contains a fix for this retry-policy classification. Its open
+PR #72 concerns API compatibility and uploads. QwenGate
+[#40](https://github.com/youssefvdel/qwengate/pull/40) remains open: its cookie
+persistence, JWT expiry and browser refresh changes have counterparts here.
+Its later [#99](https://github.com/youssefvdel/qwengate/issues/99) reports
+continuing WAF failures; it does not establish a fix or a provider TTL change.
+Patchright #247 is already backported; #260 concerns authenticated proxies,
+while #264 is still open and changes document interception. None demonstrates
+a remedy for the observed Qwen authentication/WAF failures. Dependencies are
+unchanged.
+
+Validation: the new regression fails against the previous policy; typecheck
+PASS, 60 focused tests PASS, canonical mock suite 1359 PASS / 0 FAIL / 1 SKIP
+(1360 total). Production data and credentials were excluded from the test run.
